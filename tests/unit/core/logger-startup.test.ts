@@ -8,7 +8,7 @@ const roots: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.resetModules();
-  delete process.env.LARK_CHANNEL_HOME;
+  delete process.env.LARKLINE_HOME;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -16,7 +16,7 @@ describe('logger startup behavior', () => {
   it('does not create the default claude profile directory before logger configuration', async () => {
     const root = await mkdtemp(join(tmpdir(), 'logger-startup-'));
     roots.push(root);
-    process.env.LARK_CHANNEL_HOME = root;
+    process.env.LARKLINE_HOME = root;
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const { flushLogger, log } = await import('../../../src/core/logger.js');

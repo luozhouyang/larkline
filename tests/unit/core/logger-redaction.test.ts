@@ -54,7 +54,7 @@ describe('logger redaction', () => {
         {
           headers: { authorization: 'Bearer nested-token' },
           body: { file_token: 'doc-token-secret' },
-          path: '/tmp/lark-channel/secret/file.txt',
+          path: '/tmp/larkline/secret/file.txt',
         },
       ],
     });
@@ -64,7 +64,7 @@ describe('logger redaction', () => {
     expect(text).not.toContain('drive-token');
     expect(text).not.toContain('nested-token');
     expect(text).not.toContain('doc-token-secret');
-    expect(text).not.toContain('/tmp/lark-channel/secret/file.txt');
+    expect(text).not.toContain('/tmp/larkline/secret/file.txt');
   });
 
   it('redacts credentials inside stringified JSON sdk args', async () => {
@@ -101,12 +101,12 @@ describe('logger redaction', () => {
 
   it('redacts home-relative local paths inside arbitrary strings', async () => {
     log.warn('agent', 'stderr', {
-      line: 'artifact saved to ~/.lark-channel/profiles/claude/media/private.bin',
+      line: 'artifact saved to ~/.larkline/profiles/claude/media/private.bin',
     });
     await flushLogger();
 
     const text = await readTodayLog();
-    expect(text).not.toContain('~/.lark-channel/profiles/claude/media/private.bin');
+    expect(text).not.toContain('~/.larkline/profiles/claude/media/private.bin');
     expect(text).toContain('[REDACTED_PATH]');
   });
 

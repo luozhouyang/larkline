@@ -20,9 +20,12 @@ export const paths = {
 };
 
 /**
- * Pre-0.1.11 paths (XDG-style). Kept here only so the `migrate` command
- * can detect and move data out of the old location. Don't reference these
- * anywhere in the runtime.
+ * Historical paths kept only so the `migrate` command can detect and move
+ * data out of the old locations. Don't reference these anywhere in the
+ * runtime.
+ *
+ *  - `appDir` / `cacheDir`: pre-0.1.11 XDG-style paths.
+ *  - `stateDir` / `workspacesDir`: the pre-rename `~/.lark-channel` layout.
  */
 export const legacyPaths = {
   appDir: join(
@@ -33,4 +36,6 @@ export const legacyPaths = {
     process.env.XDG_CACHE_HOME ?? join(homedir(), '.cache'),
     'lark-channel-bridge',
   ),
+  stateDir: join(homedir(), '.lark-channel'),
+  workspacesDir: join(homedir(), '.lark-channel-workspaces'),
 };

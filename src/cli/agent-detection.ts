@@ -1,6 +1,7 @@
 import { constants } from 'node:fs';
 import { access } from 'node:fs/promises';
 import { delimiter, extname, isAbsolute, join } from 'node:path';
+import { readBridgeEnv } from '../config/env-compat';
 
 export type AgentKind = 'claude' | 'codex';
 
@@ -46,8 +47,8 @@ function pathExts(): string[] {
 
 export async function detectInstalledAgents(): Promise<DetectedAgent[]> {
   const candidates: Array<{ kind: AgentKind; command: string }> = [
-    { kind: 'claude', command: process.env.LARK_CHANNEL_CLAUDE_BIN ?? 'claude' },
-    { kind: 'codex', command: process.env.LARK_CHANNEL_CODEX_BIN ?? 'codex' },
+    { kind: 'claude', command: readBridgeEnv('CLAUDE_BIN') ?? 'claude' },
+    { kind: 'codex', command: readBridgeEnv('CODEX_BIN') ?? 'codex' },
   ];
   const detected: DetectedAgent[] = [];
   for (const candidate of candidates) {

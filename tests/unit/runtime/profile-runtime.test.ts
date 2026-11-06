@@ -236,11 +236,11 @@ describe('profile runtime resolver', () => {
     const claude = await writeExecutable(bin, 'claude');
     const codex = await writeExecutable(bin, 'codex');
     const oldPath = process.env.PATH;
-    const oldClaude = process.env.LARK_CHANNEL_CLAUDE_BIN;
-    const oldCodex = process.env.LARK_CHANNEL_CODEX_BIN;
+    const oldClaude = process.env.LARKLINE_CLAUDE_BIN;
+    const oldCodex = process.env.LARKLINE_CODEX_BIN;
     process.env.PATH = bin;
-    delete process.env.LARK_CHANNEL_CLAUDE_BIN;
-    delete process.env.LARK_CHANNEL_CODEX_BIN;
+    delete process.env.LARKLINE_CLAUDE_BIN;
+    delete process.env.LARKLINE_CODEX_BIN;
 
     try {
       let error: Error | undefined;
@@ -266,14 +266,14 @@ describe('profile runtime resolver', () => {
     } finally {
       process.env.PATH = oldPath;
       if (oldClaude === undefined) {
-        delete process.env.LARK_CHANNEL_CLAUDE_BIN;
+        delete process.env.LARKLINE_CLAUDE_BIN;
       } else {
-        process.env.LARK_CHANNEL_CLAUDE_BIN = oldClaude;
+        process.env.LARKLINE_CLAUDE_BIN = oldClaude;
       }
       if (oldCodex === undefined) {
-        delete process.env.LARK_CHANNEL_CODEX_BIN;
+        delete process.env.LARKLINE_CODEX_BIN;
       } else {
-        process.env.LARK_CHANNEL_CODEX_BIN = oldCodex;
+        process.env.LARKLINE_CODEX_BIN = oldCodex;
       }
     }
   });
@@ -284,11 +284,11 @@ describe('profile runtime resolver', () => {
     const codex = await writeExecutable(bin, 'codex');
     await writeExecutable(bin, 'claude');
     const oldPath = process.env.PATH;
-    const oldClaude = process.env.LARK_CHANNEL_CLAUDE_BIN;
-    const oldCodex = process.env.LARK_CHANNEL_CODEX_BIN;
+    const oldClaude = process.env.LARKLINE_CLAUDE_BIN;
+    const oldCodex = process.env.LARKLINE_CODEX_BIN;
     process.env.PATH = bin;
-    delete process.env.LARK_CHANNEL_CLAUDE_BIN;
-    delete process.env.LARK_CHANNEL_CODEX_BIN;
+    delete process.env.LARKLINE_CLAUDE_BIN;
+    delete process.env.LARKLINE_CODEX_BIN;
 
     try {
       const runtime = await withTty(true, true, () =>
@@ -308,14 +308,14 @@ describe('profile runtime resolver', () => {
     } finally {
       process.env.PATH = oldPath;
       if (oldClaude === undefined) {
-        delete process.env.LARK_CHANNEL_CLAUDE_BIN;
+        delete process.env.LARKLINE_CLAUDE_BIN;
       } else {
-        process.env.LARK_CHANNEL_CLAUDE_BIN = oldClaude;
+        process.env.LARKLINE_CLAUDE_BIN = oldClaude;
       }
       if (oldCodex === undefined) {
-        delete process.env.LARK_CHANNEL_CODEX_BIN;
+        delete process.env.LARKLINE_CODEX_BIN;
       } else {
-        process.env.LARK_CHANNEL_CODEX_BIN = oldCodex;
+        process.env.LARKLINE_CODEX_BIN = oldCodex;
       }
     }
   });
@@ -443,9 +443,9 @@ describe('profile runtime resolver', () => {
     const bin = join(root, 'bin');
     const codex = await writeExecutable(bin, 'codex');
     const oldPath = process.env.PATH;
-    const oldHome = process.env.LARK_CHANNEL_HOME;
+    const oldHome = process.env.LARKLINE_HOME;
     process.env.PATH = `${bin}${delimiter}${oldPath ?? ''}`;
-    process.env.LARK_CHANNEL_HOME = root;
+    process.env.LARKLINE_HOME = root;
     await writeFile(
       join(root, 'config.json'),
       `${JSON.stringify({
@@ -472,9 +472,9 @@ describe('profile runtime resolver', () => {
     } finally {
       process.env.PATH = oldPath;
       if (oldHome === undefined) {
-        delete process.env.LARK_CHANNEL_HOME;
+        delete process.env.LARKLINE_HOME;
       } else {
-        process.env.LARK_CHANNEL_HOME = oldHome;
+        process.env.LARKLINE_HOME = oldHome;
       }
     }
   });
@@ -1145,8 +1145,8 @@ describe('profile runtime resolver', () => {
     });
     expect(projection.secrets?.providers?.bridge?.command).toBe(expectedSecretsGetter(root));
     expect(projection.secrets?.providers?.bridge?.env).toMatchObject({
-      LARK_CHANNEL_HOME: root,
-      LARK_CHANNEL_PROFILE: 'codex-dev',
+      LARKLINE_HOME: root,
+      LARKLINE_PROFILE: 'codex-dev',
     });
   });
 });

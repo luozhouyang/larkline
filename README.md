@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# larkline
 
 A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
+
+larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge), renamed from `lark-channel-bridge`. The npm package, CLI binary, local state directory, and environment variables now all use the `larkline` name. Upgrading from the old name is automatic for the state directory, and the old `LARK_CHANNEL_*` environment variables are still accepted as fallbacks.
 
 [中文 README](./README.zh.md)
 
@@ -16,6 +18,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
 - **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
+- **Long-running tasks**: Feishu auto-closes a streaming card about 10 minutes after it is created. larkline pauses live updates just before that cutoff and sends the final answer as a separate message, so a long run never ends silently.
 
 ## Prerequisites
 
@@ -28,15 +31,17 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 ## Install
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g larkline
 # or
-pnpm add -g lark-channel-bridge
+pnpm add -g larkline
 ```
+
+If you previously installed `lark-channel-bridge`, stop and unregister its OS service first (`lark-channel-bridge stop` / `unregister`), then install `larkline` and run `larkline start`. On first launch, `~/.lark-channel` is renamed to `~/.larkline` automatically; set `LARKLINE_HOME` to use a different state directory.
 
 ## First run
 
 ```bash
-lark-channel-bridge run
+larkline run
 ```
 
 The first run opens a QR-code wizard:
@@ -45,16 +50,16 @@ The first run opens a QR-code wizard:
 2. Scan it with the Feishu / Lark app.
 3. Pick or create a PersonalAgent app.
 4. If prompted, choose which agent to initialize.
-5. Config is written to `~/.lark-channel/config.json`.
+5. Config is written to `~/.larkline/config.json`.
 
 You do not need to choose a project directory up front. The bridge creates a profile-managed default working directory; after startup, send `/cd <path>` in Feishu / Lark to switch to a real project.
 
 If you already have a PersonalAgent app, pass `--app-id` during initialization to skip app creation. The command prompts for the App Secret.
 
 ```bash
-lark-channel-bridge run --app-id cli_xxx
+larkline run --app-id cli_xxx
 # or initialize and start the background service directly
-lark-channel-bridge start --app-id cli_xxx
+larkline start --app-id cli_xxx
 ```
 
 For Lark global apps, add `--tenant lark`.
@@ -64,9 +69,9 @@ For Lark global apps, add `--tenant lark`.
 Use `run` for first-run setup and foreground debugging. After the bot can send and receive messages, stop the foreground process with `Ctrl-C`, then use an OS-managed service for background operation:
 
 ```bash
-lark-channel-bridge start
-lark-channel-bridge status
-lark-channel-bridge stop
+larkline start
+larkline status
+larkline stop
 ```
 
 Install globally before using service commands. The daemon's launchd plist / systemd unit / Windows task records the bridge CLI path; if that path comes from an npm temp cache through `npx`, the daemon can break when the cache is cleaned. `run` is fine through `npx` as a one-shot foreground process.
@@ -74,34 +79,34 @@ Install globally before using service commands. The daemon's launchd plist / sys
 Service commands install a per-profile service:
 
 ```bash
-lark-channel-bridge start [--profile <name>]
-lark-channel-bridge stop [--profile <name>]
-lark-channel-bridge restart [--profile <name>]
-lark-channel-bridge status [--profile <name>]
-lark-channel-bridge unregister [--profile <name>]
+larkline start [--profile <name>]
+larkline stop [--profile <name>]
+larkline restart [--profile <name>]
+larkline status [--profile <name>]
+larkline unregister [--profile <name>]
 ```
 
 Platform mapping:
-- **macOS**: launchd user agent `ai.lark-channel-bridge.bot.<profile>`
-- **Linux**: systemd user unit `lark-channel-bridge.bot.<profile>.service`
-- **Windows**: Task Scheduler task `LarkChannelBridge.Bot.<profile>`, launched through a `.cmd` wrapper
+- **macOS**: launchd user agent `ai.larkline.bot.<profile>`
+- **Linux**: systemd user unit `larkline.bot.<profile>.service`
+- **Windows**: Task Scheduler task `Larkline.Bot.<profile>`, launched through a `.cmd` wrapper
 
-Daemon logs are under `~/.lark-channel/profiles/<profile>/logs/daemon/`.
+Daemon logs are under `~/.larkline/profiles/<profile>/logs/daemon/`.
 
 ### Multiple profiles: Claude and Codex
 
 By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
 
 ```bash
-lark-channel-bridge start --profile claude --agent claude
-lark-channel-bridge start --profile codex --agent codex
+larkline start --profile claude --agent claude
+larkline start --profile codex --agent codex
 ```
 
 For example, to restart only the Codex bot:
 
 ```bash
-lark-channel-bridge restart --profile codex
-lark-channel-bridge status --profile codex
+larkline restart --profile codex
+larkline status --profile codex
 ```
 
 ## Commands
@@ -109,24 +114,24 @@ lark-channel-bridge status --profile codex
 ### Host CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
-lark-channel-bridge ps
-lark-channel-bridge kill <id|#>
-lark-channel-bridge --help
+larkline run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline migrate [--profile <name>] [--agent claude|codex]
+larkline ps
+larkline kill <id|#>
+larkline --help
 ```
 
 `profile use <name>` changes the profile used by later default starts. Use these profile management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
 
 ```bash
-lark-channel-bridge profile create claude --agent claude
-lark-channel-bridge profile create codex --agent codex
-lark-channel-bridge profile list
-lark-channel-bridge profile use <name>
-lark-channel-bridge profile remove <name>
-lark-channel-bridge profile remove <name> --purge --yes
-lark-channel-bridge profile export <name> [--output ./profile.json] [--force]
-lark-channel-bridge profile export <name> --include-secrets --yes
+larkline profile create claude --agent claude
+larkline profile create codex --agent codex
+larkline profile list
+larkline profile use <name>
+larkline profile remove <name>
+larkline profile remove <name> --purge --yes
+larkline profile export <name> [--output ./profile.json] [--force]
+larkline profile export <name> --include-secrets --yes
 ```
 
 `profile remove` archives local state by default, including the active profile. If other profiles remain, the bridge switches to the next one; if it was the last profile, the root config is cleared so the same name can be created again. `--purge --yes` permanently deletes local state. `profile export` redacts app secrets by default; `--include-secrets --yes` includes sensitive config.
@@ -173,7 +178,7 @@ When COT is enabled, the bridge splits the process view and final answer into tw
 
 ## lark-cli identity policy
 
-Each profile uses a profile-local lark-cli directory at `~/.lark-channel/profiles/<profile>/lark-cli`. The agent process receives `LARKSUITE_CLI_CONFIG_DIR` for that directory, so personal authorization in one profile is not shared with another profile.
+Each profile uses a profile-local lark-cli directory at `~/.larkline/profiles/<profile>/lark-cli`. The agent process receives `LARKSUITE_CLI_CONFIG_DIR` for that directory, so personal authorization in one profile is not shared with another profile.
 
 The default policy is `bot-only`: lark-cli uses the app/bot identity and does not access personal resources. When a user authorizes personal resources such as calendar, mail, or drive, the current profile can switch to `user-default`, which keeps app identity available and also allows the authorized user identity. Owner/admin users can inspect or change this policy in `/config`; `/status` shows the current summary as `lark-cli: app` or `lark-cli: user-ready`.
 
@@ -186,7 +191,7 @@ This is a profile-field snippet. Do not replace the whole `config.json` with it;
 ```json
 {
   "workspaces": {
-    "default": "/Users/me/.lark-channel-workspaces/claude/default"
+    "default": "/Users/me/.larkline-workspaces/claude/default"
   }
 }
 ```
@@ -222,19 +227,19 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 
 | Path | Content |
 |---|---|
-| `~/.lark-channel/config.json` | Root config with profiles and active profile |
-| `~/.lark-channel/active-profile` | Last selected profile |
-| `~/.lark-channel/profiles/<profile>/sessions.json` | Session state |
-| `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | Agent-aware session catalog |
-| `~/.lark-channel/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
-| `~/.lark-channel/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
-| `~/.lark-channel/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
-| `~/.lark-channel/profiles/<profile>/media/` | Attachment cache |
-| `~/.lark-channel/profiles/<profile>/logs/` | Structured run logs |
-| `~/.lark-channel/registry/processes.json` | Local process registry |
-| `~/.lark-channel/registry/locks/` | Profile and app locks |
+| `~/.larkline/config.json` | Root config with profiles and active profile |
+| `~/.larkline/active-profile` | Last selected profile |
+| `~/.larkline/profiles/<profile>/sessions.json` | Session state |
+| `~/.larkline/profiles/<profile>/sessions.json.catalog.json` | Agent-aware session catalog |
+| `~/.larkline/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
+| `~/.larkline/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
+| `~/.larkline/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
+| `~/.larkline/profiles/<profile>/media/` | Attachment cache |
+| `~/.larkline/profiles/<profile>/logs/` | Structured run logs |
+| `~/.larkline/registry/processes.json` | Local process registry |
+| `~/.larkline/registry/locks/` | Profile and app locks |
 
-Set `LARK_CHANNEL_HOME=/path/to/state` to move all local bridge state. `LARK_CHANNEL_LOG_DAYS` overrides log retention.
+Set `LARKLINE_HOME=/path/to/state` to move all local bridge state. `LARKLINE_LOG_DAYS` overrides log retention.
 
 ## Access control
 
@@ -272,7 +277,7 @@ To let other people or groups in, add them to one of three lists:
 
 ### Advanced: editing the config file directly
 
-If you'd rather not do it inside Feishu, `/invite` and `/config` write the matching profile's `access` field in `~/.lark-channel/config.json`. Empty lists mean nobody from that list, not open access. This is a profile-field snippet; do not replace the whole `config.json` with it:
+If you'd rather not do it inside Feishu, `/invite` and `/config` write the matching profile's `access` field in `~/.larkline/config.json`. Empty lists mean nobody from that list, not open access. This is a profile-field snippet; do not replace the whole `config.json` with it:
 
 ```json
 {
@@ -294,7 +299,7 @@ If you'd rather not do it inside Feishu, `/invite` and `/config` write the match
 `allowedUsers` / `admins` take user `open_id`s; `allowedChats` takes group `chat_id`s. The easiest way to find an ID by hand: have the person message the bot (or `@` it in the group), then check the active profile's log:
 
 ```bash
-grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
+grep '"event":"enter"' ~/.larkline/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
 ```
 
 Each line carries `chatId` (group / DM id) and `senderId` (user `open_id`). After a manual edit, **restart the bridge** or send `/reconnect` from an allowed admin context to apply it. For day-to-day tweaks `/invite` / `/config` are easier; direct edits are mainly for deployment scripts that pre-seed access.
@@ -308,6 +313,8 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 **The bot stays silent or the local CLI never replies.** Usually the local `claude` or `codex` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
 
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
+
+**A long run stops updating at "正在调用工具" and no answer arrives.** Feishu force-finalizes a streaming card about 10 minutes after it is created and silently drops later card updates. This is a server-side Feishu limit, so it can happen with desktop and mobile clients alike. larkline pauses the progress card at ~8.5 minutes with an explicit notice, then delivers the final answer as a new message when the run finishes. The pause threshold can be overridden with `LARKLINE_STREAM_CARD_SAFE_MS` (milliseconds, capped below 10 minutes). When the guard fires, the log contains `stream card-lifetime-expiring` and `stream card-lifetime-final-fallback`.
 
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.
 
@@ -330,13 +337,13 @@ By default the bridge reports **nothing**: no metrics, no logs leave your machin
 To wire up your own monitoring, point an environment variable at a module that default-exports (or exports `createAdapter`) an `AdapterFactory`:
 
 ```bash
-LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+LARKLINE_TELEMETRY_MODULE=your-telemetry-package larkline start
 ```
 
 That module receives every `log.*` event plus error/metric hooks and forwards them wherever you like. The interface is exported from the package root:
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'larkline';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* ship event */},

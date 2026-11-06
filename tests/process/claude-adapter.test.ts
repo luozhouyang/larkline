@@ -42,7 +42,7 @@ describe('ClaudeAdapter process contract', () => {
     const record = await readRecord(fake.recordPath);
 
     expect(await realpath(record.cwd)).toBe(await realpath(fake.dir));
-    expect(record.env.LARK_CHANNEL).toBe('1');
+    expect(record.env.LARKLINE).toBe('1');
     // The prompt goes via stdin, and the bridge system prompt via a temp file,
     // so neither ever touches argv (which cmd.exe would mangle on Windows).
     expect(record.stdin).toBe('hello');
@@ -56,9 +56,9 @@ describe('ClaudeAdapter process contract', () => {
       '--append-system-prompt-file',
     ]);
     expect(record.argv).not.toContain('hello');
-    expect(record.systemPrompt).toContain('lark-channel-bridge 运行约定');
+    expect(record.systemPrompt).toContain('larkline 运行约定');
     expect(record.systemPrompt).toContain('__bridge_cb');
-    expect(record.systemPrompt).toContain('LARK_CHANNEL_PROFILE');
+    expect(record.systemPrompt).toContain('LARKLINE_PROFILE');
     expect(record.systemPrompt).toContain('LARKSUITE_CLI_CONFIG_DIR');
     expect(record.systemPrompt).not.toContain('lark-cli config bind --source lark-channel');
     expect(record.systemPrompt).not.toContain('__claude_cb');
@@ -78,7 +78,7 @@ describe('ClaudeAdapter process contract', () => {
 
     const run = new ClaudeAdapter({
       binary: fake.path,
-      larkChannel: {
+      larklineEnv: {
         profile: 'codex-dev',
         rootDir,
         configPath,
@@ -95,10 +95,10 @@ describe('ClaudeAdapter process contract', () => {
     const record = await readRecord(fake.recordPath);
 
     expect(record.env).toMatchObject({
-      LARK_CHANNEL: '1',
-      LARK_CHANNEL_PROFILE: 'codex-dev',
-      LARK_CHANNEL_HOME: rootDir,
-      LARK_CHANNEL_CONFIG: larkCliSourceConfigFile,
+      LARKLINE: '1',
+      LARKLINE_PROFILE: 'codex-dev',
+      LARKLINE_HOME: rootDir,
+      LARKLINE_CONFIG: larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: larkCliConfigDir,
     });
   });
@@ -244,10 +244,10 @@ async function createFakeClaude(options: {
       '    systemPrompt,',
       '    cwd: process.cwd(),',
       '    env: {',
-      '      LARK_CHANNEL: process.env.LARK_CHANNEL,',
-      '      LARK_CHANNEL_PROFILE: process.env.LARK_CHANNEL_PROFILE,',
-      '      LARK_CHANNEL_HOME: process.env.LARK_CHANNEL_HOME,',
-      '      LARK_CHANNEL_CONFIG: process.env.LARK_CHANNEL_CONFIG,',
+      '      LARKLINE: process.env.LARKLINE,',
+      '      LARKLINE_PROFILE: process.env.LARKLINE_PROFILE,',
+      '      LARKLINE_HOME: process.env.LARKLINE_HOME,',
+      '      LARKLINE_CONFIG: process.env.LARKLINE_CONFIG,',
       '      LARKSUITE_CLI_CONFIG_DIR: process.env.LARKSUITE_CLI_CONFIG_DIR,',
       '    },',
       '  }));',
@@ -269,10 +269,10 @@ async function readRecord(path: string): Promise<{
   systemPrompt: string | null;
   cwd: string;
   env: {
-    LARK_CHANNEL?: string;
-    LARK_CHANNEL_PROFILE?: string;
-    LARK_CHANNEL_HOME?: string;
-    LARK_CHANNEL_CONFIG?: string;
+    LARKLINE?: string;
+    LARKLINE_PROFILE?: string;
+    LARKLINE_HOME?: string;
+    LARKLINE_CONFIG?: string;
     LARKSUITE_CLI_CONFIG_DIR?: string;
   };
 }> {
@@ -282,10 +282,10 @@ async function readRecord(path: string): Promise<{
     systemPrompt: string | null;
     cwd: string;
     env: {
-      LARK_CHANNEL?: string;
-      LARK_CHANNEL_PROFILE?: string;
-      LARK_CHANNEL_HOME?: string;
-      LARK_CHANNEL_CONFIG?: string;
+      LARKLINE?: string;
+      LARKLINE_PROFILE?: string;
+      LARKLINE_HOME?: string;
+      LARKLINE_CONFIG?: string;
       LARKSUITE_CLI_CONFIG_DIR?: string;
     };
   };

@@ -7,7 +7,7 @@ import type { AgentKind, ProfileConfig } from '../config/profile-schema';
 import type { AcquiredRuntimeLock } from './locks';
 
 /**
- * Build the agent adapter for a profile, wiring its per-profile lark-channel env
+ * Build the agent adapter for a profile, wiring its per-profile larkline env
  * (so spawned agent processes see this profile's LARKSUITE_CLI_CONFIG_DIR etc.).
  * Shared by the foreground run path and the supervisor so both produce an
  * identically-configured adapter. Each profile MUST get its own adapter — the
@@ -20,13 +20,13 @@ export function createRuntimeAgent(
       configPath?: string;
     },
 ): AgentAdapter {
-  const larkChannelConfigPath = appPaths.configPath ?? appPaths.configFile;
-  const larkChannel =
+  const larklineConfigPath = appPaths.configPath ?? appPaths.configFile;
+  const larklineEnv =
     appPaths.rootDir && appPaths.profile
       ? {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
-          ...(larkChannelConfigPath ? { configPath: larkChannelConfigPath } : {}),
+          ...(larklineConfigPath ? { configPath: larklineConfigPath } : {}),
           ...(appPaths.larkCliConfigDir ? { larkCliConfigDir: appPaths.larkCliConfigDir } : {}),
           ...(appPaths.larkCliSourceConfigFile
             ? { larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile }
@@ -46,10 +46,10 @@ export function createRuntimeAgent(
       ignoreUserConfig: codex.ignoreUserConfig === true,
       ignoreRules: codex.ignoreRules !== false,
       sandbox: profileConfig.sandbox.defaultMode,
-      larkChannel,
+      larklineEnv,
     });
   }
-  return new ClaudeAdapter({ larkChannel });
+  return new ClaudeAdapter({ larklineEnv });
 }
 
 export async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promise<AgentAvailability> {

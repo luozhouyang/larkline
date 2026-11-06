@@ -384,8 +384,8 @@ describe('profile v2 migration', () => {
   it('migrates a legacy config to Codex through the migrate command', async () => {
     const root = await makeRoot();
     const codex = await writeVersionExecutable(root, 'codex', 'codex 1.2.3');
-    const oldCodexBin = process.env.LARK_CHANNEL_CODEX_BIN;
-    process.env.LARK_CHANNEL_CODEX_BIN = codex;
+    const oldCodexBin = process.env.LARKLINE_CODEX_BIN;
+    process.env.LARKLINE_CODEX_BIN = codex;
     await writeJson(join(root, 'config.json'), legacyConfigFixture());
 
     try {
@@ -396,9 +396,9 @@ describe('profile v2 migration', () => {
       });
     } finally {
       if (oldCodexBin === undefined) {
-        delete process.env.LARK_CHANNEL_CODEX_BIN;
+        delete process.env.LARKLINE_CODEX_BIN;
       } else {
-        process.env.LARK_CHANNEL_CODEX_BIN = oldCodexBin;
+        process.env.LARKLINE_CODEX_BIN = oldCodexBin;
       }
     }
 

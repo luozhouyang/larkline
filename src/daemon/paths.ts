@@ -9,7 +9,7 @@ import { paths } from '../config/paths';
  * unit name. Single-instance for now; if we ever support multiple bots
  * per machine the suffix can grow `.{appid}` without breaking installs.
  */
-export const SERVICE_NAME = 'lark-channel-bridge.bot';
+export const SERVICE_NAME = 'larkline.bot';
 
 /**
  * Reserved service id for the machine-wide supervisor+console daemon
@@ -77,13 +77,13 @@ export function systemdUnitPath(profile: string = paths.profile): string {
 
 /**
  * schtasks task name. Backslashes turn into Task Scheduler "folders" so
- * `LarkChannelBridge\Bot` would create a Bot task under a LarkChannelBridge
+ * `Larkline\Bot` would create a Bot task under a Larkline
  * folder. We keep it flat for now.
  */
 export const WINDOWS_TASK_NAME = windowsTaskName();
 
 export function windowsTaskName(profile: string = paths.profile): string {
-  return `LarkChannelBridge.Bot.${serviceProfileId(profile)}`;
+  return `Larkline.Bot.${serviceProfileId(profile)}`;
 }
 
 /**
@@ -99,7 +99,7 @@ export function windowsLauncherCmdPath(profile: string = paths.profile): string 
 
 /**
  * Daemon stdout/stderr go alongside the bridge's own structured logs in
- * `~/.lark-channel/logs/` so users only need to remember one path. Filenames
+ * `~/.larkline/logs/` so users only need to remember one path. Filenames
  * are `daemon-*` to keep them distinct from the rolling per-day JSON files.
  */
 export function daemonLogDir(profile: string = paths.profile): string {

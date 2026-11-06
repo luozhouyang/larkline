@@ -714,7 +714,13 @@ function isBridgeSelfReply(channel: LarkChannel, evt: CommentEvent): boolean {
   const metadata = raw.replyMetadata ?? raw.reply_metadata ?? raw.metadata;
   if (!metadata || typeof metadata !== 'object') return false;
   const record = metadata as Record<string, unknown>;
-  return record.bridge === true || record.bridgeReply === true || record.source === 'lark-channel-bridge';
+  return (
+    record.bridge === true ||
+    record.bridgeReply === true ||
+    record.source === 'larkline' ||
+    // Replies persisted before the rename must still be recognized.
+    record.source === 'lark-channel-bridge'
+  );
 }
 
 /**

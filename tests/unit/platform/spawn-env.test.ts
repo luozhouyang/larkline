@@ -8,16 +8,16 @@ describe('platform spawn env', () => {
       {
         Path: '/bin',
         Codex_Home: '/old-codex-home',
-        LARK_CHANNEL: '0',
+        LARKLINE: '0',
       },
       {
         CODEX_HOME: '/new-codex-home',
-        LARK_CHANNEL: '1',
+        LARKLINE: '1',
       },
     );
 
     expect(env.CODEX_HOME).toBe('/new-codex-home');
-    expect(env.LARK_CHANNEL).toBe('1');
+    expect(env.LARKLINE).toBe('1');
     expect(Object.keys(env).filter((key) => key.toLowerCase() === 'codex_home')).toEqual([
       'CODEX_HOME',
     ]);

@@ -87,7 +87,7 @@ export async function startQrRegistration(rootDir?: string): Promise<{
   await new Promise<void>((resolve, reject) => {
     let readied = false;
     registerApp({
-      source: 'lark-channel-bridge',
+      source: 'larkline',
       onQRCodeReady: (info) => {
         session.qrUrl = info.url;
         session.expireIn = info.expireIn;

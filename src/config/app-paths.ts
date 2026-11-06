@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { readBridgeEnv } from './env-compat';
 
 export interface ResolveAppPathsOptions {
   rootDir?: string;
@@ -43,7 +45,7 @@ export interface AppPaths {
 const DEFAULT_PROFILE = 'claude';
 
 export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
-  const rootDir = opts.rootDir ?? process.env.LARK_CHANNEL_HOME ?? join(homedir(), '.lark-channel');
+  const rootDir = opts.rootDir ?? resolveDefaultRootDir();
   const profile = normalizeProfileName(opts.profile ?? DEFAULT_PROFILE);
   const profileDir = join(rootDir, 'profiles', profile);
   const registryDir = join(rootDir, 'registry');
@@ -64,6 +66,9 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     larkCliConfigDir: join(profileDir, 'lark-cli'),
     larkCliSourceDir: join(profileDir, 'lark-cli-source'),
     larkCliSourceConfigFile: join(profileDir, 'lark-cli-source', 'config.json'),
+    // `lark-channel` is the source identifier the external lark-cli accepts
+    // via `config bind --source`; it is a protocol name, not this project's
+    // name, so it stays unchanged by the larkline rename.
     larkCliTargetConfigFile: join(profileDir, 'lark-cli', 'lark-channel', 'config.json'),
     mediaDir: join(profileDir, 'media'),
     logsDir: join(profileDir, 'logs'),
@@ -77,6 +82,20 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     profileLockFile: join(userLockDir, 'profile', `${profile}.lock`),
     appLockFile: (appId: string) => join(userLockDir, 'app', `${lockSafeName(appId)}.lock`),
   };
+}
+
+function resolveDefaultRootDir(): string {
+  const explicit = readBridgeEnv('HOME');
+  if (explicit) return explicit;
+  const current = join(homedir(), '.larkline');
+  if (existsSync(current)) return current;
+  // Upgrade path from the pre-rename name. The launcher normally renames the
+  // directory before the CLI imports this module; this fallback keeps state
+  // reachable when the rename could not run (direct `node dist/cli.js`, a
+  // read-only home, etc.). `larkline migrate` moves it later.
+  const legacy = join(homedir(), '.lark-channel');
+  if (existsSync(legacy)) return legacy;
+  return current;
 }
 
 function normalizeProfileName(profile: string): string {

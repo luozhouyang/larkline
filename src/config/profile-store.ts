@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import * as lockfile from 'proper-lockfile';
 import { writeFileAtomic } from '../platform/atomic-write';
 import { resolveAppPaths } from './app-paths';
+import { readBridgeEnv } from './env-compat';
 import {
   normalizeProfileConfig,
   type AgentKind,
@@ -127,7 +128,7 @@ export async function withConfigFileLock<T>(configPath: string, fn: () => Promis
 
 export async function readActiveProfile(rootDir?: string): Promise<string | undefined> {
   const activeProfileFile = join(
-    rootDir ?? process.env.LARK_CHANNEL_HOME ?? resolveAppPaths().rootDir,
+    rootDir ?? readBridgeEnv('HOME') ?? resolveAppPaths().rootDir,
     'active-profile',
   );
   try {

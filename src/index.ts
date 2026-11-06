@@ -11,7 +11,7 @@ export type { RunState, ToolEntry, Block, ToolStatus, Terminal, FooterStatus } f
 
 // Optional telemetry hook (see README "Optional telemetry"). Types let an
 // external adapter package implement the interface via `import type`; the
-// runtime helpers are noop unless LARK_CHANNEL_TELEMETRY_MODULE is set.
+// runtime helpers are noop unless LARKLINE_TELEMETRY_MODULE is set.
 export type {
   TelemetryAdapter,
   AdapterFactory,

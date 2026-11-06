@@ -80,7 +80,7 @@ describe('profile-aware secrets commands', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('uses LARK_CHANNEL_PROFILE to resolve duplicate secret ids within one profile', async () => {
+  it('uses LARKLINE_PROFILE to resolve duplicate secret ids within one profile', async () => {
     const root = await makeRoot();
     await writeProfiles(root, 'codex-dev', ['alpha', 'codex-dev']);
     const duplicate = secretKeyForApp('cli_duplicate');

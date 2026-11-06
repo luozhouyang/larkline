@@ -6,7 +6,7 @@ import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { SpawnFailed } from '../../runtime/errors';
 import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
-import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
+import { buildLarklineEnv, type LarklineEnvContext } from '../larkline-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
   AgentAdapter,
@@ -27,7 +27,7 @@ export interface CodexAdapterOptions {
   ignoreRules?: boolean;
   sandbox?: SandboxMode;
   stopGraceMs?: number;
-  larkChannel?: LarkChannelEnvContext;
+  larklineEnv?: LarklineEnvContext;
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -44,7 +44,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly ignoreRules: boolean;
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
-  private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly larklineEnv: LarklineEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: CodexAdapterOptions) {
@@ -56,7 +56,7 @@ export class CodexAdapter implements AgentAdapter {
     this.ignoreRules = opts.ignoreRules !== false;
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
-    this.larkChannel = opts.larkChannel;
+    this.larklineEnv = opts.larklineEnv;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -102,7 +102,7 @@ export class CodexAdapter implements AgentAdapter {
       ignoreRules: this.ignoreRules,
       model: opts.model,
     });
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    const envOverrides: NodeJS.ProcessEnv = buildLarklineEnv(this.larklineEnv);
     if (this.codexHome) {
       envOverrides.CODEX_HOME = this.codexHome;
     } else if (!this.inheritCodexHome) {

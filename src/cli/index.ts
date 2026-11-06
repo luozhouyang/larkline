@@ -29,7 +29,7 @@ import { runUi } from './commands/ui';
 const program = new Command();
 
 program
-  .name('lark-channel-bridge')
+  .name('larkline')
   .description('Bridge Feishu/Lark messenger with local CLI coding agents')
   .version(pkg.version, '-v, --version');
 
@@ -224,7 +224,7 @@ program
 
 const secrets = program
   .command('secrets')
-  .description('Manage the bridge\'s encrypted secret keystore (~/.lark-channel/secrets.enc)');
+  .description('Manage the bridge\'s encrypted secret keystore (~/.larkline/secrets.enc)');
 
 secrets
   .command('get')

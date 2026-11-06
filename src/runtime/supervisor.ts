@@ -36,7 +36,7 @@ type StartChannelFn = typeof realStartChannel;
 export interface SupervisorOptions {
   /** Root config path (config.json). */
   configPath: string;
-  /** LARK_CHANNEL_HOME root; undefined = default. */
+  /** LARKLINE_HOME root; undefined = default. */
   rootDir?: string;
   /** Injectable for tests (defaults to the real startChannel). */
   startChannelFn?: StartChannelFn;
@@ -321,7 +321,7 @@ export class Supervisor {
         bridgeConfig: cfg,
         profileConfig,
         appPaths,
-        larkChannel: {
+        larklineEnv: {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
           configPath,

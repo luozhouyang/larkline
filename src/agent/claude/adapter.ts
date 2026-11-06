@@ -6,7 +6,7 @@ import type { Readable, Writable } from 'node:stream';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
-import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
+import { buildLarklineEnv, type LarklineEnvContext } from '../larkline-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import {
   CLAUDE_DEFAULT_PERMISSION_MODE,
@@ -20,7 +20,7 @@ import { translateEvent } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
-  larkChannel?: LarkChannelEnvContext;
+  larklineEnv?: LarklineEnvContext;
 }
 
 type ClaudeChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -30,12 +30,12 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly displayName = 'Claude Code';
 
   private readonly binary: string;
-  private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly larklineEnv: LarklineEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: ClaudeAdapterOptions = {}) {
     this.binary = opts.binary ?? 'claude';
-    this.larkChannel = opts.larkChannel;
+    this.larklineEnv = opts.larklineEnv;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -85,7 +85,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     const child = spawnProcess(this.binary, args, {
       cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
+      env: mergeProcessEnv(process.env, buildLarklineEnv(this.larklineEnv)),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ClaudeChild;
 

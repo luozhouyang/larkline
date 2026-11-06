@@ -1,5 +1,6 @@
 import { platform } from 'node:os';
 import { resolveAppPaths } from '../../config/app-paths';
+import { readBridgeEnv } from '../../config/env-compat';
 import { isAlive } from '../../runtime/registry';
 import { spawnProcess } from '../../platform/spawn';
 import { readUiSidecar } from '../../ui/sidecar';
@@ -18,7 +19,7 @@ export interface RunUiOptions {
  * the user to start one.
  */
 export async function runUi(opts: RunUiOptions = {}): Promise<void> {
-  const rootDir = process.env.LARK_CHANNEL_HOME;
+  const rootDir = readBridgeEnv('HOME');
   const appPaths = resolveAppPaths({ rootDir });
 
   const sidecar = await readUiSidecar(appPaths.hostUiFile);
@@ -37,12 +38,12 @@ export async function runUi(opts: RunUiOptions = {}): Promise<void> {
       '未检测到运行中的控制面。',
       '',
       '控制台需要 supervisor 模式（--web-ui）：',
-      '  lark-channel-bridge run --web-ui        # 前台运行 supervisor + 控制台',
-      '  lark-channel-bridge start --web-ui      # 作为后台服务运行 supervisor + 控制台',
+      '  larkline run --web-ui        # 前台运行 supervisor + 控制台',
+      '  larkline start --web-ui      # 作为后台服务运行 supervisor + 控制台',
       '',
       '（不带 --web-ui 的 run/start 是单 profile 无界面运行，适合无浏览器环境。）',
       '',
-      '启动后再次运行 `lark-channel-bridge ui` 打开控制台。',
+      '启动后再次运行 `larkline ui` 打开控制台。',
     ].join('\n'),
   );
   process.exitCode = 1;

@@ -1,6 +1,7 @@
 import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AgentPreflightError } from '../agent/preflight';
+import { readBridgeEnv } from '../config/env-compat';
 import { createDefaultProfileConfig, type AgentKind, type ProfileConfig } from '../config/profile-schema';
 import type { AppConfig } from '../config/schema';
 import { resolveWorkingDirectory } from '../policy/workspace';
@@ -60,7 +61,7 @@ async function ensureManagedDefaultWorkspace(path: string): Promise<string> {
 }
 
 export async function createBootstrapCodexConfig(binaryPath: string | undefined) {
-  const command = binaryPath ?? process.env.LARK_CHANNEL_CODEX_BIN ?? 'codex';
+  const command = binaryPath ?? readBridgeEnv('CODEX_BIN') ?? 'codex';
   let resolvedBinary: string;
   try {
     resolvedBinary = await resolveExecutablePath(command);

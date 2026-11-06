@@ -26,12 +26,12 @@ describe('Claude local session history', () => {
     });
     const { listRecentSessions } = await import('../../../src/session/history.js');
 
-    const cwd = '/Users/example/.lark-channel-workspaces/claude/default_open.sdks';
+    const cwd = '/Users/example/.larkline-workspaces/claude/default_open.sdks';
     const projectDir = join(
       home,
       '.claude',
       'projects',
-      '-Users-example--lark-channel-workspaces-claude-default-open-sdks',
+      '-Users-example--larkline-workspaces-claude-default-open-sdks',
     );
     await mkdir(projectDir, { recursive: true });
     const sessionPath = join(projectDir, 'session-a.jsonl');

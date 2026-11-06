@@ -43,15 +43,15 @@ vi.mock('../../../src/config/profile-store', () => ({
 
 vi.mock('../../../src/config/paths', () => ({
   paths: {
-    rootDir: '/tmp/lark-channel-home',
-    configFile: '/tmp/lark-channel-home/config.json',
+    rootDir: '/tmp/larkline-home',
+    configFile: '/tmp/larkline-home/config.json',
     profile: 'claude',
   },
 }));
 
 vi.mock('../../../src/daemon/paths', () => ({
-  daemonStdoutPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stdout.log`,
-  daemonStderrPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stderr.log`,
+  daemonStdoutPath: (profile: string) => `/tmp/larkline-home/profiles/${profile}/logs/daemon/stdout.log`,
+  daemonStderrPath: (profile: string) => `/tmp/larkline-home/profiles/${profile}/logs/daemon/stderr.log`,
   SUPERVISOR_SERVICE_ID: 'supervisor',
 }));
 
@@ -85,14 +85,14 @@ describe('profile-aware service commands', () => {
     mocks.stopProcessEntry.mockResolvedValue('terminated');
     mocks.resolveProfileRuntime.mockResolvedValue({
       profile: 'codex-dev',
-      configPath: '/tmp/lark-channel-home/config.json',
+      configPath: '/tmp/larkline-home/config.json',
       appPaths: {
         profile: 'codex-dev',
-        rootDir: '/tmp/lark-channel-home',
-        larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-        larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
-        profileLockFile: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
-        appLockFile: (appId: string) => `/tmp/lark-channel-home/registry/locks/app/${appId}.lock`,
+        rootDir: '/tmp/larkline-home',
+        larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+        larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
+        profileLockFile: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
+        appLockFile: (appId: string) => `/tmp/larkline-home/registry/locks/app/${appId}.lock`,
       },
       cfg: {
         accounts: {
@@ -165,16 +165,16 @@ describe('profile-aware service commands', () => {
       }),
       appPaths: expect.objectContaining({
         profile: 'codex-dev',
-        rootDir: '/tmp/lark-channel-home',
-        larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-        larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
+        rootDir: '/tmp/larkline-home',
+        larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+        larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
       }),
-      larkChannel: {
+      larklineEnv: {
         profile: 'codex-dev',
-        rootDir: '/tmp/lark-channel-home',
-        configPath: '/tmp/lark-channel-home/config.json',
-        larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-        larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
+        rootDir: '/tmp/larkline-home',
+        configPath: '/tmp/larkline-home/config.json',
+        larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+        larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
       },
     });
     expect(mocks.adapter.install).toHaveBeenCalled();
@@ -203,7 +203,7 @@ describe('profile-aware service commands', () => {
         providers: {
           bridge: {
             source: 'exec',
-            command: '/tmp/lark-channel-home/secrets-getter',
+            command: '/tmp/larkline-home/secrets-getter',
             args: [],
           },
         },
@@ -213,14 +213,14 @@ describe('profile-aware service commands', () => {
     mocks.resolveProfileRuntime
       .mockResolvedValueOnce({
         profile: 'codex-dev',
-        configPath: '/tmp/lark-channel-home/config.json',
+        configPath: '/tmp/larkline-home/config.json',
         appPaths: {
           profile: 'codex-dev',
-          rootDir: '/tmp/lark-channel-home',
-          larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-          larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
-          profileLockFile: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
-          appLockFile: (appId: string) => `/tmp/lark-channel-home/registry/locks/app/${appId}.lock`,
+          rootDir: '/tmp/larkline-home',
+          larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+          larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
+          profileLockFile: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
+          appLockFile: (appId: string) => `/tmp/larkline-home/registry/locks/app/${appId}.lock`,
         },
         cfg: {
           accounts: {
@@ -235,27 +235,27 @@ describe('profile-aware service commands', () => {
       })
       .mockResolvedValueOnce({
         profile: 'codex-dev',
-        configPath: '/tmp/lark-channel-home/config.json',
+        configPath: '/tmp/larkline-home/config.json',
         appPaths: {
           profile: 'codex-dev',
-          rootDir: '/tmp/lark-channel-home',
-          larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-          larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
-          profileLockFile: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
-          appLockFile: (appId: string) => `/tmp/lark-channel-home/registry/locks/app/${appId}.lock`,
+          rootDir: '/tmp/larkline-home',
+          larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+          larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
+          profileLockFile: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
+          appLockFile: (appId: string) => `/tmp/larkline-home/registry/locks/app/${appId}.lock`,
         },
         cfg: materializedCfg,
       })
       .mockResolvedValueOnce({
         profile: 'codex-dev',
-        configPath: '/tmp/lark-channel-home/config.json',
+        configPath: '/tmp/larkline-home/config.json',
         appPaths: {
           profile: 'codex-dev',
-          rootDir: '/tmp/lark-channel-home',
-          larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
-          larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
-          profileLockFile: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
-          appLockFile: (appId: string) => `/tmp/lark-channel-home/registry/locks/app/${appId}.lock`,
+          rootDir: '/tmp/larkline-home',
+          larkCliConfigDir: '/tmp/larkline-home/profiles/codex-dev/lark-cli',
+          larkCliSourceConfigFile: '/tmp/larkline-home/profiles/codex-dev/lark-cli-source/config.json',
+          profileLockFile: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
+          appLockFile: (appId: string) => `/tmp/larkline-home/registry/locks/app/${appId}.lock`,
         },
         cfg: materializedCfg,
       });
@@ -306,7 +306,7 @@ describe('profile-aware service commands', () => {
       locked: true,
       meta: {
         kind: 'profile',
-        target: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
+        target: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
         profile: 'codex-dev',
         agentKind: 'codex',
         pid: 2468,
@@ -345,7 +345,7 @@ describe('profile-aware service commands', () => {
     });
     const holder = {
       kind: 'profile' as const,
-      target: '/tmp/lark-channel-home/registry/locks/profile/codex-dev.lock',
+      target: '/tmp/larkline-home/registry/locks/profile/codex-dev.lock',
       profile: 'codex-dev',
       agentKind: 'codex' as const,
       pid: 2468,
@@ -394,7 +394,7 @@ describe('profile-aware service commands', () => {
         locked: true,
         meta: {
           kind: 'app',
-          target: '/tmp/lark-channel-home/registry/locks/app/cli_codex.lock',
+          target: '/tmp/larkline-home/registry/locks/app/cli_codex.lock',
           profile: 'codex-dev',
           agentKind: 'codex',
           appId: 'cli_codex',
@@ -420,8 +420,8 @@ describe('profile-aware service commands', () => {
     mocks.resolveProfileRuntime.mockResolvedValue({
       profile: 'claude',
       appPaths: {
-        profileLockFile: '/tmp/lark-channel-home/registry/locks/profile/claude.lock',
-        appLockFile: (appId: string) => `/tmp/lark-channel-home/registry/locks/app/${appId}.lock`,
+        profileLockFile: '/tmp/larkline-home/registry/locks/profile/claude.lock',
+        appLockFile: (appId: string) => `/tmp/larkline-home/registry/locks/app/${appId}.lock`,
       },
       cfg: {
         accounts: {
@@ -564,7 +564,7 @@ describe('profile-aware service commands', () => {
     expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', undefined);
     expect(mocks.adapter.deleteFile).toHaveBeenCalled();
     expect(lines).toContain('✓ 已清除后台运行注册');
-    expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/lark-channel-home)');
+    expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/larkline-home)');
   });
 });
 

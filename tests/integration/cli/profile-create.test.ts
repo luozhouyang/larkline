@@ -71,8 +71,8 @@ describe('profile create command', () => {
     await mkdir(workspace, { recursive: true });
     await writeProfiles(root, 'claude', ['claude']);
     const codex = await writeVersionExecutable(root, 'codex', 'codex 1.2.3');
-    const oldCodexBin = process.env.LARK_CHANNEL_CODEX_BIN;
-    process.env.LARK_CHANNEL_CODEX_BIN = codex;
+    const oldCodexBin = process.env.LARKLINE_CODEX_BIN;
+    process.env.LARKLINE_CODEX_BIN = codex;
 
     try {
       await runProfileCreate('codex-dev', {
@@ -85,9 +85,9 @@ describe('profile create command', () => {
       });
     } finally {
       if (oldCodexBin === undefined) {
-        delete process.env.LARK_CHANNEL_CODEX_BIN;
+        delete process.env.LARKLINE_CODEX_BIN;
       } else {
-        process.env.LARK_CHANNEL_CODEX_BIN = oldCodexBin;
+        process.env.LARKLINE_CODEX_BIN = oldCodexBin;
       }
     }
 

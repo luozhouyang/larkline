@@ -33,7 +33,7 @@ export interface UiServerDeps {
   supervisor: UiSupervisor;
   /** Bridge version string (for the status endpoint). */
   version: string;
-  /** Config root dir (LARK_CHANNEL_HOME); undefined = default. */
+  /** Config root dir (LARKLINE_HOME); undefined = default. */
   rootDir?: string;
   /** Bind host; defaults to 127.0.0.1. */
   host?: string;

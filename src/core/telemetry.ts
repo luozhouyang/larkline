@@ -1,3 +1,4 @@
+import { readBridgeEnv } from '../config/env-compat';
 import type { LogContext, LogFields } from './logger';
 
 /**
@@ -6,7 +7,7 @@ import type { LogContext, LogFields } from './logger';
  * The bridge itself ships **no** telemetry: by default this module is inert
  * (a noop adapter), pulls in zero dependencies, and makes zero network calls.
  *
- * An operator who wants monitoring points `LARK_CHANNEL_TELEMETRY_MODULE` at a
+ * An operator who wants monitoring points `LARKLINE_TELEMETRY_MODULE` at a
  * package that default-exports (or exposes `createAdapter`) an `AdapterFactory`.
  * That package — not this repo — owns the vendor SDK, endpoints, and keys.
  * See README "Optional telemetry".
@@ -110,7 +111,7 @@ function wrapSafe(adapter: TelemetryAdapter): TelemetryAdapter {
 }
 
 /**
- * Load the optional telemetry adapter named by `LARK_CHANNEL_TELEMETRY_MODULE`.
+ * Load the optional telemetry adapter named by `LARKLINE_TELEMETRY_MODULE`.
  *
  * - No env set → stay noop (the open-source default: zero deps, zero egress).
  * - Module missing / not a factory / throws → log a diagnostic and stay noop.
@@ -118,7 +119,7 @@ function wrapSafe(adapter: TelemetryAdapter): TelemetryAdapter {
  * Never throws: a broken telemetry module must not stop the bridge starting.
  */
 export async function loadTelemetryAdapter(meta: AdapterMeta): Promise<void> {
-  const mod = process.env.LARK_CHANNEL_TELEMETRY_MODULE;
+  const mod = readBridgeEnv('TELEMETRY_MODULE');
   if (!mod) return;
   try {
     const imported = (await import(normalizeModuleSpecifier(mod))) as {

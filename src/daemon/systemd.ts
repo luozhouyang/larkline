@@ -49,7 +49,7 @@ export function buildUnit(inputs: UnitInputs): string {
   // them unquoted is fine.
   const runArgs = inputs.runArgs.join(' ');
   return `[Unit]
-Description=Lark Channel Bridge bot
+Description=larkline bot
 After=network-online.target
 Wants=network-online.target
 
@@ -61,7 +61,7 @@ RestartSec=5
 StandardOutput=append:${daemonStdoutPath(inputs.profile)}
 StandardError=append:${daemonStderrPath(inputs.profile)}
 Environment="PATH=${escape(inputs.envPath)}"
-Environment="LARK_CHANNEL_HOME=${escape(inputs.channelHome)}"
+Environment="LARKLINE_HOME=${escape(inputs.channelHome)}"
 
 [Install]
 WantedBy=default.target

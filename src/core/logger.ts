@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { open, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { readBridgeEnv } from '../config/env-compat';
 import { telemetry } from './telemetry';
 
 export interface LoggerOptions {
@@ -12,7 +13,7 @@ export interface LoggerOptions {
 
 const DEFAULT_RETENTION_DAYS = Math.max(
   1,
-  Number(process.env.LARK_CHANNEL_LOG_DAYS ?? 30) || 30,
+  Number(readBridgeEnv('LOG_DAYS') ?? 30) || 30,
 );
 
 let loggerOptions: LoggerOptions = {

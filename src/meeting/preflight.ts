@@ -1,5 +1,5 @@
 import { resolveAppPaths } from '../config/app-paths';
-import { buildLarkChannelEnv } from '../agent/lark-channel-env';
+import { buildLarklineEnv } from '../agent/larkline-env';
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
 import { log } from '../core/logger';
 
@@ -188,7 +188,7 @@ export async function checkMeetingPreflight(
   exec: PreflightExec = defaultExec,
 ): Promise<MeetingPreflight> {
   const appPaths = resolveAppPaths({ rootDir: input.rootDir, profile: input.profile });
-  const env = buildLarkChannelEnv({
+  const env = buildLarklineEnv({
     profile: appPaths.profile,
     rootDir: appPaths.rootDir,
     configPath: appPaths.configFile,

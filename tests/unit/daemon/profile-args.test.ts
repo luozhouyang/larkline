@@ -30,14 +30,14 @@ describe('profile-scoped daemon paths and arguments', () => {
     );
   });
 
-  it('classic service pins `run --profile <profile>` and LARK_CHANNEL_HOME', () => {
+  it('classic service pins `run --profile <profile>` and LARKLINE_HOME', () => {
     const inputs = {
       nodePath: '/usr/local/bin/node',
-      bridgeEntryPath: '/repo/bin/lark-channel-bridge.mjs',
+      bridgeEntryPath: '/repo/bin/larkline.mjs',
       envPath: '/usr/local/bin:/usr/bin',
       profile: 'codex-dev',
       runArgs: ['run', '--profile', 'codex-dev'],
-      channelHome: '/tmp/lark-channel-home',
+      channelHome: '/tmp/larkline-home',
     };
 
     // Classic per-profile service pins --profile so the daemon always runs THIS
@@ -45,21 +45,21 @@ describe('profile-scoped daemon paths and arguments', () => {
     expect(buildPlist(inputs)).toContain('<string>run</string>');
     expect(buildPlist(inputs)).toContain('<string>--profile</string>');
     expect(buildPlist(inputs)).toContain('<string>codex-dev</string>');
-    expect(buildPlist(inputs)).toContain('<key>LARK_CHANNEL_HOME</key>\n        <string>/tmp/lark-channel-home</string>');
+    expect(buildPlist(inputs)).toContain('<key>LARKLINE_HOME</key>\n        <string>/tmp/larkline-home</string>');
     expect(buildUnit(inputs)).toContain('run --profile codex-dev');
-    expect(buildUnit(inputs)).toContain('Environment="LARK_CHANNEL_HOME=/tmp/lark-channel-home"');
+    expect(buildUnit(inputs)).toContain('Environment="LARKLINE_HOME=/tmp/larkline-home"');
     expect(buildLauncherCmd(inputs)).toContain('run --profile codex-dev');
-    expect(buildLauncherCmd(inputs)).toContain('set "LARK_CHANNEL_HOME=/tmp/lark-channel-home"');
+    expect(buildLauncherCmd(inputs)).toContain('set "LARKLINE_HOME=/tmp/larkline-home"');
   });
 
   it('supervisor service runs `run --web-ui` with no --profile', () => {
     const inputs = {
       nodePath: '/usr/local/bin/node',
-      bridgeEntryPath: '/repo/bin/lark-channel-bridge.mjs',
+      bridgeEntryPath: '/repo/bin/larkline.mjs',
       envPath: '/usr/local/bin:/usr/bin',
       profile: 'supervisor',
       runArgs: ['run', '--web-ui'],
-      channelHome: '/tmp/lark-channel-home',
+      channelHome: '/tmp/larkline-home',
     };
 
     expect(buildPlist(inputs)).toContain('<string>--web-ui</string>');

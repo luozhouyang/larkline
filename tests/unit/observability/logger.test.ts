@@ -212,7 +212,7 @@ describe('profile logger observability', () => {
         }
       `,
     );
-    process.env.LARK_CHANNEL_TELEMETRY_MODULE = pathToFileURL(adapterPath).href;
+    process.env.LARKLINE_TELEMETRY_MODULE = pathToFileURL(adapterPath).href;
     await loadTelemetryAdapter({
       version: 'test',
       appId: 'cli_secret_app',
@@ -259,7 +259,7 @@ describe('profile logger observability', () => {
     expect(telemetryText).toContain('[REDACTED_PATH]');
     expect(telemetryText).toContain('[REDACTED_RESOURCE]');
 
-    delete process.env.LARK_CHANNEL_TELEMETRY_MODULE;
+    delete process.env.LARKLINE_TELEMETRY_MODULE;
   });
 
   it('sanitizes optional telemetry metric tags', async () => {
@@ -281,7 +281,7 @@ describe('profile logger observability', () => {
         }
       `,
     );
-    process.env.LARK_CHANNEL_TELEMETRY_MODULE = pathToFileURL(adapterPath).href;
+    process.env.LARKLINE_TELEMETRY_MODULE = pathToFileURL(adapterPath).href;
     await loadTelemetryAdapter({
       version: 'test',
       appId: 'cli_secret_app',
@@ -311,7 +311,7 @@ describe('profile logger observability', () => {
     expect(metricsText).toContain('[REDACTED_PATH]');
     expect(metricsText).toContain('[REDACTED_RESOURCE]');
 
-    delete process.env.LARK_CHANNEL_TELEMETRY_MODULE;
+    delete process.env.LARKLINE_TELEMETRY_MODULE;
   });
 
   it('declares the required low-sensitivity event names', () => {

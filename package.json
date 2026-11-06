@@ -1,7 +1,7 @@
 {
-  "name": "lark-channel-bridge",
+  "name": "larkline",
   "version": "0.7.1",
-  "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
+  "description": "larkline: bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "publishConfig": {
@@ -10,14 +10,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zarazhangrui/feishu-claude-code-bridge.git"
+    "url": "git+https://github.com/luozhouyang/larkline.git"
   },
   "bugs": {
-    "url": "https://github.com/zarazhangrui/feishu-claude-code-bridge/issues"
+    "url": "https://github.com/luozhouyang/larkline/issues"
   },
-  "homepage": "https://github.com/zarazhangrui/feishu-claude-code-bridge#readme",
+  "homepage": "https://github.com/luozhouyang/larkline#readme",
   "bin": {
-    "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
+    "larkline": "./bin/larkline.mjs"
   },
   "exports": {
     ".": {
@@ -99,6 +99,7 @@
     ]
   },
   "keywords": [
+    "larkline",
     "feishu",
     "lark",
     "claude",

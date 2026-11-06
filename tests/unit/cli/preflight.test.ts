@@ -131,7 +131,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -146,10 +146,10 @@ describe('lark-cli preflight', () => {
       ['config', 'bind', '--source', 'lark-channel', '--identity', 'bot-only'],
     ]);
     expect(mocks.calls[0]?.env).toMatchObject({
-      LARK_CHANNEL: '1',
-      LARK_CHANNEL_PROFILE: 'codex',
-      LARK_CHANNEL_HOME: root,
-      LARK_CHANNEL_CONFIG: appPaths.larkCliSourceConfigFile,
+      LARKLINE: '1',
+      LARKLINE_PROFILE: 'codex',
+      LARKLINE_HOME: root,
+      LARKLINE_CONFIG: appPaths.larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
     });
     const source = JSON.parse(await readFile(appPaths.larkCliSourceConfigFile, 'utf8')) as {
@@ -158,7 +158,7 @@ describe('lark-cli preflight', () => {
     expect(source.accounts.app.id).toBe('cli_codex');
   });
 
-  it('falls back through a locked root source overlay for lark-cli builds without LARK_CHANNEL_CONFIG support', async () => {
+  it('falls back through a locked root source overlay for lark-cli builds without LARKLINE_CONFIG support', async () => {
     const root = await tempRoot();
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
     await writeFile(
@@ -196,7 +196,7 @@ describe('lark-cli preflight', () => {
     };
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -212,7 +212,7 @@ describe('lark-cli preflight', () => {
       ['config', 'bind', '--source', 'lark-channel', '--identity', 'bot-only'],
     ]);
     expect(mocks.calls[0]?.env).toMatchObject({
-      LARK_CHANNEL_CONFIG: appPaths.larkCliSourceConfigFile,
+      LARKLINE_CONFIG: appPaths.larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
     });
     expect(mocks.calls[1]?.env).toMatchObject({
@@ -256,7 +256,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -294,7 +294,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -327,7 +327,7 @@ describe('lark-cli preflight', () => {
     mocks.outputs = ['invalid --source "lark-channel"; valid values: env, file'];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -372,7 +372,7 @@ describe('lark-cli preflight', () => {
     let printed = '';
     try {
       await preFlightChecks({
-        larkChannel: {
+        larklineEnv: {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
           configPath: appPaths.configFile,
@@ -421,7 +421,7 @@ describe('lark-cli preflight', () => {
     let printed = '';
     try {
       await preFlightChecks({
-        larkChannel: {
+        larklineEnv: {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
           configPath: appPaths.configFile,
@@ -471,7 +471,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -486,7 +486,7 @@ describe('lark-cli preflight', () => {
       ['config', 'show'],
     ]);
     expect(mocks.calls[0]?.env).toMatchObject({
-      LARK_CHANNEL_CONFIG: appPaths.larkCliSourceConfigFile,
+      LARKLINE_CONFIG: appPaths.larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
     });
   });
@@ -514,7 +514,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -558,7 +558,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0, 0, 0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -604,7 +604,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0, 2, 0, 0, 0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -668,7 +668,7 @@ describe('lark-cli preflight', () => {
     mocks.exitCodes = [0, 0, 0];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -738,7 +738,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -816,7 +816,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -894,7 +894,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -939,7 +939,7 @@ describe('lark-cli preflight', () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -1024,7 +1024,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -1071,7 +1071,7 @@ describe('lark-cli preflight', () => {
     ];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -1105,7 +1105,7 @@ describe('lark-cli preflight', () => {
     mocks.outputs = ['no local config', ''];
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -1155,7 +1155,7 @@ describe('lark-cli preflight', () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,
@@ -1195,7 +1195,7 @@ describe('lark-cli preflight', () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
 
     await preFlightChecks({
-      larkChannel: {
+      larklineEnv: {
         profile: appPaths.profile,
         rootDir: appPaths.rootDir,
         configPath: appPaths.configFile,

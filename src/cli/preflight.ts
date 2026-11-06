@@ -1,6 +1,6 @@
 import * as p from '@clack/prompts';
 import { readFile } from 'node:fs/promises';
-import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../agent/lark-channel-env';
+import { buildLarklineEnv, type LarklineEnvContext } from '../agent/larkline-env';
 import type { AppPaths } from '../config/app-paths';
 import {
   type LarkCliConfig,
@@ -42,7 +42,7 @@ const MANUAL_INSTALL_HINT = [
 export interface PreFlightOptions {
   /** Skip lark-cli auto-install + bind. */
   skipCheckLarkCli?: boolean;
-  larkChannel?: LarkChannelEnvContext;
+  larklineEnv?: LarklineEnvContext;
   bridgeConfig?: AppConfig;
   profileConfig?: ProfileConfig;
   appPaths?: AppPaths;
@@ -56,16 +56,16 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
   if (opts.skipCheckLarkCli) return;
   const bridgeConfig = opts.bridgeConfig;
   const appPaths = opts.appPaths;
-  const privateBinding = bridgeConfig !== undefined && appPaths !== undefined && opts.larkChannel !== undefined;
+  const privateBinding = bridgeConfig !== undefined && appPaths !== undefined && opts.larklineEnv !== undefined;
   if (privateBinding) {
     await writeLarkCliSourceProjection(bridgeConfig, appPaths);
   }
-  const larkChannelEnv = opts.larkChannel ? buildLarkChannelEnv(opts.larkChannel) : undefined;
-  const legacyLarkChannelEnv = opts.larkChannel
-    ? buildLarkChannelEnv({ ...opts.larkChannel, larkCliConfigDir: undefined })
+  const larklineEnv = opts.larklineEnv ? buildLarklineEnv(opts.larklineEnv) : undefined;
+  const legacyLarkCliEnv = opts.larklineEnv
+    ? buildLarklineEnv({ ...opts.larklineEnv, larkCliConfigDir: undefined })
     : undefined;
   const profileArgs =
-    privateBinding || !opts.larkChannel?.profile ? [] : ['--profile', opts.larkChannel.profile];
+    privateBinding || !opts.larklineEnv?.profile ? [] : ['--profile', opts.larklineEnv.profile];
 
   if (!isLarkCliInstalled()) {
     console.log(
@@ -119,13 +119,13 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
       if (!teamTarget.sameApp) {
         await bindLarkCliWithCompatibility(
           profileArgs,
-          larkChannelEnv,
+          larklineEnv,
           appPaths,
           privateBinding,
           'bot-only',
         );
       } else if (teamTarget.identityPreset !== 'bot-only') {
-        await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'bot-only');
+        await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'bot-only');
       }
       return;
     }
@@ -133,7 +133,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
     if (target.sameApp) {
       if (shouldSkipLocalUserImport(opts.profileConfig?.larkCli)) {
         if (target.identityPreset !== 'bot-only') {
-          await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'bot-only');
+          await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'bot-only');
         }
         await persistLarkCliConfig(opts, {
           identityPreset: 'bot-only',
@@ -142,7 +142,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
         });
       } else if (target.hasUserAuth) {
         if (target.identityPreset !== 'user-default') {
-          const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'user-default');
+          const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'user-default');
           if (switchResult.success) {
             await persistLarkCliConfig(opts, {
               identityPreset: 'user-default',
@@ -150,7 +150,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
               reason: 'existing-private-user',
             });
           } else {
-            await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'bot-only');
+            await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'bot-only');
             await persistLarkCliConfig(opts, {
               identityPreset: 'bot-only',
               importStatus: 'failed',
@@ -165,11 +165,11 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
           });
         }
       } else if (shouldAttemptLocalUserImport(opts)) {
-        const localUser = await detectLocalSameAppUser(bridgeConfig, legacyLarkChannelEnv);
+        const localUser = await detectLocalSameAppUser(bridgeConfig, legacyLarkCliEnv);
         if (localUser.status === 'imported') {
           await copyLocalUsersToPrivateTarget(appPaths, bridgeConfig, localUser.users);
-          const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'user-default');
-          if (switchResult.success && await privateSameAppUserReady(profileArgs, larkChannelEnv, bridgeConfig)) {
+          const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'user-default');
+          if (switchResult.success && await privateSameAppUserReady(profileArgs, larklineEnv, bridgeConfig)) {
             await persistLarkCliConfig(opts, {
               identityPreset: 'user-default',
               importStatus: 'imported',
@@ -177,7 +177,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
             });
             return;
           }
-          await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'bot-only');
+          await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'bot-only');
           await persistLarkCliConfig(opts, {
             identityPreset: target.identityPreset ?? 'bot-only',
             importStatus: 'failed',
@@ -199,7 +199,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
         'lark-cli',
         [...profileArgs, 'config', 'show'],
         BIND_TIMEOUT_MS,
-        larkChannelEnv,
+        larklineEnv,
       );
       if (showResult.success) return;
     }
@@ -210,7 +210,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
       'lark-cli',
       [...profileArgs, 'config', 'show'],
       BIND_TIMEOUT_MS,
-      larkChannelEnv,
+      larklineEnv,
     );
     if (showResult.success) return;
   }
@@ -218,13 +218,13 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
   const localUser = privateBinding && shouldSkipLocalUserImport(opts.profileConfig?.larkCli)
     ? { status: 'not-needed' as const, reason: 'manual-bot-only' }
     : privateBinding && shouldAttemptLocalUserImport(opts)
-      ? await detectLocalSameAppUser(bridgeConfig, legacyLarkChannelEnv)
+      ? await detectLocalSameAppUser(bridgeConfig, legacyLarkCliEnv)
       : { status: 'not-needed' as const, reason: 'not-private-binding' };
   const sBind = p.spinner();
   sBind.start('Initializing lark-cli configuration');
   const bindResult = await bindLarkCliWithCompatibility(
     profileArgs,
-    larkChannelEnv,
+    larklineEnv,
     appPaths,
     privateBinding,
     'bot-only',
@@ -244,15 +244,15 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
   if (privateBinding) {
     if (localUser.status === 'imported') {
       await copyLocalUsersToPrivateTarget(appPaths, bridgeConfig, localUser.users);
-      const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'user-default');
-      if (switchResult.success && await privateSameAppUserReady(profileArgs, larkChannelEnv, bridgeConfig)) {
+      const switchResult = await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'user-default');
+      if (switchResult.success && await privateSameAppUserReady(profileArgs, larklineEnv, bridgeConfig)) {
         await persistLarkCliConfig(opts, {
           identityPreset: 'user-default',
           importStatus: 'imported',
           reason: 'same-app-local-user',
         });
       } else {
-        await switchLarkCliIdentityPolicy(profileArgs, larkChannelEnv, 'bot-only');
+        await switchLarkCliIdentityPolicy(profileArgs, larklineEnv, 'bot-only');
         await persistLarkCliConfig(opts, {
           identityPreset: 'bot-only',
           importStatus: 'failed',
@@ -275,16 +275,18 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
 
 async function bindLarkCliWithCompatibility(
   profileArgs: string[],
-  larkChannelEnv: NodeJS.ProcessEnv | undefined,
+  larklineEnv: NodeJS.ProcessEnv | undefined,
   appPaths: AppPaths | undefined,
   privateBinding: boolean,
   identityPreset: LarkCliIdentityPreset,
 ): Promise<RunResult> {
   const directResult = await runCapture(
     'lark-cli',
+    // `lark-channel` is the bind-source name implemented by the external
+    // lark-cli; it is not our product name and must survive the rename.
     [...profileArgs, 'config', 'bind', '--source', 'lark-channel', '--identity', identityPreset],
     BIND_TIMEOUT_MS,
-    larkChannelEnv,
+    larklineEnv,
   );
   if (directResult.success) return directResult;
 
@@ -301,7 +303,7 @@ async function bindLarkCliWithCompatibility(
           'lark-cli',
           [...profileArgs, 'config', 'bind', '--source', 'lark-channel', '--identity', identityPreset],
           BIND_TIMEOUT_MS,
-          larkChannelEnv,
+          larklineEnv,
         ),
     );
   }
@@ -380,14 +382,14 @@ function shouldAttemptLocalUserImport(opts: PreFlightOptions): boolean {
 
 async function privateSameAppUserReady(
   profileArgs: string[],
-  larkChannelEnv: NodeJS.ProcessEnv | undefined,
+  larklineEnv: NodeJS.ProcessEnv | undefined,
   cfg: AppConfig,
 ): Promise<boolean> {
   const result = await runCapture(
     'lark-cli',
     [...profileArgs, 'config', 'show'],
     BIND_TIMEOUT_MS,
-    larkChannelEnv,
+    larklineEnv,
   );
   if (!result.success) return false;
   const parsed = parseJsonObject(result.output);
@@ -495,7 +497,7 @@ async function copyLocalUsersToPrivateTarget(
 
 async function switchLarkCliIdentityPolicy(
   profileArgs: string[],
-  larkChannelEnv: NodeJS.ProcessEnv | undefined,
+  larklineEnv: NodeJS.ProcessEnv | undefined,
   identityPreset: LarkCliIdentityPreset,
 ): Promise<RunResult> {
   const strictMode = identityPreset === 'user-default' ? 'off' : 'bot';
@@ -504,14 +506,14 @@ async function switchLarkCliIdentityPolicy(
     'lark-cli',
     [...profileArgs, 'config', 'strict-mode', strictMode],
     BIND_TIMEOUT_MS,
-    larkChannelEnv,
+    larklineEnv,
   );
   if (!strictResult.success) return strictResult;
   return runCapture(
     'lark-cli',
     [...profileArgs, 'config', 'default-as', defaultAs],
     BIND_TIMEOUT_MS,
-    larkChannelEnv,
+    larklineEnv,
   );
 }
 
@@ -615,7 +617,7 @@ function printBindFailedWarning(result: RunResult, appPaths?: AppPaths): void {
 
 function restartInstruction(profile?: string): string {
   const suffix = profile ? ` --profile ${profile}` : '';
-  return `Restart the current profile: lark-channel-bridge restart${suffix}; for foreground runs, press Ctrl+C and rerun lark-channel-bridge run${suffix}.`;
+  return `Restart the current profile: larkline restart${suffix}; for foreground runs, press Ctrl+C and rerun larkline run${suffix}.`;
 }
 
 function shouldUseLegacyLarkChannelSourceOverlay(output: string, appPaths: AppPaths): boolean {

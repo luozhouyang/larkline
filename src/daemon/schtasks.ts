@@ -45,7 +45,7 @@ export function buildLauncherCmd(inputs: LauncherInputs): string {
   const runArgs = inputs.runArgs.join(' ');
   return [
     '@echo off',
-    `set "LARK_CHANNEL_HOME=${inputs.channelHome}"`,
+    `set "LARKLINE_HOME=${inputs.channelHome}"`,
     `set "PATH=${inputs.envPath}"`,
     `"${inputs.nodePath}" "${inputs.bridgeEntryPath}" ${runArgs} >> "${daemonStdoutPath(inputs.profile)}" 2>> "${daemonStderrPath(inputs.profile)}"`,
     '',

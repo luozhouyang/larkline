@@ -71,16 +71,16 @@ describe('CodexAdapter process contract', () => {
     expect(record.argv).not.toContain('--ignore-user-config');
     expect(record.argv).toContain('--skip-git-repo-check');
     expect(record.argv).not.toContain('hello from lark');
-    expect(record.stdin).toContain('lark-channel-bridge 运行约定');
+    expect(record.stdin).toContain('larkline 运行约定');
     expect(record.stdin).toContain('__bridge_cb');
     expect(record.stdin).toContain('lark-cli auth login');
-    expect(record.stdin).toContain('LARK_CHANNEL_PROFILE');
+    expect(record.stdin).toContain('LARKLINE_PROFILE');
     expect(record.stdin).toContain('LARKSUITE_CLI_CONFIG_DIR');
     expect(record.stdin).not.toContain('lark-cli config bind --source lark-channel');
     expect(record.stdin).toContain('hello from lark');
     expect(record.stdin).not.toBe('hello from lark');
     expect(record.env).toMatchObject({
-      LARK_CHANNEL: '1',
+      LARKLINE: '1',
       CODEX_HOME: '/outer/codex-home',
     });
     expect(record.env.APP_SECRET).toBe('inherited-secret');
@@ -100,7 +100,7 @@ describe('CodexAdapter process contract', () => {
     const run = new CodexAdapter({
       binary: fake.path,
       profileStateDir: fake.dir,
-      larkChannel: {
+      larklineEnv: {
         profile: 'codex-dev',
         rootDir,
         configPath,
@@ -117,10 +117,10 @@ describe('CodexAdapter process contract', () => {
     const record = await readRecord(fake.recordPath);
 
     expect(record.env).toMatchObject({
-      LARK_CHANNEL: '1',
-      LARK_CHANNEL_PROFILE: 'codex-dev',
-      LARK_CHANNEL_HOME: rootDir,
-      LARK_CHANNEL_CONFIG: larkCliSourceConfigFile,
+      LARKLINE: '1',
+      LARKLINE_PROFILE: 'codex-dev',
+      LARKLINE_HOME: rootDir,
+      LARKLINE_CONFIG: larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: larkCliConfigDir,
       CODEX_HOME: '/outer/codex-home',
     });
@@ -447,10 +447,10 @@ async function createFakeCodex(options: {
       '    cwd: process.cwd(),',
       '    stdin,',
       '    env: {',
-      '      LARK_CHANNEL: process.env.LARK_CHANNEL,',
-      '      LARK_CHANNEL_PROFILE: process.env.LARK_CHANNEL_PROFILE,',
-      '      LARK_CHANNEL_HOME: process.env.LARK_CHANNEL_HOME,',
-      '      LARK_CHANNEL_CONFIG: process.env.LARK_CHANNEL_CONFIG,',
+      '      LARKLINE: process.env.LARKLINE,',
+      '      LARKLINE_PROFILE: process.env.LARKLINE_PROFILE,',
+      '      LARKLINE_HOME: process.env.LARKLINE_HOME,',
+      '      LARKLINE_CONFIG: process.env.LARKLINE_CONFIG,',
       '      LARKSUITE_CLI_CONFIG_DIR: process.env.LARKSUITE_CLI_CONFIG_DIR,',
       '      CODEX_HOME: process.env.CODEX_HOME,',
       '      APP_SECRET: process.env.APP_SECRET,',
@@ -474,10 +474,10 @@ async function readRecord(path: string): Promise<{
   cwd: string;
   stdin: string;
   env: {
-    LARK_CHANNEL?: string;
-    LARK_CHANNEL_PROFILE?: string;
-    LARK_CHANNEL_HOME?: string;
-    LARK_CHANNEL_CONFIG?: string;
+    LARKLINE?: string;
+    LARKLINE_PROFILE?: string;
+    LARKLINE_HOME?: string;
+    LARKLINE_CONFIG?: string;
     LARKSUITE_CLI_CONFIG_DIR?: string;
     CODEX_HOME?: string;
     APP_SECRET?: string;
@@ -489,10 +489,10 @@ async function readRecord(path: string): Promise<{
     cwd: string;
     stdin: string;
     env: {
-      LARK_CHANNEL?: string;
-      LARK_CHANNEL_PROFILE?: string;
-      LARK_CHANNEL_HOME?: string;
-      LARK_CHANNEL_CONFIG?: string;
+      LARKLINE?: string;
+      LARKLINE_PROFILE?: string;
+      LARKLINE_HOME?: string;
+      LARKLINE_CONFIG?: string;
       LARKSUITE_CLI_CONFIG_DIR?: string;
       CODEX_HOME?: string;
       APP_SECRET?: string;

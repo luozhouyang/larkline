@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# larkline
 
 把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
+
+larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)，由 `lark-channel-bridge` 更名而来。npm 包名、CLI 命令、本地状态目录和环境变量现在统一使用 `larkline`。升级时状态目录会自动迁移，旧的 `LARK_CHANNEL_*` 环境变量仍可作为回退读取。
 
 [English README](./README.md)
 
@@ -16,6 +18,7 @@
 - **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
 - **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
+- **长任务保护**：飞书会在流式卡片创建约 10 分钟后强制结束它。larkline 会在到达这个上限前暂停实时更新，并在任务结束后把最终答案作为一条新消息单独发送，避免长任务静默丢失结果。
 
 ## 前置条件
 
@@ -28,15 +31,17 @@
 ## 安装
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g larkline
 # 或
-pnpm add -g lark-channel-bridge
+pnpm add -g larkline
 ```
+
+如果之前安装过 `lark-channel-bridge`，请先停止并注销旧的后台服务（`lark-channel-bridge stop` / `unregister`），再安装 `larkline` 并运行 `larkline start`。首次启动会自动把 `~/.lark-channel` 重命名为 `~/.larkline`；也可以用 `LARKLINE_HOME` 指定其他状态目录。
 
 ## 首次启动
 
 ```bash
-lark-channel-bridge run
+larkline run
 ```
 
 第一次运行会进入扫码向导：
@@ -45,16 +50,16 @@ lark-channel-bridge run
 2. 用飞书 App 扫码。
 3. 选择或创建 PersonalAgent 应用。
 4. 如果终端提示，选择本次要初始化的 agent。
-5. 成功后配置写入 `~/.lark-channel/config.json`。
+5. 成功后配置写入 `~/.larkline/config.json`。
 
 没有指定项目目录也可以启动。bridge 会创建一个 profile 托管的默认工作目录；启动后在飞书里发送 `/cd <path>` 切到实际项目。
 
 如果已经有 PersonalAgent app，可以在初始化时传 `--app-id` 跳过创建应用流程；命令会提示输入 App Secret。
 
 ```bash
-lark-channel-bridge run --app-id cli_xxx
+larkline run --app-id cli_xxx
 # 或直接初始化并启动后台服务
-lark-channel-bridge start --app-id cli_xxx
+larkline start --app-id cli_xxx
 ```
 
 Lark 国际版应用可加 `--tenant lark`。
@@ -64,9 +69,9 @@ Lark 国际版应用可加 `--tenant lark`。
 `run` 适合首次配置和前台调试。确认 bot 能正常收发消息后，先用 `Ctrl-C` 停掉前台进程，再用系统服务常驻后台：
 
 ```bash
-lark-channel-bridge start
-lark-channel-bridge status
-lark-channel-bridge stop
+larkline start
+larkline status
+larkline stop
 ```
 
 服务层命令必须先全局安装，不能直接用 `npx`。daemon 的 launchd plist / systemd unit / Windows 任务会记录 bridge CLI 的路径；如果这个路径来自 npm 临时缓存，缓存清掉后 daemon 就起不来。`run` 用 `npx` 单次启动没问题。
@@ -74,34 +79,34 @@ lark-channel-bridge stop
 服务层命令按 profile 注册，每个 profile 有独立服务：
 
 ```bash
-lark-channel-bridge start [--profile <name>]
-lark-channel-bridge stop [--profile <name>]
-lark-channel-bridge restart [--profile <name>]
-lark-channel-bridge status [--profile <name>]
-lark-channel-bridge unregister [--profile <name>]
+larkline start [--profile <name>]
+larkline stop [--profile <name>]
+larkline restart [--profile <name>]
+larkline status [--profile <name>]
+larkline unregister [--profile <name>]
 ```
 
 平台映射：
-- **macOS**：launchd 用户代理 `ai.lark-channel-bridge.bot.<profile>`
-- **Linux**：systemd 用户单元 `lark-channel-bridge.bot.<profile>.service`
-- **Windows**：Task Scheduler 任务 `LarkChannelBridge.Bot.<profile>`，launcher 是 `.cmd`
+- **macOS**：launchd 用户代理 `ai.larkline.bot.<profile>`
+- **Linux**：systemd 用户单元 `larkline.bot.<profile>.service`
+- **Windows**：Task Scheduler 任务 `Larkline.Bot.<profile>`，launcher 是 `.cmd`
 
-daemon 日志在 `~/.lark-channel/profiles/<profile>/logs/daemon/`。
+daemon 日志在 `~/.larkline/profiles/<profile>/logs/daemon/`。
 
 ### 多 profile：分别运行 Claude 和 Codex
 
 默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 profile：
 
 ```bash
-lark-channel-bridge start --profile claude --agent claude
-lark-channel-bridge start --profile codex --agent codex
+larkline start --profile claude --agent claude
+larkline start --profile codex --agent codex
 ```
 
 例如只重启 Codex bot：
 
 ```bash
-lark-channel-bridge restart --profile codex
-lark-channel-bridge status --profile codex
+larkline restart --profile codex
+larkline status --profile codex
 ```
 
 ## 命令速查
@@ -109,24 +114,24 @@ lark-channel-bridge status --profile codex
 ### 宿主 CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
-lark-channel-bridge ps
-lark-channel-bridge kill <id|#>
-lark-channel-bridge --help
+larkline run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline migrate [--profile <name>] [--agent claude|codex]
+larkline ps
+larkline kill <id|#>
+larkline --help
 ```
 
 `profile use <name>` 会切换后续默认启动使用的 profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，再使用这些 profile 管理命令：
 
 ```bash
-lark-channel-bridge profile create claude --agent claude
-lark-channel-bridge profile create codex --agent codex
-lark-channel-bridge profile list
-lark-channel-bridge profile use <name>
-lark-channel-bridge profile remove <name>
-lark-channel-bridge profile remove <name> --purge --yes
-lark-channel-bridge profile export <name> [--output ./profile.json] [--force]
-lark-channel-bridge profile export <name> --include-secrets --yes
+larkline profile create claude --agent claude
+larkline profile create codex --agent codex
+larkline profile list
+larkline profile use <name>
+larkline profile remove <name>
+larkline profile remove <name> --purge --yes
+larkline profile export <name> [--output ./profile.json] [--force]
+larkline profile export <name> --include-secrets --yes
 ```
 
 `profile remove` 默认归档本地状态，也可以删除当前激活的 profile。若还剩其他 profile，会自动切到下一个；若这是最后一个 profile，会清空 root config，之后可以用同名重新创建。只有加 `--purge --yes` 才会永久删除。`profile export` 默认脱敏 app secret；只有加 `--include-secrets --yes` 才会导出敏感配置。
@@ -173,7 +178,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 
 ## lark-cli 身份策略
 
-每个 profile 都使用当前 profile 的 lark-cli 目录：`~/.lark-channel/profiles/<profile>/lark-cli`。agent 子进程会收到指向这个目录的 `LARKSUITE_CLI_CONFIG_DIR`，所以一个 profile 里的个人授权不会共享给另一个 profile。
+每个 profile 都使用当前 profile 的 lark-cli 目录：`~/.larkline/profiles/<profile>/lark-cli`。agent 子进程会收到指向这个目录的 `LARKSUITE_CLI_CONFIG_DIR`，所以一个 profile 里的个人授权不会共享给另一个 profile。
 
 默认策略是 `bot-only`：lark-cli 使用应用 / bot 身份，不访问个人资源。当用户为了日历、邮箱、云盘等个人资源完成授权后，当前 profile 可以切到 `user-default`，保留应用身份，同时允许已授权的用户身份。owner/admin 可以在 `/config` 查看或切换这个策略；`/status` 会用 `lark-cli: app` 或 `lark-cli: user-ready` 展示当前摘要。
 
@@ -186,7 +191,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 ```json
 {
   "workspaces": {
-    "default": "/Users/me/.lark-channel-workspaces/claude/default"
+    "default": "/Users/me/.larkline-workspaces/claude/default"
   }
 }
 ```
@@ -222,19 +227,19 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 
 | 路径 | 内容 |
 |---|---|
-| `~/.lark-channel/config.json` | root config，包含 profiles 和 active profile |
-| `~/.lark-channel/active-profile` | 最近选择的 profile |
-| `~/.lark-channel/profiles/<profile>/sessions.json` | 会话状态 |
-| `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
-| `~/.lark-channel/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
-| `~/.lark-channel/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
-| `~/.lark-channel/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
-| `~/.lark-channel/profiles/<profile>/media/` | 附件缓存 |
-| `~/.lark-channel/profiles/<profile>/logs/` | 结构化运行日志 |
-| `~/.lark-channel/registry/processes.json` | 本机进程注册表 |
-| `~/.lark-channel/registry/locks/` | profile lock 和 app lock |
+| `~/.larkline/config.json` | root config，包含 profiles 和 active profile |
+| `~/.larkline/active-profile` | 最近选择的 profile |
+| `~/.larkline/profiles/<profile>/sessions.json` | 会话状态 |
+| `~/.larkline/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
+| `~/.larkline/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
+| `~/.larkline/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
+| `~/.larkline/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
+| `~/.larkline/profiles/<profile>/media/` | 附件缓存 |
+| `~/.larkline/profiles/<profile>/logs/` | 结构化运行日志 |
+| `~/.larkline/registry/processes.json` | 本机进程注册表 |
+| `~/.larkline/registry/locks/` | profile lock 和 app lock |
 
-设置 `LARK_CHANNEL_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARK_CHANNEL_LOG_DAYS` 可以调整日志保留天数。
+设置 `LARKLINE_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARKLINE_LOG_DAYS` 可以调整日志保留天数。
 
 ## 访问控制
 
@@ -272,7 +277,7 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 
 ### 高级：直接改配置文件
 
-不想在飞书里点的话，`/invite`、`/config` 背后写的是 `~/.lark-channel/config.json` 中对应 profile 的 `access` 字段。空白名单表示这个名单没人，不表示所有人都能用。下面只是 profile 里的字段片段，不要整段覆盖 `config.json`：
+不想在飞书里点的话，`/invite`、`/config` 背后写的是 `~/.larkline/config.json` 中对应 profile 的 `access` 字段。空白名单表示这个名单没人，不表示所有人都能用。下面只是 profile 里的字段片段，不要整段覆盖 `config.json`：
 
 ```json
 {
@@ -294,7 +299,7 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 `allowedUsers` / `admins` 填用户 `open_id`，`allowedChats` 填群 `chat_id`。手动找 ID 最简单的办法：让对方给 bot 发条消息（群里就 @ 它一下），然后看当前 profile 的日志：
 
 ```bash
-grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
+grep '"event":"enter"' ~/.larkline/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
 ```
 
 每行都带 `chatId`（群 / 私聊 ID）和 `senderId`（用户 `open_id`）。手改完后**重启 bridge**，或在允许的 admin 上下文里发 `/reconnect` 让它生效。日常调整还是 `/invite` / `/config` 更省事，直接改文件主要用于部署脚本预填。
@@ -308,6 +313,8 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 **bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
 
 **agent 子进程假死（卡片停在最后一帧不动）**：支持 idle 探活。agent 一段时间没输出就会被 SIGTERM kill，卡片末尾会标出自动终止原因。默认关闭。开启方式：`/config` 设全局值（分钟），或 `/timeout 10` 只对当前会话生效；`/timeout off` 关掉当前会话的探活；`/timeout default` 清掉会话覆盖，回退到全局设置。
+
+**长任务停在“正在调用工具”，之后收不到任何消息**：飞书会在流式卡片创建约 10 分钟后强制结束它，并静默丢弃之后的卡片更新。这是飞书服务端的限制，桌面端和手机端都可能出现。larkline 会在约 8.5 分钟时暂停过程卡片并显示说明，等任务结束后把最终答案作为一条新消息发送。可以用 `LARKLINE_STREAM_CARD_SAFE_MS`（毫秒，上限小于 10 分钟）调整暂停阈值。触发保护时，日志中会出现 `stream card-lifetime-expiring` 和 `stream card-lifetime-final-fallback`。
 
 **图片发过去 agent 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。
 
@@ -330,13 +337,13 @@ pnpm build
 想接自己的监控时，用环境变量指向一个 default export（或导出 `createAdapter`）`AdapterFactory` 的模块：
 
 ```bash
-LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+LARKLINE_TELEMETRY_MODULE=your-telemetry-package larkline start
 ```
 
 该模块会收到每一条 `log.*` 事件，以及错误 / 指标钩子，转发到任何你想要的地方。接口从包根导出：
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'larkline';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* 上报事件 */},

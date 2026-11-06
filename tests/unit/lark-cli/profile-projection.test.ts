@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 describe('writeLarkCliSourceProjection', () => {
-  it('writes a profile-scoped legacy lark-channel source config', async () => {
+  it('writes a profile-scoped lark-cli source config', async () => {
     const root = await tempRoot();
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex-dev' });
     const cfg: AppConfig = {
@@ -86,6 +86,10 @@ describe('writeLarkCliSourceProjection', () => {
             command: expectedSecretsGetterWrapper(appPaths.secretsGetterScript),
             args: [],
             env: {
+              LARKLINE_HOME: root,
+              LARKLINE_PROFILE: 'codex-dev',
+              // Legacy aliases let pre-rename lark-cli builds resolve the same
+              // profile during the transition.
               LARK_CHANNEL_HOME: root,
               LARK_CHANNEL_PROFILE: 'codex-dev',
             },

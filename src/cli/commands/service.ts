@@ -201,7 +201,7 @@ async function assertLockNotHeldByAnotherRuntime(
     if (!opts.confirmStopRuntimeLockProcess && (!process.stdin.isTTY || !process.stdout.isTTY)) {
       console.error(
         `  非交互模式无法确认停止 ${kind === 'profile' ? 'profile' : 'app'} 占用进程。` +
-          '请先用 `lark-channel-bridge ps` 查看并用 `lark-channel-bridge kill <bot id>` 停止后重试。',
+          '请先用 `larkline ps` 查看并用 `larkline kill <bot id>` 停止后重试。',
       );
       process.exit(1);
     }
@@ -239,7 +239,7 @@ async function confirmStopRuntimeLockProcess(): Promise<boolean> {
 }
 
 /**
- * Poll `~/.lark-channel/processes.json` for a freshly-registered bridge
+ * Poll `~/.larkline/processes.json` for a freshly-registered bridge
  * instance whose appId matches our config and whose `botName` is filled —
  * the latter only happens AFTER the WS handshake to Feishu succeeds, so
  * by the time we see it the daemon is genuinely online.
@@ -341,7 +341,7 @@ export async function runServiceStart(opts: ServiceStartOptions = {}): Promise<v
     bridgeConfig,
     profileConfig,
     appPaths,
-    larkChannel: {
+    larklineEnv: {
       profile: appPaths.profile,
       rootDir: appPaths.rootDir,
       configPath,
@@ -398,7 +398,7 @@ async function runServiceStartWebUi(opts: ServiceStartOptions): Promise<void> {
     bridgeConfig,
     profileConfig,
     appPaths,
-    larkChannel: {
+    larklineEnv: {
       profile: appPaths.profile,
       rootDir: appPaths.rootDir,
       configPath,
@@ -425,7 +425,7 @@ async function runServiceStartWebUi(opts: ServiceStartOptions): Promise<void> {
   }
 
   await reportConnectAfter('started', profile, adapter.start);
-  console.log('  控制台由后台 supervisor 托管；用 `lark-channel-bridge ui` 打开');
+  console.log('  控制台由后台 supervisor 托管；用 `larkline ui` 打开');
 }
 
 /**
@@ -555,7 +555,7 @@ export async function runServiceStatus(opts: ServiceProfileOptions = {}): Promis
  * `bridge unregister` — stop, disable autostart, and remove the service
  * definition file.
  *
- * Idempotent. Leaves ~/.lark-channel/ state untouched (keystore, sessions,
+ * Idempotent. Leaves ~/.larkline/ state untouched (keystore, sessions,
  * logs etc) — that's the user's data, not service-manager hooks.
  */
 export async function runServiceUnregister(opts: ServiceProfileOptions = {}): Promise<void> {

@@ -1,4 +1,4 @@
-import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../agent/lark-channel-env';
+import { buildLarklineEnv, type LarklineEnvContext } from '../agent/larkline-env';
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
 import type { LarkCliIdentityPreset } from '../config/profile-schema';
 
@@ -35,10 +35,10 @@ function isLarkCliUserDisplayValue(value: string): boolean {
 }
 
 export async function applyLarkCliIdentityPolicy(
-  context: LarkChannelEnvContext,
+  context: LarklineEnvContext,
   identityPreset: LarkCliIdentityPreset,
 ): Promise<boolean> {
-  const env = buildLarkChannelEnv(context);
+  const env = buildLarklineEnv(context);
   const strictMode = identityPreset === 'user-default' ? 'off' : 'bot';
   const defaultAs = identityPreset === 'user-default' ? 'auto' : 'bot';
   const strictResult = await runQuiet('lark-cli', ['config', 'strict-mode', strictMode], env);

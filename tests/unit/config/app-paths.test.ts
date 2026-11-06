@@ -54,10 +54,10 @@ describe('resolveAppPaths', () => {
     expect(paths.secretsGetterScript).toBe(join(root, 'secrets-getter'));
   });
 
-  it('uses LARK_CHANNEL_HOME only for the root directory, not profile selection', async () => {
+  it('uses LARKLINE_HOME only for the root directory, not profile selection', async () => {
     const root = await tempRoot();
-    const prev = process.env.LARK_CHANNEL_HOME;
-    process.env.LARK_CHANNEL_HOME = root;
+    const prev = process.env.LARKLINE_HOME;
+    process.env.LARKLINE_HOME = root;
     try {
       const paths = resolveAppPaths({ profile: 'operator-choice' });
       expect(paths.rootDir).toBe(root);
@@ -65,10 +65,30 @@ describe('resolveAppPaths', () => {
       expect(paths.profileDir).toBe(join(root, 'profiles', 'operator-choice'));
     } finally {
       if (prev === undefined) {
-        delete process.env.LARK_CHANNEL_HOME;
+        delete process.env.LARKLINE_HOME;
       } else {
-        process.env.LARK_CHANNEL_HOME = prev;
+        process.env.LARKLINE_HOME = prev;
       }
+    }
+  });
+
+  it('prefers LARKLINE_HOME over the legacy LARK_CHANNEL_HOME', async () => {
+    const legacyRoot = await tempRoot();
+    const newRoot = await tempRoot();
+    const prevNew = process.env.LARKLINE_HOME;
+    const prevOld = process.env.LARK_CHANNEL_HOME;
+    try {
+      delete process.env.LARKLINE_HOME;
+      process.env.LARK_CHANNEL_HOME = legacyRoot;
+      expect(resolveAppPaths({ profile: 'claude' }).rootDir).toBe(legacyRoot);
+
+      process.env.LARKLINE_HOME = newRoot;
+      expect(resolveAppPaths({ profile: 'claude' }).rootDir).toBe(newRoot);
+    } finally {
+      if (prevNew === undefined) delete process.env.LARKLINE_HOME;
+      else process.env.LARKLINE_HOME = prevNew;
+      if (prevOld === undefined) delete process.env.LARK_CHANNEL_HOME;
+      else process.env.LARK_CHANNEL_HOME = prevOld;
     }
   });
 
