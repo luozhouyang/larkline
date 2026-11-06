@@ -17,7 +17,7 @@
   },
   "homepage": "https://github.com/luozhouyang/larkline#readme",
   "bin": {
-    "larkline": "./bin/larkline.mjs"
+    "larkline": "bin/larkline.mjs"
   },
   "exports": {
     ".": {
