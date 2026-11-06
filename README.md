@@ -330,6 +330,23 @@ pnpm build
 
 `pnpm test` includes unit, integration, and process-level adapter tests. CI runs on macOS, Ubuntu, and Windows with `pnpm install --frozen-lockfile`, `pnpm test`, `pnpm typecheck`, and `pnpm build`.
 
+### Release
+
+Releases are tag-driven. Pushing a `v*` tag runs `.github/workflows/release.yml`, which verifies that the tag matches `package.json`, runs tests / typecheck / build, publishes to npm with provenance through [npm trusted publishing](https://docs.npmjs.com/trusted-publishers), and creates a GitHub Release. No `NPM_TOKEN` secret is used.
+
+One-time setup:
+
+1. If `larkline` does not exist on npm yet, publish the first version manually: `npm login && npm publish --access public`.
+2. On npmjs.com → `larkline` → Settings → Trusted publishing, add a GitHub Actions publisher with owner `luozhouyang`, repository `larkline`, and workflow filename `release.yml`.
+3. After that, cut releases with the tag and push it:
+
+```bash
+pnpm version patch   # or minor / major
+git push --follow-tags
+```
+
+The tag and `package.json` must agree (`v0.7.1` ↔ `0.7.1`), otherwise the workflow stops before publishing.
+
 ## Optional telemetry
 
 By default the bridge reports **nothing**: no metrics, no logs leave your machine, and it pulls in zero telemetry dependencies. The hook below is inert unless you opt in.

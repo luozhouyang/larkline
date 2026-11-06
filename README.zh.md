@@ -330,6 +330,23 @@ pnpm build
 
 `pnpm test` 包含 unit、integration 和 process-level adapter 测试。CI 在 macOS、Ubuntu、Windows 上执行 `pnpm install --frozen-lockfile`、`pnpm test`、`pnpm typecheck` 和 `pnpm build`。
 
+### 发布
+
+发布由 tag 触发。推送 `v*` tag 后会运行 `.github/workflows/release.yml`：校验 tag 与 `package.json` 版本一致，执行测试 / typecheck / build，通过 [npm trusted publishing](https://docs.npmjs.com/trusted-publishers) 带 provenance 发布到 npm，并创建 GitHub Release。不需要 `NPM_TOKEN` secret。
+
+首次配置：
+
+1. 如果 npm 上还没有 `larkline`，先在本地手动发布第一个版本：`npm login && npm publish --access public`。
+2. 在 npmjs.com → `larkline` → Settings → Trusted publishing 添加 GitHub Actions：owner `luozhouyang`、repository `larkline`、workflow 文件名 `release.yml`。
+3. 之后用 tag 发布：
+
+```bash
+pnpm version patch   # 或 minor / major
+git push --follow-tags
+```
+
+tag 必须和 `package.json` 版本一致（`v0.7.1` ↔ `0.7.1`），否则流水线会在发布前停止。
+
 ## 可选：遥测（Telemetry）
 
 默认情况下 bridge **不上报任何数据**：没有指标、没有日志离开你的机器，也不引入任何遥测依赖。下面这个钩子在你主动开启前完全是空操作。
