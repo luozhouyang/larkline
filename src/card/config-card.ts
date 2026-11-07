@@ -258,7 +258,7 @@ export function configFormCard(opts: ConfigFormOpts): object {
                 '\n**群里需要 @ bot**\n' +
                 '_是(默认):群和话题群里,不 @ bot 的消息不会触发回复,bot 不接群里聊天_\n' +
                 '_否:任何消息都会发给 agent(0.1.21 及更早版本的行为)_\n' +
-                '_私聊永远不需要 @;`@全员` 永远不响应_',
+                '_私聊永远不需要 @;群里只剩你一个真人时也会自动免 @;`@全员` 永远不响应_',
             },
             {
               tag: 'select_static',

@@ -164,7 +164,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/doctor [description]` | Run low-sensitive diagnostics |
 | `/help` | Help card |
 
-DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned.
+DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. When a group has only one human member (bots don't count), the mention requirement is relaxed automatically — this covers dedicated groups created with `/new chat`. Adding a second person restores the `@` requirement. Cloud-doc comments in supported document types run when the bot is mentioned.
 
 ## Reply Display and COT
 
@@ -271,7 +271,7 @@ To let other people or groups in, add them to one of three lists:
 ### Worth knowing
 
 - Changes take effect on the **next message** — no restart needed.
-- **In groups you must `@` the bot first** (DMs don't need it). That's a separate toggle (`/config` → "require @ in groups"), independent of the lists above.
+- **In groups you must `@` the bot first** (DMs don't need it; a group with only one human relaxes this automatically). That's a separate toggle (`/config` → "require @ in groups"), independent of the lists above.
 - Strangers get pure silence — no reply at all. The one exception: if someone `@`-mentions the bot in a group that hasn't been opened up, the bot posts a friendly one-liner telling them an admin can run `/invite group` to enable it.
 - Cloud-doc comments are document-scoped: anyone who can comment in a supported document and mention the bot can trigger a reply.
 

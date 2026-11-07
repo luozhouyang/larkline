@@ -17,9 +17,15 @@ export interface FakeRawClientRequest {
   params: unknown;
 }
 
+export interface FakeCreatedChat {
+  chatId: string;
+  params: unknown;
+}
+
 export interface FakeChannel {
   readonly sent: FakeChannelMessage[];
   readonly streams: FakeChannelStream[];
+  readonly createdChats: FakeCreatedChat[];
   /**
    * Maps a messageId to the `thread_id` that `fetchRawMessage` should report
    * for it — mirrors the raw `im.v1.message.get` items[0].thread_id that the
@@ -50,6 +56,7 @@ export interface FakeChannel {
   };
   createCard(cardJson: unknown): Promise<{ cardId: string }>;
   updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void>;
+  createChat(params: unknown): Promise<{ chatId: string }>;
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
 }
@@ -57,11 +64,13 @@ export interface FakeChannel {
 export function createFakeChannel(): FakeChannel {
   const sent: FakeChannelMessage[] = [];
   const streams: FakeChannelStream[] = [];
+  const createdChats: FakeCreatedChat[] = [];
   const requests: FakeRawClientRequest[] = [];
   const rawThreadIds = new Map<string, string>();
   const cardById = new Map<string, unknown>();
   let nextCard = 1;
   let nextMessage = 1;
+  let nextChat = 1;
 
   const pushManagedCardMessage = (params: unknown, fallbackChatId: string): { message_id: string } => {
     requests.push({ method: 'im.v1.message.create', params });
@@ -77,6 +86,7 @@ export function createFakeChannel(): FakeChannel {
   return {
     sent,
     streams,
+    createdChats,
     rawThreadIds,
     async fetchRawMessage(messageId: string): Promise<Array<{ thread_id?: string }>> {
       const threadId = rawThreadIds.get(messageId);
@@ -128,6 +138,11 @@ export function createFakeChannel(): FakeChannel {
     },
     async updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void> {
       requests.push({ method: 'cardkit.v1.card.update', params: { cardId, cardJson, sequence } });
+    },
+    async createChat(params: unknown): Promise<{ chatId: string }> {
+      const chatId = `oc_fake_${nextChat++}`;
+      createdChats.push({ chatId, params });
+      return { chatId };
     },
     async send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }> {
       // Resolve a `{ cardId }` reference back to the card JSON so assertions

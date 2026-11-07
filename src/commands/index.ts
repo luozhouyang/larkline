@@ -366,9 +366,11 @@ async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void
   }
 
   // Welcome the user inside the new group with a hint about how to start.
+  // The group starts with only the requester and the bot, so the intake
+  // mention gate automatically treats it like a DM (see ChatMemberCountCache).
   const welcome = sourceCwd
-    ? `🎉 群已建好，cwd 继承自原群：\`${sourceCwd}\`\n\n@我 + 任意消息开始对话。`
-    : '🎉 群已建好。\n\n@我 + 任意消息开始对话。';
+    ? `🎉 群已建好，cwd 继承自原群：\`${sourceCwd}\`\n\n直接发消息即可，无需 @我。`
+    : '🎉 群已建好。\n\n直接发消息即可，无需 @我。';
   try {
     await ctx.channel.send(created.chatId, { markdown: welcome });
   } catch (err) {

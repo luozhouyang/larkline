@@ -299,6 +299,26 @@ describe('Bridge command contracts', () => {
     expect(root?.profiles.claude?.access.allowedUsers).not.toContain('ou-alice');
   });
 
+  it('creates a /new chat group without persisting a static mention override', async () => {
+    const h = await createHarness();
+
+    await expect(h.run('/new chat 专属群')).resolves.toBe(true);
+
+    const created = h.channel.createdChats[0];
+    expect(created).toBeDefined();
+
+    // The group starts with only the requester + bot, so intake relaxes the
+    // @ requirement dynamically. No per-chat override is written, otherwise
+    // adding another member later could never restore the gate.
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.chatRequireMention).toBeUndefined();
+    expect(h.controls.profileConfig.access.chatRequireMention).toBeUndefined();
+
+    // The welcome lands in the new group and tells the user they can skip @.
+    const welcome = h.channel.sent.find((entry) => entry.chatId === created!.chatId);
+    expect(JSON.stringify(welcome?.content)).toContain('无需 @我');
+  });
+
   it('adds every known bot group through /invite all group', async () => {
     const h = await createHarness();
     h.controls.knownChats = [

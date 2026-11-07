@@ -57,6 +57,7 @@ import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
+import { ChatMemberCountCache } from './chat-member-count-cache';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
@@ -199,6 +200,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
   const chatModeCache = new ChatModeCache();
+  // Short-TTL human-member count cache backing the "solo group behaves like a
+  // DM" relaxation of the group @-mention gate.
+  const chatMemberCountCache = new ChatMemberCountCache();
   // Concurrency cap — reads `preferences.maxConcurrentRuns` on each acquire,
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
@@ -358,6 +362,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           msg,
           controls,
           chatModeCache,
+          chatMemberCountCache,
           logThreadModeOverride,
           executor,
           pool,
@@ -634,6 +639,7 @@ interface IntakeDeps {
   msg: NormalizedMessage;
   controls: Controls;
   chatModeCache: ChatModeCache;
+  chatMemberCountCache: ChatMemberCountCache;
   logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
@@ -657,6 +663,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     msg,
     controls,
     chatModeCache,
+    chatMemberCountCache,
     logThreadModeOverride,
     executor,
     pool,
@@ -746,8 +753,16 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     requireMentionForChat(controls.profileConfig, controls.cfg, msg.chatId) &&
     !msg.mentionedBot
   ) {
-    log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
-    return;
+    // A group containing only one human (the sender) plus bot members is
+    // effectively a DM — `/new chat` creates exactly this shape. Probe the
+    // human count (short-TTL cached) and relax the @ requirement for as long
+    // as that stays true, so adding a second person restores the gate.
+    const soloHumanChat = await chatMemberCountCache.isSoloHumanChat(channel, msg.chatId);
+    if (!soloHumanChat) {
+      log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
+      return;
+    }
+    log.info('intake', 'allow-solo-chat-no-mention', { scope, chatType: msg.chatType });
   }
 
   // A merge_forward whose sub-messages the SDK could not fetch (transient
