@@ -57,7 +57,10 @@ import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
-import { ChatMemberCountCache } from './chat-member-count-cache';
+import {
+  bindChatMemberCountInvalidation,
+  ChatMemberCountCache,
+} from './chat-member-count-cache';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
@@ -286,6 +289,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   };
 
   const channel = createLarkChannel(opts);
+  const stopMemberCountInvalidation = bindChatMemberCountInvalidation(
+    channel,
+    chatMemberCountCache,
+  );
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
   // Pending → run handoff: while a run is active on a chat, block its pending
@@ -530,6 +537,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ownerRefresh.stop();
       knownChatsRefresh.stop();
       keepalive.stop();
+      stopMemberCountInvalidation();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
       // channel down and rebuilds it, and auto-leaving every meeting on a
       // reconnect would be surprising.

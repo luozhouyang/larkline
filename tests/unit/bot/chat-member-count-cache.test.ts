@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { LarkChannel } from '@larksuite/channel';
 import {
+  bindChatMemberCountInvalidation,
   ChatMemberCountCache,
   DEFAULT_CHAT_MEMBER_COUNT_TTL_MS,
 } from '../../../src/bot/chat-member-count-cache.js';
@@ -59,6 +60,67 @@ describe('ChatMemberCountCache', () => {
     // not hammer the API again.
     await expect(failingCache.isSoloHumanChat(failing.channel, 'oc_fail')).resolves.toBe(false);
     expect(failing.calls).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates the cached count when a member-change event arrives', async () => {
+    let memberCount = 1;
+    const handlers = new Map<string, Set<(payload: unknown) => void>>();
+    const getChatInfo = vi.fn(async () => ({ memberCount }));
+    const channel = {
+      getChatInfo,
+      onRawEvent(eventType: string, handler: (payload: unknown) => void) {
+        let set = handlers.get(eventType);
+        if (!set) {
+          set = new Set();
+          handlers.set(eventType, set);
+        }
+        set.add(handler);
+        return () => set?.delete(handler);
+      },
+    } as unknown as LarkChannel;
+    const cache = new ChatMemberCountCache();
+    const stop = bindChatMemberCountInvalidation(channel, cache);
+
+    await expect(cache.isSoloHumanChat(channel, 'oc_member_change')).resolves.toBe(true);
+
+    // A second human joins: the event drops the cached count immediately, so
+    // the very next message re-probes instead of waiting for the TTL.
+    memberCount = 2;
+    for (const handler of handlers.get('im.chat.member.user.added_v1') ?? []) {
+      handler({ chat_id: 'oc_member_change' });
+    }
+    await expect(cache.isSoloHumanChat(channel, 'oc_member_change')).resolves.toBe(false);
+    expect(getChatInfo).toHaveBeenCalledTimes(2);
+
+    stop();
+    expect(handlers.get('im.chat.member.user.added_v1')?.size).toBe(0);
+  });
+
+  it('accepts the nested event envelope shape', async () => {
+    let memberCount = 1;
+    const handlers = new Map<string, Set<(payload: unknown) => void>>();
+    const channel = {
+      getChatInfo: vi.fn(async () => ({ memberCount })),
+      onRawEvent(eventType: string, handler: (payload: unknown) => void) {
+        let set = handlers.get(eventType);
+        if (!set) {
+          set = new Set();
+          handlers.set(eventType, set);
+        }
+        set.add(handler);
+        return () => set?.delete(handler);
+      },
+    } as unknown as LarkChannel;
+    const cache = new ChatMemberCountCache();
+    bindChatMemberCountInvalidation(channel, cache);
+
+    await cache.isSoloHumanChat(channel, 'oc_nested');
+    memberCount = 2;
+    for (const handler of handlers.get('im.chat.member.user.added_v1') ?? []) {
+      handler({ event: { chat_id: 'oc_nested' } });
+    }
+
+    await expect(cache.isSoloHumanChat(channel, 'oc_nested')).resolves.toBe(false);
   });
 
   it('re-probes after the default TTL', async () => {

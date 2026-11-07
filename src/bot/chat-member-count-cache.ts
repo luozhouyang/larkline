@@ -64,3 +64,54 @@ export class ChatMemberCountCache {
     this.cache.delete(chatId);
   }
 }
+
+const MEMBER_CHANGE_EVENTS = [
+  'im.chat.member.user.added_v1',
+  'im.chat.member.user.deleted_v1',
+  'im.chat.member.user.withdrawn_v1',
+] as const;
+
+/**
+ * Drop the cached human count as soon as Feishu tells us membership changed,
+ * so a freshly added/removed member takes effect on the next message instead
+ * of waiting for {@link DEFAULT_CHAT_MEMBER_COUNT_TTL_MS}.
+ *
+ * Delivery requires the app to subscribe to the `im.chat.member.user.*` events
+ * in the developer console; when it doesn't, the TTL still converges. The
+ * subscription is best-effort because older `@larksuite/channel` builds may
+ * not expose `onRawEvent`.
+ */
+export function bindChatMemberCountInvalidation(
+  channel: LarkChannel,
+  cache: ChatMemberCountCache,
+): () => void {
+  const subscribe = channel.onRawEvent?.bind(channel);
+  if (!subscribe) return () => {};
+
+  const unsubscribers = MEMBER_CHANGE_EVENTS.map((eventType) =>
+    subscribe(eventType, (payload) => {
+      const chatId = memberChangeChatId(payload);
+      if (!chatId) return;
+      cache.invalidate(chatId);
+      log.info('chat', 'member-count-invalidated', { chatId, eventType });
+    }),
+  );
+  return () => {
+    for (const unsubscribe of unsubscribers) unsubscribe();
+  };
+}
+
+/**
+ * `onRawEvent` normally hands us the unwrapped event body (`chat_id` at the
+ * top level), but tolerate the `{ event: { chat_id } }` envelope too.
+ */
+function memberChangeChatId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const record = payload as { chat_id?: unknown; event?: unknown };
+  if (typeof record.chat_id === 'string') return record.chat_id;
+  if (record.event && typeof record.event === 'object') {
+    const nested = record.event as { chat_id?: unknown };
+    if (typeof nested.chat_id === 'string') return nested.chat_id;
+  }
+  return undefined;
+}

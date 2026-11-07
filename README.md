@@ -164,7 +164,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/doctor [description]` | Run low-sensitive diagnostics |
 | `/help` | Help card |
 
-DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. When a group has only one human member (bots don't count), the mention requirement is relaxed automatically — this covers dedicated groups created with `/new chat`. Adding a second person restores the `@` requirement. Cloud-doc comments in supported document types run when the bot is mentioned.
+DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. When a group has only one human member (bots don't count), the mention requirement is relaxed automatically — this covers dedicated groups created with `/new chat`. Adding a second person restores the `@` requirement immediately when the app receives member-change events, and within about a minute otherwise. Cloud-doc comments in supported document types run when the bot is mentioned.
 
 ## Reply Display and COT
 
