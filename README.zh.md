@@ -95,7 +95,7 @@ daemon 日志在 `~/.larkline/profiles/<profile>/logs/daemon/`。
 
 ### 多 profile：分别运行 Claude 和 Codex
 
-默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 profile：
+默认情况下，bridge 使用当前激活的 bot / profile；可以通过 `bot use <name>`（或 `profile use` 别名）切换。每个 bot 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 bot：
 
 ```bash
 larkline start --profile claude --agent claude
@@ -114,29 +114,32 @@ larkline status --profile codex
 ### 宿主 CLI
 
 ```text
-larkline run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline run [--profile <name>] [--no-bootstrap] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline bot create|list|use|remove|export ...
 larkline migrate [--profile <name>] [--agent claude|codex]
 larkline ps
 larkline kill <id|#>
 larkline --help
 ```
 
-`profile use <name>` 会切换后续默认启动使用的 profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，再使用这些 profile 管理命令：
+`bot use <name>` 会切换后续默认启动使用的 bot / profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，使用这些 bot 管理命令：
 
 ```bash
-larkline profile create claude --agent claude
-larkline profile create codex --agent codex
-larkline profile list
-larkline profile use <name>
-larkline profile remove <name>
-larkline profile remove <name> --purge --yes
-larkline profile export <name> [--output ./profile.json] [--force]
-larkline profile export <name> --include-secrets --yes
+larkline bot create claude --agent claude   # 扫码创建新 bot
+larkline bot create codex --agent codex
+larkline bot list
+larkline bot use <name>
+larkline bot remove <name>
+larkline bot remove <name> --purge --yes
+larkline bot export <name> [--output ./profile.json] [--force]
+larkline bot export <name> --include-secrets --yes
 ```
 
-`profile remove` 默认归档本地状态，也可以删除当前激活的 profile。若还剩其他 profile，会自动切到下一个；若这是最后一个 profile，会清空 root config，之后可以用同名重新创建。只有加 `--purge --yes` 才会永久删除。`profile export` 默认脱敏 app secret；只有加 `--include-secrets --yes` 才会导出敏感配置。
+`profile` 仍然保留为 `bot` 的别名（命令和数据完全一致），兼容旧脚本：`profile remove`、`profile export` 等旧用法继续可用。`bot remove` 默认归档本地状态，也可以删除当前激活的 bot。若还剩其他 bot，会自动切到下一个；若这是最后一个，会清空 root config，之后可以用同名重新创建。只有加 `--purge --yes` 才会永久删除。`bot export` 默认脱敏 app secret；只有加 `--include-secrets --yes` 才会导出敏感配置。
 
-如果某个 profile 被建成了错误的 agent 类型，先 `stop` 或 `unregister --profile <name>` 清理对应后台服务，再 `profile remove <name>`，然后用正确的 `--agent` 重新创建。
+`run` / `start` 仍保留首次启动自动初始化，方便新用户一条命令跑起来；传 `--no-bootstrap` 可以强制只使用已有 bot，不再自动创建或迁移。
+
+如果某个 bot 被建成了错误的 agent 类型，先 `stop` 或 `unregister --profile <name>` 清理对应后台服务，再 `bot remove <name>`，然后用正确的 `--agent` 重新创建。
 
 ### 飞书内斜杠命令
 
@@ -168,13 +171,27 @@ larkline profile export <name> --include-secrets --yes
 
 ## 回复展示与 COT
 
-`/config` 可以调整三类展示选项：
+`/config` 可以调整四类展示选项：
 
 - **消息回复方式**：`消息卡片` 流式更新最终回复；`纯文本` 在 run 完成后一次性发送。
 - **工具调用显示**：控制最终回复卡片 / markdown 中是否展示工具块。
 - **COT 过程消息**：`关闭` 只发送最终回复；`简略` 先用 COT 消息展示 agent 的过程文本和工具摘要；`详细` 还会展示工具参数和截断后的输出。
+- **思考内容显示**：控制是否展示 agent 的 reasoning，详见下一节。
 
 开启 COT 后，bridge 会把过程消息和最终答案拆成两条消息。过程消息用于追踪 agent 做了什么；最终答案仍由 agent 原始文本生成，bridge 不做启发式过滤。若 agent 把最终答案也作为普通流式文本输出，COT 过程消息中可能会出现对应片段。
+
+### 思考内容显示
+
+`/config` 的「思考内容显示」控制是否在手机 / 桌面飞书里展示 agent 的 reasoning：
+
+- **自动（默认）**：保持旧行为——消息卡片显示可折叠的思考面板；Markdown / 纯文本回复不显示。
+- **关闭**：普通回复里不显示思考内容；显式开启 COT 时仍按 COT 配置处理。
+- **内联显示**：在正常回复里输出思考过程。卡片模式用折叠面板，Markdown / 纯文本模式用引用块。
+- **独立气泡**：COT 关闭时，单独发一条“思考过程”消息；COT 开启时合并进 COT，避免重复气泡。
+
+Claude Code 的 thinking 会按流式增量展示；larkline 会传入 `--include-partial-messages`，请确认本机 Claude Code 版本支持该参数。Codex 只会在 CLI 实际输出 reasoning summary item 时展示；这通常取决于 `~/.codex/config.toml` 里的 `model_reasoning_summary` 以及认证方式。
+
+⚠️ 思考内容可能包含代码、文件路径、命令输出或其他敏感信息，并且群聊里所有成员都能看到。默认的「自动」不会改变现有可见范围；开启「内联」或「独立气泡」前请确认接收范围。
 
 ## lark-cli 身份策略
 

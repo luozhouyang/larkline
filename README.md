@@ -95,7 +95,7 @@ Daemon logs are under `~/.larkline/profiles/<profile>/logs/daemon/`.
 
 ### Multiple profiles: Claude and Codex
 
-By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
+By default, the bridge starts with the currently selected bot/profile. Use `bot use <name>` (or the `profile use` alias) to change it. Each one keeps its own app credentials, sessions, working directories, and logs. Create multiple bots only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
 
 ```bash
 larkline start --profile claude --agent claude
@@ -114,29 +114,32 @@ larkline status --profile codex
 ### Host CLI
 
 ```text
-larkline run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline run [--profile <name>] [--no-bootstrap] [--agent claude|codex] [--workspace <path>] [-c <config>]
+larkline bot create|list|use|remove|export ...
 larkline migrate [--profile <name>] [--agent claude|codex]
 larkline ps
 larkline kill <id|#>
 larkline --help
 ```
 
-`profile use <name>` changes the profile used by later default starts. Use these profile management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
+`bot use <name>` changes the bot/profile used by later default starts. Use these bot management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
 
 ```bash
-larkline profile create claude --agent claude
-larkline profile create codex --agent codex
-larkline profile list
-larkline profile use <name>
-larkline profile remove <name>
-larkline profile remove <name> --purge --yes
-larkline profile export <name> [--output ./profile.json] [--force]
-larkline profile export <name> --include-secrets --yes
+larkline bot create claude --agent claude   # QR-create a new bot
+larkline bot create codex --agent codex
+larkline bot list
+larkline bot use <name>
+larkline bot remove <name>
+larkline bot remove <name> --purge --yes
+larkline bot export <name> [--output ./profile.json] [--force]
+larkline bot export <name> --include-secrets --yes
 ```
 
-`profile remove` archives local state by default, including the active profile. If other profiles remain, the bridge switches to the next one; if it was the last profile, the root config is cleared so the same name can be created again. `--purge --yes` permanently deletes local state. `profile export` redacts app secrets by default; `--include-secrets --yes` includes sensitive config.
+`profile` remains an alias for `bot` (same commands and data), for compatibility with older scripts: `profile remove` and `profile export` still work unchanged. `bot remove` archives local state by default, including the active bot. If others remain, the bridge switches to the next one; if it was the last one, the root config is cleared so the same name can be created again. `--purge --yes` permanently deletes local state. `bot export` redacts app secrets by default; `--include-secrets --yes` includes sensitive config.
 
-If a profile was created with the wrong agent kind, stop or unregister any matching background service first, then run `profile remove <name>` and recreate it with the intended `--agent`.
+`run` and `start` still support first-run bootstrap for convenience. Pass `--no-bootstrap` when you want them to only use an existing bot and fail instead of creating/migrating one.
+
+If a bot was created with the wrong agent kind, stop or unregister any matching background service first, then run `bot remove <name>` and recreate it with the intended `--agent`.
 
 ### Slash commands inside Feishu / Lark
 
@@ -168,13 +171,25 @@ DMs do not require an @ mention. Groups and topic groups require `@bot` by defau
 
 ## Reply Display and COT
 
-`/config` controls three presentation settings:
+`/config` controls four presentation settings:
 
 - **Message reply mode**: `message card` streams the final reply; `plain text` sends once after the run finishes.
 - **Tool-call display**: controls whether tool blocks appear in the final card / markdown reply.
 - **COT process message**: `off` sends only the final reply; `brief` first sends a COT message with agent progress text and tool summaries; `detailed` also includes tool args and truncated output.
+- **Reasoning display**: controls whether agent thinking is shown in normal replies or a dedicated bubble.
 
 When COT is enabled, the bridge splits the process view and final answer into two messages. The COT message is for tracing what the agent did; the final answer is still generated from the agent's raw text, without heuristic bridge-side filtering. If an agent emits final-answer text as ordinary stream text, that text can also appear in the COT process message.
+
+### Reasoning display
+
+- **Auto (default)**: preserves the old behavior — interactive cards show a collapsible thinking panel; Markdown/plain-text replies hide it.
+- **Off**: hide reasoning in normal replies. An explicitly enabled COT process message still follows its own settings.
+- **Inline**: include reasoning in the normal reply. Cards use a collapsible panel; Markdown/plain text uses a blockquote.
+- **Bubble**: when COT is off, publish a dedicated “thinking process” message. When COT is on, merge reasoning into that bubble instead of creating a duplicate.
+
+Claude Code thinking is streamed incrementally; larkline passes `--include-partial-messages`, so make sure the installed Claude Code build supports that flag. Codex reasoning is shown only when the CLI emits reasoning-summary items; that usually depends on `model_reasoning_summary` in `~/.codex/config.toml` and on the authentication mode.
+
+⚠️ Reasoning may contain code, file paths, command output, or other sensitive data, and every member of a group chat can see it. The default **Auto** mode does not widen existing visibility; confirm the audience before enabling **Inline** or **Bubble**.
 
 ## lark-cli identity policy
 

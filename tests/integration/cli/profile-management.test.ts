@@ -52,6 +52,23 @@ describe('profile management commands', () => {
     ]);
   });
 
+  it('uses bot terminology when invoked through the bot alias', async () => {
+    const root = await makeRoot();
+    await writeProfiles(root, 'claude', ['claude', 'codex-dev']);
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => {
+      lines.push(line);
+    });
+
+    await runProfileList({ rootDir: root, label: 'bot' });
+    expect(lines[0]).toContain('BOT');
+    expect(lines[0]).not.toContain('PROFILE');
+
+    lines.length = 0;
+    await runProfileUse('codex-dev', { rootDir: root, label: 'bot' });
+    expect(lines).toEqual(['已切换到 bot: codex-dev']);
+  });
+
   it('switches active profile atomically without rewriting running process entries', async () => {
     const root = await makeRoot();
     await writeProfiles(root, 'claude', ['claude', 'codex-dev']);

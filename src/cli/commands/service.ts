@@ -27,6 +27,8 @@ export interface ServiceStartOptions {
   tenant?: string;
   /** Skip lark-cli auto-install + bind during `start`. */
   skipCheckLarkCli?: boolean;
+  /** Allow the first-run QR/migration bootstrap. `--no-bootstrap` sets false. */
+  bootstrap?: boolean;
   /** Install the supervisor+console service (`run --web-ui`) instead of a
    * single-profile service. */
   webUi?: boolean;
@@ -157,7 +159,7 @@ async function ensureBridgeConfigured(
     appId: opts.appId,
     appSecret: opts.appSecret,
     tenant: opts.tenant,
-    allowBootstrap: true,
+    allowBootstrap: opts.bootstrap !== false,
     handleActiveBridgeMigrationConflict: async (err) => {
       const handled = await promptAndStopActiveBridgeMigrationConflict(err, {
         cancelMessage: '已取消启动。',
@@ -168,8 +170,12 @@ async function ensureBridgeConfigured(
   });
   if (!isComplete(cfg)) {
     console.error('bot 还没配置 app 凭据。');
-    console.error('请重新运行 `start` 完成首次扫码向导或传入已有应用信息。');
+    console.error('请先运行 `larkline bot create <name>` 完成首次扫码向导。');
     process.exit(1);
+  }
+  if (!opts.profile) {
+    console.log(`→ 当前 bot: ${profile} (${cfg.accounts.app.id})`);
+    console.log('  创建新 bot: larkline bot create <name>');
   }
   return { profile, cfg, profileConfig, appPaths, configPath };
 }

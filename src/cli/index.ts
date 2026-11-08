@@ -47,6 +47,7 @@ program
   .option('--app-secret <secret>', 'App Secret for --app-id; prefer interactive input on shared machines')
   .option('--tenant <tenant>', 'tenant for --app-id (feishu or lark; default feishu)')
   .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
+  .option('--no-bootstrap', 'do not auto-create/migrate a profile; require bot create first')
   .action(async (opts: {
     config?: string;
     profile?: string;
@@ -57,6 +58,7 @@ program
     appSecret?: string;
     tenant?: string;
     skipCheckLarkCli?: boolean;
+    bootstrap?: boolean;
   }) => {
     await runStart(opts);
   });
@@ -71,71 +73,88 @@ program
     await runMigrate(opts);
   });
 
-const profile = program
-  .command('profile')
-  .description('Manage local bridge profiles');
+/**
+ * `profile` and `bot` are the same management surface. `bot` is the primary
+ * user-facing noun; `profile` stays as the precise/internal alias so existing
+ * scripts and docs keep working.
+ */
+function registerManagementCommands(name: 'profile' | 'bot', description: string): void {
+  const noun = name === 'bot' ? 'bot' : 'profile';
+  const ns = program.command(name).description(description);
 
-profile
-  .command('list')
-  .description('List configured profiles')
-  .action(async () => {
-    await runProfileList();
-  });
-
-profile
-  .command('create <name>')
-  .description('Create a profile from QR registration or existing app credentials')
-  .option('--agent <kind>', 'agent kind (claude or codex)')
-  .option('--workspace <path>', 'initial working directory for this profile')
-  .option('--app-id <id>', 'use an existing Lark/Feishu app instead of QR app creation')
-  .option('--app-secret <secret>', 'App Secret for --app-id; prefer interactive input on shared machines')
-  .option('--tenant <tenant>', 'tenant for --app-id (feishu or lark; default feishu)')
-  .action(async (name: string, opts: {
-    agent?: string;
-    workspace?: string;
-    appId?: string;
-    appSecret?: string;
-    tenant?: string;
-  }) => {
-    await runProfileCreate(name, opts);
-  });
-
-profile
-  .command('use <name>')
-  .description('Set the active profile')
-  .action(async (name: string) => {
-    await runProfileUse(name);
-  });
-
-profile
-  .command('remove <name>')
-  .description('Archive a profile and its local state')
-  .option('--purge', 'permanently delete profile state instead of archiving')
-  .option('--yes', 'confirm destructive profile deletion')
-  .action(async (name: string, opts: { purge?: boolean; yes?: boolean }) => {
-    await runProfileRemove(name, { purge: opts.purge, yes: opts.yes });
-  });
-
-profile
-  .command('export <name>')
-  .description('Export one profile as JSON')
-  .option('--output <path>', 'write export JSON to a file instead of stdout')
-  .option('--force', 'overwrite an existing output file')
-  .option('--include-secrets', 'include secret provider configuration and app secret values')
-  .option('--yes', 'confirm exporting secrets')
-  .action(async (name: string, opts: {
-    output?: string;
-    force?: boolean;
-    includeSecrets?: boolean;
-    yes?: boolean;
-  }) => {
-    await runProfileExport(name, {
-      output: opts.output,
-      force: opts.force,
-      includeSecrets: opts.includeSecrets,
-      yes: opts.yes,
+  ns.command('list')
+    .description(name === 'bot' ? 'List configured bots' : 'List configured profiles')
+    .action(async () => {
+      await runProfileList({ label: name });
     });
-  });
+
+  ns.command('create <name>')
+    .description(
+      name === 'bot'
+        ? 'Create a bot from QR registration or existing app credentials'
+        : 'Create a profile from QR registration or existing app credentials',
+    )
+    .option('--agent <kind>', 'agent kind (claude or codex)')
+    .option('--workspace <path>', `initial working directory for this ${noun}`)
+    .option('--app-id <id>', 'use an existing Lark/Feishu app instead of QR app creation')
+    .option('--app-secret <secret>', 'App Secret for --app-id; prefer interactive input on shared machines')
+    .option('--tenant <tenant>', 'tenant for --app-id (feishu or lark; default feishu)')
+    .action(async (profileName: string, opts: {
+      agent?: string;
+      workspace?: string;
+      appId?: string;
+      appSecret?: string;
+      tenant?: string;
+    }) => {
+      await runProfileCreate(profileName, { ...opts, label: name });
+    });
+
+  ns.command('use <name>')
+    .description(name === 'bot' ? 'Set the active bot' : 'Set the active profile')
+    .action(async (profileName: string) => {
+      await runProfileUse(profileName, { label: name });
+    });
+
+  ns.command('remove <name>')
+    .description(
+      name === 'bot'
+        ? 'Archive a bot and its local state'
+        : 'Archive a profile and its local state',
+    )
+    .option('--purge', `permanently delete ${noun} state instead of archiving`)
+    .option('--yes', `confirm destructive ${noun} deletion`)
+    .action(async (profileName: string, opts: { purge?: boolean; yes?: boolean }) => {
+      await runProfileRemove(profileName, {
+        purge: opts.purge,
+        yes: opts.yes,
+        label: name,
+      });
+    });
+
+  ns.command('export <name>')
+    .description(name === 'bot' ? 'Export one bot as JSON' : 'Export one profile as JSON')
+    .option('--output <path>', 'write export JSON to a file instead of stdout')
+    .option('--force', 'overwrite an existing output file')
+    .option('--include-secrets', 'include secret provider configuration and app secret values')
+    .option('--yes', 'confirm exporting secrets')
+    .action(async (profileName: string, opts: {
+      output?: string;
+      force?: boolean;
+      includeSecrets?: boolean;
+      yes?: boolean;
+    }) => {
+      await runProfileExport(profileName, {
+        output: opts.output,
+        force: opts.force,
+        includeSecrets: opts.includeSecrets,
+        yes: opts.yes,
+        label: name,
+      });
+    });
+}
+
+registerManagementCommands('bot', 'Manage bots (create, list, switch, remove)');
+registerManagementCommands('profile', 'Manage local bridge profiles (alias for bot)');
 
 program
   .command('ui')
@@ -173,6 +192,7 @@ program
   .option('--app-secret <secret>', 'App Secret for --app-id; prefer interactive input on shared machines')
   .option('--tenant <tenant>', 'tenant for --app-id (feishu or lark; default feishu)')
   .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
+  .option('--no-bootstrap', 'do not auto-create/migrate a profile; require bot create first')
   .action(async (opts: {
     profile?: string;
     webUi?: boolean;
@@ -182,6 +202,7 @@ program
     appSecret?: string;
     tenant?: string;
     skipCheckLarkCli?: boolean;
+    bootstrap?: boolean;
   }) => {
     await runServiceStart(opts);
   });

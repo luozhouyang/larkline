@@ -91,6 +91,8 @@ export interface StartOptions {
   appSecret?: string;
   tenant?: string;
   skipCheckLarkCli?: boolean;
+  /** Allow the first-run QR/migration bootstrap. `--no-bootstrap` sets false. */
+  bootstrap?: boolean;
   /** Start the machine-wide supervisor + web console instead of a single
    * profile in the foreground. Default false → classic headless run. */
   webUi?: boolean;
@@ -131,10 +133,14 @@ const migrationConflictHandler = async (err: unknown): Promise<boolean> => {
 async function runClassic(opts: StartOptions): Promise<void> {
   const runtime = await resolveProfileRuntime({
     ...opts,
-    allowBootstrap: true,
+    allowBootstrap: opts.bootstrap !== false,
     handleActiveBridgeMigrationConflict: migrationConflictHandler,
   });
   const { cfg, configPath, appPaths } = runtime;
+  if (!opts.profile) {
+    console.log(`→ 当前 bot: ${appPaths.profile} (${cfg.accounts.app.id})`);
+    console.log('  创建新 bot: larkline bot create <name>');
+  }
   configureLogger({ logsDir: appPaths.logsDir });
   await loadTelemetryAdapter({
     version: pkg.version,
@@ -174,10 +180,14 @@ async function runClassic(opts: StartOptions): Promise<void> {
 async function runSupervisorConsole(opts: StartOptions): Promise<void> {
   const runtime = await resolveProfileRuntime({
     ...opts,
-    allowBootstrap: true,
+    allowBootstrap: opts.bootstrap !== false,
     handleActiveBridgeMigrationConflict: migrationConflictHandler,
   });
   const cfg = runtime.cfg;
+  if (!opts.profile) {
+    console.log(`→ 当前 bot: ${runtime.appPaths.profile} (${cfg.accounts.app.id})`);
+    console.log('  创建新 bot: larkline bot create <name>');
+  }
   const configPath = runtime.configPath;
   const appPaths = runtime.appPaths;
   configureLogger({ logsDir: appPaths.hostLogsDir });

@@ -23,8 +23,12 @@ import { readAndPrune } from '../../runtime/registry';
 import { listAllProfiles } from '../../runtime/profile-discovery';
 import { resolveProfileRuntime } from '../../runtime/profile-runtime';
 
+export type ProfileLabel = 'profile' | 'bot';
+
 export interface ProfileCommandOptions {
   rootDir?: string;
+  /** User-facing noun; `bot` is the friendlier alias for profile commands. */
+  label?: ProfileLabel;
 }
 
 export interface ProfileCreateOptions extends ProfileCommandOptions {
@@ -50,12 +54,13 @@ export interface ProfileExportOptions extends ProfileCommandOptions {
 
 export async function runProfileList(opts: ProfileCommandOptions = {}): Promise<void> {
   const rootDir = opts.rootDir ?? paths.rootDir;
+  const label = opts.label ?? 'profile';
   let profiles;
   try {
     profiles = await listAllProfiles(rootDir);
   } catch (err) {
     if (!(err instanceof Error) || !err.message.startsWith('root config not found:')) throw err;
-    console.log('暂无 profile。');
+    console.log(`暂无 ${label}。`);
     return;
   }
 
@@ -79,7 +84,7 @@ export async function runProfileList(opts: ProfileCommandOptions = {}): Promise<
   };
   console.log(formatProfileListRow({
     active: 'ACTIVE',
-    profile: 'PROFILE',
+    profile: label === 'bot' ? 'BOT' : 'PROFILE',
     agent: 'AGENT',
     status: 'STATUS',
   }, widths));
@@ -105,6 +110,7 @@ export async function runProfileCreate(
   opts: ProfileCreateOptions = {},
 ): Promise<void> {
   const rootDir = opts.rootDir ?? paths.rootDir;
+  const label = opts.label ?? 'profile';
   const configFile = resolveAppPaths({ rootDir }).configFile;
   await withConfigFileLock(configFile, async () => {
     const root = await loadRootConfig(configFile);
@@ -113,13 +119,14 @@ export async function runProfileCreate(
       const requested = agentKindFromString(opts.agent);
       if (requested && existing.agentKind !== requested) {
         throw new Error(
-          `profile ${name} already exists with agentKind ${existing.agentKind}, ` +
-            `but profile create requested --agent ${requested}. ` +
-            `Profile names are labels; use the existing ${existing.agentKind} profile, ` +
-            `choose another name, or remove profile ${name} before creating a ${requested} profile.`,
+          `${label} ${name} already exists with agentKind ${existing.agentKind}, ` +
+            `but ${label} create requested --agent ${requested}. ` +
+            (label === 'bot' ? 'Bot names are labels; ' : 'Profile names are labels; ') +
+            `use the existing ${existing.agentKind} ${label}, ` +
+            `choose another name, or remove ${label} ${name} before creating a ${requested} ${label}.`,
         );
       }
-      throw new Error(`profile already exists: ${name}`);
+      throw new Error(`${label} already exists: ${name}`);
     }
 
     await resolveProfileRuntime({
@@ -133,7 +140,7 @@ export async function runProfileCreate(
       allowBootstrap: true,
     });
   });
-  console.log(`已创建 profile: ${name}`);
+  console.log(`已创建 ${label}: ${name}`);
 }
 
 export async function runProfileUse(
@@ -141,15 +148,16 @@ export async function runProfileUse(
   opts: ProfileCommandOptions = {},
 ): Promise<void> {
   const rootDir = opts.rootDir ?? paths.rootDir;
+  const label = opts.label ?? 'profile';
   const configFile = resolveAppPaths({ rootDir }).configFile;
   await withConfigFileLock(configFile, async () => {
     const root = await loadRootConfig(configFile);
-    if (!root?.profiles[name]) throw new Error(`profile not found: ${name}`);
+    if (!root?.profiles[name]) throw new Error(`${label} not found: ${name}`);
     root.activeProfile = name;
     await saveRootConfig(root, configFile);
     await writeActiveProfile(rootDir, name);
   });
-  console.log(`已切换到 profile: ${name}`);
+  console.log(`已切换到 ${label}: ${name}`);
 }
 
 export async function runProfileRemove(
@@ -157,19 +165,20 @@ export async function runProfileRemove(
   opts: ProfileRemoveOptions = {},
 ): Promise<void> {
   const rootDir = opts.rootDir ?? paths.rootDir;
+  const label = opts.label ?? 'profile';
   if (opts.purge && !opts.yes) {
-    throw new Error('profile remove --purge requires --yes');
+    throw new Error(`${label} remove --purge requires --yes`);
   }
   const configFile = resolveAppPaths({ rootDir }).configFile;
   await withConfigFileLock(configFile, async () => {
     const root = await loadRootConfig(configFile);
     if (!root) throw new Error('config not initialized');
     const profile = root.profiles[name];
-    if (!profile) throw new Error(`profile not found: ${name}`);
+    if (!profile) throw new Error(`${label} not found: ${name}`);
     const activeProfile = await readActiveProfile(rootDir);
     if (activeProfile) {
       if (!root.profiles[activeProfile]) {
-        throw new Error(`active profile not found: ${activeProfile}; run profile use <name> to repair`);
+        throw new Error(`active ${label} not found: ${activeProfile}; run ${label} use <name> to repair`);
       }
       root.activeProfile = activeProfile;
     }
@@ -177,7 +186,7 @@ export async function runProfileRemove(
     const profileLock = await checkRuntimeLock(profilePaths.profileLockFile);
     if (profileLock.locked) {
       const holder = profileLock.meta ? ` pid=${profileLock.meta.pid}` : '';
-      throw new Error(`profile is locked/running: ${name}${holder}`);
+      throw new Error(`${label} is locked/running: ${name}${holder}`);
     }
     const lock = await acquireProfileRuntimeLock(profilePaths, profile.agentKind);
     try {
@@ -201,7 +210,7 @@ export async function runProfileRemove(
             await writeActiveProfile(rootDir, root.activeProfile);
           } catch (restoreErr) {
             throw new Error(
-              `profile remove failed after moving ${name}; state is at ${result.archivedTo}. ` +
+              `${label} remove failed after moving ${name}; state is at ${result.archivedTo}. ` +
                 `restore failed: ${String((restoreErr as Error).message ?? restoreErr)}. ` +
                 `root config error: ${String((err as Error).message ?? err)}`,
             );
@@ -211,10 +220,10 @@ export async function runProfileRemove(
       }
       if (result.purged) {
         await result.cleanup?.();
-        console.log(`已永久删除 profile: ${name}`);
+        console.log(`已永久删除 ${label}: ${name}`);
         return;
       }
-      console.log(`已归档 profile: ${name} -> ${result.archivedTo}`);
+      console.log(`已归档 ${label}: ${name} -> ${result.archivedTo}`);
     } finally {
       await lock.release().catch(() => {});
     }
@@ -225,15 +234,16 @@ export async function runProfileExport(
   name: string,
   opts: ProfileExportOptions = {},
 ): Promise<void> {
+  const label = opts.label ?? 'profile';
   if (opts.includeSecrets && !opts.yes) {
-    throw new Error('profile export --include-secrets requires --yes');
+    throw new Error(`${label} export --include-secrets requires --yes`);
   }
   const rootDir = opts.rootDir ?? paths.rootDir;
   const configFile = resolveAppPaths({ rootDir }).configFile;
   const root = await loadRootConfig(configFile);
   if (!root) throw new Error('config not initialized');
   const selected = root.profiles[name];
-  if (!selected) throw new Error(`profile not found: ${name}`);
+  if (!selected) throw new Error(`${label} not found: ${name}`);
 
   const profile = cloneJson(selected);
   if (opts.includeSecrets) {
@@ -268,7 +278,7 @@ export async function runProfileExport(
     throw new Error('output already exists; use --force');
   }
   await writeFileAtomic(opts.output, body, { mode: 0o600 });
-  console.log(`已导出 profile: ${name} -> ${opts.output}`);
+  console.log(`已导出 ${label}: ${name} -> ${opts.output}`);
 }
 
 function cloneJson<T>(value: T): T {
