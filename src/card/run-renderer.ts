@@ -2,7 +2,7 @@ import { deepMaskEmails } from './mask-email';
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
-const REASONING_MAX = 1500;
+const REASONING_MAX = 3000;
 const COLLAPSE_TOOL_THRESHOLD = 3;
 
 interface ToolGroup {
@@ -17,12 +17,14 @@ type Group = ToolGroup | TextGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
+  /** Render the aggregated thinking panel. Default true (legacy behavior). */
+  reasoning?: boolean;
 }
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
 
-  if (state.reasoning.content) {
+  if (state.reasoning.content && options.reasoning !== false) {
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));
   }
 

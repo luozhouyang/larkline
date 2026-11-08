@@ -1,7 +1,7 @@
 import { modelLabel, supportedModels } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
 import type { AgentKind, LarkCliIdentityPreset, ProfileMode } from '../config/profile-schema';
-import type { CotMessagesMode, MessageReplyMode } from '../config/schema';
+import type { CotMessagesMode, MessageReplyMode, ReasoningDisplay } from '../config/schema';
 
 export interface ConfigFormOpts {
   /** Profile's agent kind — decides which model catalog the picker shows. */
@@ -13,6 +13,7 @@ export interface ConfigFormOpts {
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
   cotMessages: CotMessagesMode;
+  reasoningDisplay: ReasoningDisplay;
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
@@ -227,6 +228,27 @@ export function configFormCard(opts: ConfigFormOpts): object {
             {
               tag: 'markdown',
               content:
+                '\n**思考内容显示**\n' +
+                '_自动(默认):卡片模式显示思考面板,Markdown/纯文本不显示_\n' +
+                '_关闭:不显示思考内容_\n' +
+                '_内联:在正常回复里显示思考过程(Markdown 中为引用块)_\n' +
+                '_独立气泡:COT 关闭时单独发一条思考过程消息；COT 开启时合并进 COT_\n' +
+                '_⚠️ 思考内容可能包含代码、路径或敏感信息，开启前请确认接收群可见范围_',
+            },
+            {
+              tag: 'select_static',
+              name: 'reasoning_display',
+              initial_option: opts.reasoningDisplay,
+              options: [
+                { text: { tag: 'plain_text', content: '自动(默认)' }, value: 'auto' },
+                { text: { tag: 'plain_text', content: '关闭' }, value: 'off' },
+                { text: { tag: 'plain_text', content: '内联显示' }, value: 'inline' },
+                { text: { tag: 'plain_text', content: '独立气泡' }, value: 'bubble' },
+              ],
+            },
+            {
+              tag: 'markdown',
+              content:
                 '\n**并发上限**\n' +
                 '_全局同时运行的 agent 进程数(主要影响话题群多话题并行场景)_\n' +
                 '_默认 10,范围 1-50。超出的请求会 FIFO 排队_',
@@ -338,6 +360,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
   const summarize = (list: string[]): string =>
     list.length === 0 ? '_(空)_' : `${list.length} 项`;
   const cotLabel = cotMessagesLabel(opts.cotMessages);
+  const reasoningLabel = reasoningDisplayLabel(opts.reasoningDisplay);
   return {
     schema: '2.0',
     config: { summary: { content: '偏好已保存' } },
@@ -352,6 +375,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             `**消息回复方式**:${replyLabel}\n` +
             `**工具调用显示**:\`${opts.showToolCalls ? 'show' : 'hide'}\`\n` +
             `**COT 过程消息**:\`${cotLabel}\`\n` +
+            `**思考内容显示**:\`${reasoningLabel}\`\n` +
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
             `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +
@@ -373,6 +397,13 @@ function cotMessagesLabel(value: CotMessagesMode): string {
   if (value === 'brief') return '简略';
   if (value === 'detailed') return '详细';
   return '关闭';
+}
+
+function reasoningDisplayLabel(value: ReasoningDisplay): string {
+  if (value === 'off') return '关闭';
+  if (value === 'inline') return '内联显示';
+  if (value === 'bubble') return '独立气泡';
+  return '自动';
 }
 
 /**

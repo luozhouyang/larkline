@@ -27,12 +27,14 @@ import {
   getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
+  getReasoningDisplay,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
   type AppPreferences,
   type CotMessagesMode,
   type MessageReplyMode,
+  type ReasoningDisplay,
 } from '../config/schema';
 import {
   effectiveLarkCliIdentity,
@@ -59,6 +61,7 @@ export interface ConfigView {
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
   cotMessages: CotMessagesMode;
+  reasoningDisplay: ReasoningDisplay;
   maxConcurrentRuns: number;
   runIdleTimeoutMinutes: number;
   requireMentionInGroup: boolean;
@@ -88,6 +91,7 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
     messageReply: getMessageReplyMode(state.cfg),
     showToolCalls: getShowToolCalls(state.cfg),
     cotMessages: getCotMessages(state.cfg),
+    reasoningDisplay: getReasoningDisplay(state.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(state.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(state.cfg),
@@ -229,6 +233,13 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
     fv.cotMessages === 'brief' || fv.cotMessages === 'detailed' || fv.cotMessages === 'off'
       ? fv.cotMessages
       : getCotMessages(state.cfg);
+  const reasoningDisplay: ReasoningDisplay =
+    fv.reasoningDisplay === 'auto' ||
+    fv.reasoningDisplay === 'off' ||
+    fv.reasoningDisplay === 'inline' ||
+    fv.reasoningDisplay === 'bubble'
+      ? fv.reasoningDisplay
+      : getReasoningDisplay(state.cfg);
   const maxConcurrentRuns =
     fv.maxConcurrentRuns === undefined
       ? getMaxConcurrentRuns(state.cfg)
@@ -270,6 +281,7 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       messageReplyMigrated: true,
       showToolCalls,
       cotMessages,
+      reasoningDisplay,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
     },

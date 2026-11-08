@@ -14,6 +14,7 @@ export class CodexJsonlTranslator {
   private lastNonTerminalError: string | undefined;
   private pendingAgentMessage: string | undefined;
   private readonly startedItems = new Set<string>();
+  private readonly seenReasoning = new Set<string>();
   private drift: ProtocolDriftState = {
     unknownEvents: 0,
     anomalies: 0,
@@ -123,6 +124,27 @@ export class CodexJsonlTranslator {
     if (item.type === 'agent_message') {
       const message = stringValue(item.text ?? item.message);
       return message ? this.queueAgentMessage(message) : [];
+    }
+    if (item.type === 'reasoning' || item.type === 'reasoning_summary') {
+      const text = stringValue(item.text) ?? stringValue(item.summary);
+      if (!text || !text.trim()) return [];
+      const id = stringValue(item.id);
+      // Protocol variants may report the same reasoning as both a `reasoning`
+      // and a `reasoning_summary` item, or repeat a completed item. Dedupe by
+      // id when there is one, while still catching id-less copies of reasoning
+      // that was already seen. Distinct ids are distinct reasoning items even
+      // when their text happens to match.
+      const textKey = `text:${text}`;
+      const idTextKey = `idtext:${text}`;
+      if (id) {
+        if (this.seenReasoning.has(`id:${id}`) || this.seenReasoning.has(textKey)) return [];
+        this.seenReasoning.add(`id:${id}`);
+        this.seenReasoning.add(idTextKey);
+      } else {
+        if (this.seenReasoning.has(textKey) || this.seenReasoning.has(idTextKey)) return [];
+        this.seenReasoning.add(textKey);
+      }
+      return this.prependPendingText([{ type: 'thinking', delta: text }]);
     }
     if (item.type !== 'command_execution') return [];
     const id = stringValue(item.id);

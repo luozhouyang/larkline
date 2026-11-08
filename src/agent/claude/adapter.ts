@@ -16,7 +16,7 @@ import {
   type AgentRun,
   type AgentRunOptions,
 } from '../types';
-import { translateEvent } from './stream-json';
+import { ClaudeStreamTranslator } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
@@ -75,6 +75,7 @@ export class ClaudeAdapter implements AgentAdapter {
       '--output-format',
       'stream-json',
       '--verbose',
+      '--include-partial-messages',
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
       '--append-system-prompt-file',
@@ -204,6 +205,7 @@ async function* createEventStream(
   }
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const translator = new ClaudeStreamTranslator();
   let sawStdout = false;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
   const closeSilentStdout = (): void => {
@@ -223,7 +225,7 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      yield* translator.translate(parsed);
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);

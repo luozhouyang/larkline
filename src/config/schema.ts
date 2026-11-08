@@ -70,6 +70,19 @@ export type MessageReplyMode = 'card' | 'markdown' | 'text';
 export type CotMessagesMode = 'off' | 'brief' | 'detailed';
 
 /**
+ * How model reasoning/thinking is surfaced in IM:
+ *   - `auto`: preserve the historical layout — cards show a collapsible
+ *     thinking panel, markdown/text replies omit it.
+ *   - `off`: hide reasoning everywhere outside an explicit COT process bubble.
+ *   - `inline`: include reasoning in the normal reply (card panel, or a
+ *     blockquote in markdown/text).
+ *   - `bubble`: when COT process messages are off, publish a dedicated
+ *     reasoning-only COT bubble; otherwise reasoning stays in the process
+ *     bubble to avoid duplicates.
+ */
+export type ReasoningDisplay = 'auto' | 'off' | 'inline' | 'bubble';
+
+/**
  * Access control settings. Empty lists are fail-closed in the v2 policy:
  * no DM senders, no group chats, and only the runtime owner can administer
  * the bot. Runtime owner/admin bypass is applied by the policy layer because
@@ -121,6 +134,11 @@ export interface AppPreferences {
    * Legacy boolean/string `on` is accepted by the resolver for upgrades.
    */
   cotMessages?: CotMessagesMode | 'on' | 'simple';
+  /**
+   * Where to show agent reasoning/thinking. Default `auto` preserves the
+   * historical behavior: cards show it, markdown/text do not.
+   */
+  reasoningDisplay?: ReasoningDisplay;
   /**
    * Cap on concurrent claude runs across all chats / topics. Excess runs
    * queue FIFO. Default 10. Mostly relevant for topic groups where each
@@ -224,6 +242,13 @@ export function getCotMessages(cfg: AppConfig): CotMessagesMode {
   if (raw === 'brief' || raw === 'simple') return 'brief';
   if (raw === 'detailed' || raw === 'on') return 'detailed';
   return 'off';
+}
+
+/** Resolve the reasoning display preference, defaulting to legacy `auto`. */
+export function getReasoningDisplay(cfg: AppConfig): ReasoningDisplay {
+  const raw = cfg.preferences?.reasoningDisplay;
+  if (raw === 'off' || raw === 'inline' || raw === 'bubble' || raw === 'auto') return raw;
+  return 'auto';
 }
 
 /** Resolve the max-concurrent-runs preference with default + sanity clamp. */

@@ -82,6 +82,7 @@ export function ConfigView({ profile }: { profile: string }) {
         messageReply: cfg.messageReply,
         showToolCalls: cfg.showToolCalls,
         cotMessages: cfg.cotMessages,
+        reasoningDisplay: cfg.reasoningDisplay,
         maxConcurrentRuns: cfg.maxConcurrentRuns,
         runIdleTimeoutMinutes: cfg.runIdleTimeoutMinutes,
         requireMentionInGroup: cfg.requireMentionInGroup,
@@ -155,6 +156,10 @@ export function ConfigView({ profile }: { profile: string }) {
           <Field label="COT 过程消息">
             <SelectRow value={cfg.cotMessages} onChange={(v) => set("cotMessages", v as ConfigData["cotMessages"])}
               options={[["off", "关闭"], ["brief", "简略"], ["detailed", "详细"]]} />
+          </Field>
+          <Field label="思考内容显示" hint="思考内容可能包含代码、路径或敏感信息；请确认接收群可见范围。">
+            <SelectRow value={cfg.reasoningDisplay} onChange={(v) => set("reasoningDisplay", v as ConfigData["reasoningDisplay"])}
+              options={[["auto", "自动（卡片显示 / Markdown 不显示）"], ["off", "关闭"], ["inline", "内联显示"], ["bubble", "独立思考气泡"]]} />
           </Field>
           <div className="grid grid-cols-2 gap-4">
             <Field label="并发上限（1-50）">

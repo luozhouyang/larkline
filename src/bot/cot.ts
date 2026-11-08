@@ -11,7 +11,7 @@ const ENDPOINTS: Record<TenantBrand, string> = {
 
 const COT_UPDATE_THROTTLE_MS = 600;
 const COT_TOOL_OUTPUT_MAX = 1200;
-const COT_TEXT_MAX = 1200;
+const COT_TEXT_MAX = 4000;
 // Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
 // start() — which runs before any agent event is drained and before the
 // plain-reply fallback — to undici's ~300s default.
@@ -139,6 +139,7 @@ export class CotPublisher {
   private buffer: CotEvent[] = [];
   private flushing: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
+  private started = false;
 
   constructor(opts: {
     client: Pick<CotClient, 'create' | 'update' | 'complete'>;
@@ -156,7 +157,19 @@ export class CotPublisher {
     this.inputPreview = opts.inputPreview;
   }
 
+  isStarted(): boolean {
+    return this.started;
+  }
+
+  /** Create the bubble on first use. Used by reasoning-only mode so a run
+   * without thinking does not leave an empty "理解用户问题" bubble behind. */
+  async ensureStarted(): Promise<void> {
+    if (!this.started) await this.start();
+  }
+
   async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
     // Single chat_id-addressed create. In topics the bubble follows
     // originMessageId's thread (see CotClient.create); the caller passes an
     // in-topic origin so it lands in the topic. On any failure we disable CoT
@@ -168,16 +181,16 @@ export class CotPublisher {
       created = await this.client.create(this.chatId, this.originMessageId);
     } catch (err) {
       this.disabled = true;
-      log.warn('cot', 'create-failed', { err: err instanceof Error ? err.message : String(err) });
+      this.degradedReason = err instanceof Error ? err.message : String(err);
+      log.warn('cot', 'create-failed', { err: this.degradedReason });
       return;
     }
     const cotId = stringValue(created.cot_id ?? created.cotId);
     const messageId = stringValue(created.message_id ?? created.messageId);
     if (!cotId || !messageId) {
       this.disabled = true;
-      log.warn('cot', 'create-failed', {
-        err: `CreateCOT missing ids: ${JSON.stringify(created).slice(0, 200)}`,
-      });
+      this.degradedReason = `CreateCOT missing ids: ${JSON.stringify(created).slice(0, 200)}`;
+      log.warn('cot', 'create-failed', { err: this.degradedReason });
       return;
     }
     this.ref = { cotId, messageId };
@@ -260,11 +273,22 @@ export function finalAnswerOnlyState(state: RunState): RunState {
   };
 }
 
+export type CotConsumeMode = 'process' | 'reasoning-only';
+
 export async function consumeCotEvents(
   events: AsyncIterable<AgentEvent>,
   publisher: CotPublisher,
-  opts: { detail: CotMessagesMode },
+  opts: {
+    detail: CotMessagesMode;
+    /** `process` mirrors the full run into the bubble; `reasoning-only`
+     * publishes just the thinking stream (used by `reasoningDisplay=bubble`). */
+    mode?: CotConsumeMode;
+    /** When false, thinking events are dropped (COT still carries tools). */
+    includeReasoning?: boolean;
+  },
 ): Promise<void> {
+  const mode = opts.mode ?? 'process';
+  const includeReasoning = opts.includeReasoning !== false;
   let reasoningOpen = false;
   let textStepOpen = false;
   let textMessageOpen = false;
@@ -278,8 +302,10 @@ export async function consumeCotEvents(
     for await (const evt of events) {
       if (evt.type === 'system' || evt.type === 'usage') continue;
       if (evt.type === 'thinking') {
-        closeTextIfNeeded();
+        if (!includeReasoning) continue;
+        if (mode === 'process') closeTextIfNeeded();
         if (!reasoningOpen) {
+          await publisher.ensureStarted();
           reasoningOpen = true;
           publisher.enqueue('REASONING_START', { messageId: reasoningMessageId });
           publisher.enqueue('REASONING_MESSAGE_START', {
@@ -293,6 +319,7 @@ export async function consumeCotEvents(
         });
         continue;
       }
+      if (mode === 'reasoning-only') continue;
       if (evt.type === 'tool_use') {
         closeReasoningIfNeeded();
         closeTextIfNeeded();
@@ -356,16 +383,21 @@ export async function consumeCotEvents(
       if (evt.type === 'done' || evt.type === 'error') {
         closeReasoningIfNeeded();
         closeTextIfNeeded();
-        if (textStepOpen) {
+        if (mode === 'process' && textStepOpen) {
           publisher.enqueue('STEP_FINISHED', {
             stepId: finalStepId,
             stepName: '输出过程',
           });
         }
         if (evt.type === 'error') {
-          publisher.enqueue('RUN_ERROR', { message: evt.message, code: evt.terminationReason ?? 'error' });
-          await publisher.finish('error');
-        } else {
+          if (publisher.isStarted()) {
+            publisher.enqueue('RUN_ERROR', {
+              message: evt.message,
+              code: evt.terminationReason ?? 'error',
+            });
+            await publisher.finish('error');
+          }
+        } else if (publisher.isStarted()) {
           const status = evt.terminationReason === 'normal' ? 'done' : evt.terminationReason ?? 'done';
           publisher.enqueue('RUN_FINISHED', {
             threadId: publisher.scope,
@@ -379,10 +411,10 @@ export async function consumeCotEvents(
     }
     closeReasoningIfNeeded();
     closeTextIfNeeded();
-    await publisher.finish('done');
+    if (publisher.isStarted()) await publisher.finish('done');
   } catch (err) {
     log.warn('cot', 'consume-failed', { err: err instanceof Error ? err.message : String(err) });
-    await publisher.finish('error');
+    if (publisher.isStarted()) await publisher.finish('error');
   }
 
   function closeReasoningIfNeeded(): void {

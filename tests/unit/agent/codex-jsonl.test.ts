@@ -96,6 +96,99 @@ describe('Codex JSONL translator', () => {
     ]);
   });
 
+  it('translates reasoning items to thinking deltas', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: {
+          id: 'reasoning-1',
+          type: 'reasoning',
+          text: 'checking the repository layout',
+        },
+      }),
+    ).toEqual([{ type: 'thinking', delta: 'checking the repository layout' }]);
+  });
+
+  it('ignores reasoning items without text', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-empty', type: 'reasoning', text: '' },
+      }),
+    ).toEqual([]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-missing', type: 'reasoning' },
+      }),
+    ).toEqual([]);
+  });
+
+  it('emits the same reasoning item only once across protocol variants', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-dup', type: 'reasoning', text: 'same thought' },
+      }),
+    ).toEqual([{ type: 'thinking', delta: 'same thought' }]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-dup', type: 'reasoning_summary', summary: 'same thought' },
+      }),
+    ).toEqual([]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { type: 'reasoning', text: 'same thought' },
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not dedupe distinct reasoning items with identical text', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-a', type: 'reasoning', text: 'same thought' },
+      }),
+    ).toEqual([{ type: 'thinking', delta: 'same thought' }]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-b', type: 'reasoning', text: 'same thought' },
+      }),
+    ).toEqual([{ type: 'thinking', delta: 'same thought' }]);
+  });
+
+  it('emits reasoning before a following agent message', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'reasoning-first', type: 'reasoning', text: 'thinking first' },
+      }),
+    ).toEqual([{ type: 'thinking', delta: 'thinking first' }]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'msg-after-reasoning', type: 'agent_message', text: 'answer' },
+      }),
+    ).toEqual([]);
+    expect(t.translate({ type: 'turn.completed' })).toEqual([
+      { type: 'final_text', content: 'answer' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+  });
+
   it('treats a message announced twice as one message', () => {
     // Some builds emit the same text both as a raw event and as a completed
     // item. Without this, copy #1 streams as commentary and copy #2 comes back

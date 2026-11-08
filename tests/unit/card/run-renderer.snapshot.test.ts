@@ -116,6 +116,70 @@ describe('run card renderer snapshots', () => {
   });
 });
 
+describe('renderText reasoning option', () => {
+  it('hides reasoning by default', () => {
+    const state = stateFrom([
+      { type: 'thinking', delta: 'hidden reasoning' },
+      { type: 'text', delta: 'Answer' },
+    ]);
+
+    expect(renderText(state)).not.toContain('hidden reasoning');
+    expect(renderText(state, {})).toBe(renderText(state));
+    expect(renderText(state, { reasoning: false })).toBe(renderText(state));
+  });
+
+  it('prepends active reasoning as a markdown blockquote when enabled', () => {
+    const state = stateFrom([{ type: 'thinking', delta: 'line 1\n\nline 2' }]);
+
+    expect(renderText(state, { reasoning: true })).toBe(
+      '🧠 **思考中**\n> line 1\n>\n> line 2\n\n_🧠 正在思考…_',
+    );
+  });
+
+  it('uses the completed title and puts reasoning before normal blocks', () => {
+    const state = stateFrom([
+      { type: 'thinking', delta: 'done thinking' },
+      { type: 'text', delta: 'Answer' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    const text = renderText(state, { reasoning: true });
+
+    expect(text).toBe('🧠 **思考过程**\n> done thinking\n\nAnswer');
+    expect(text.indexOf('🧠 **思考过程**')).toBeLessThan(text.indexOf('Answer'));
+  });
+
+  it('truncates reasoning to reasoningMaxChars and appends a note', () => {
+    const state = stateFrom([{ type: 'thinking', delta: '0123456789EXTRA' }]);
+
+    const text = renderText(state, { reasoning: true, reasoningMaxChars: 10 });
+
+    expect(text).toContain('> 0123456789\n> …（思考内容已截断）');
+    expect(text).not.toContain('EXTRA');
+  });
+
+  it('defaults the reasoning limit to 3000 characters', () => {
+    const head = 'a'.repeat(3000);
+    const state = stateFrom([{ type: 'thinking', delta: `${head}TAIL` }]);
+
+    const text = renderText(state, { reasoning: true });
+
+    expect(text).toContain(`> ${head}`);
+    expect(text).not.toContain('TAIL');
+    expect(text).toContain('> …（思考内容已截断）');
+  });
+
+  it('masks emails and neutralizes HTML in reasoning', () => {
+    const state = stateFrom([{ type: 'thinking', delta: 'mail me@example.com <b>hi</b>' }]);
+
+    const text = renderText(state, { reasoning: true });
+
+    expect(text).toContain('me[at]example.com');
+    expect(text).not.toContain('me@example.com');
+    expect(text).not.toContain('<b>');
+    expect(text).toContain('&lt;b>hi&lt;/b>');
+  });
+});
+
 function stateFrom(events: AgentEvent[]): RunState {
   return events.reduce((state, event) => reduce(state, event), initialState);
 }

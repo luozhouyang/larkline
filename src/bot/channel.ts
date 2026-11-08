@@ -27,7 +27,7 @@ import {
   reduce,
   type RunState,
 } from '../card/run-state';
-import { renderText } from '../card/text-renderer';
+import { renderText, type TextRenderOptions } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import { readBridgeEnv } from '../config/env-compat';
@@ -36,6 +36,7 @@ import {
   getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
+  getReasoningDisplay,
   getRunIdleTimeoutMs,
   getShowToolCalls,
 } from '../config/schema';
@@ -1079,6 +1080,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   log.info('flush', 'reply-mode', { mode: replyMode });
   const cotMessages = getCotMessages(controls.cfg);
   const cotEnabled = cotMessages !== 'off';
+  const reasoningDisplay = getReasoningDisplay(controls.cfg);
+  const reasoningBubble = !cotEnabled && reasoningDisplay === 'bubble';
+  const showInlineReasoning = reasoningDisplay === 'inline';
+  const showCardReasoning = reasoningDisplay === 'auto' || reasoningDisplay === 'inline';
+  const textRenderOptions: TextRenderOptions = { reasoning: showInlineReasoning };
+  log.info('flush', 'reasoning-display', {
+    mode: reasoningDisplay,
+    cotEnabled,
+    inline: showInlineReasoning,
+    card: showCardReasoning,
+    bubble: reasoningBubble,
+  });
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
@@ -1086,30 +1099,35 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (getShowToolCalls(controls.cfg)) return state;
     return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
   };
-  const cardRenderOptions = callbackAuth
-    ? {
-        signCallback: (action: string) =>
-          callbackAuth.sign({
-            runId: execution.runId,
-            scope,
-            chatId,
-            operatorOpenId: firstMsg.senderId,
-            action,
-            policyFingerprint: flow.policy.policyFingerprint,
-            ttlMs: 24 * 60 * 60 * 1000,
-          }),
-      }
-    : {};
+  const cardRenderOptions: RunCardRenderOptions = {
+    ...(callbackAuth
+      ? {
+          signCallback: (action: string) =>
+            callbackAuth.sign({
+              runId: execution.runId,
+              scope,
+              chatId,
+              operatorOpenId: firstMsg.senderId,
+              action,
+              policyFingerprint: flow.policy.policyFingerprint,
+              ttlMs: 24 * 60 * 60 * 1000,
+            }),
+        }
+      : {}),
+    reasoning: showCardReasoning,
+  };
 
   // For non-card modes Claude's output doesn't surface visually until either
   // a first streamed token (markdown mode) or the whole run ends (text mode).
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
   const reactionPromise =
-    cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+    cotEnabled || reasoningBubble || replyMode === 'card'
+      ? undefined
+      : addWorkingReaction(channel, lastMsg.messageId);
 
   try {
-    if (cotEnabled) {
+    if (cotEnabled || reasoningBubble) {
       const cotPublisher = new CotPublisher({
         client: cotClient,
         chatId,
@@ -1122,10 +1140,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         scope,
         inputPreview: lastMsg.content,
       });
-      await cotPublisher.start();
+      // A reasoning-only bubble is created lazily on the first thinking
+      // event; a run without reasoning leaves no empty process bubble.
+      if (!reasoningBubble) await cotPublisher.start();
       if (!cotPublisher.disabled) {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
-          detail: cotMessages,
+          detail: cotEnabled ? cotMessages : 'brief',
+          mode: reasoningBubble ? 'reasoning-only' : 'process',
+          includeReasoning: reasoningDisplay !== 'off',
         });
         const finalState = await processAgentStream(
           handle,
@@ -1153,6 +1175,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+          textRenderOptions,
         });
         return;
       }
@@ -1209,7 +1232,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+          if (
+            shouldOpenProgressStream(filterForPrefs(state), {
+              reasoning: showCardReasoning,
+            })
+          ) {
+            progress.ensureOpen();
+          }
           if (!progress.expired() && cardCtrl) {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
           }
@@ -1223,7 +1252,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
+            if (renderText(filterForPrefs(state), textRenderOptions).trim() === '') return;
             await channel.send(
               chatId,
               { card: renderCard(filterForPrefs(state), cardRenderOptions) },
@@ -1238,7 +1267,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex' && !progress.expired()) throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
-      await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
+      await recallIfEmptyStreamedReply(
+        channel,
+        progress,
+        filterForPrefs(latestState),
+        scope,
+        textRenderOptions,
+      );
       if (progress.expired()) {
         log.warn('stream', 'card-lifetime-final-fallback', { mode: replyMode, scope });
         await sendFinalReply({
@@ -1249,6 +1284,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+          textRenderOptions,
         });
       } else if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
@@ -1259,6 +1295,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+          textRenderOptions,
         });
       }
     } else if (replyMode === 'markdown') {
@@ -1277,7 +1314,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
                 if (progress.abandoned()) return;
                 markdownCtrl = ctrl;
                 try {
-                  await ctrl.setContent(renderText(filterForPrefs(latestState)));
+                  await ctrl.setContent(
+                    renderText(filterForPrefs(latestState), textRenderOptions),
+                  );
                   await Promise.race([renderDone, progress.closeSignal()]);
                 } finally {
                   if (markdownCtrl === ctrl) markdownCtrl = undefined;
@@ -1291,7 +1330,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           onExpire: async () => {
             if (!markdownCtrl) return;
             await withTimeout(
-              markdownCtrl.setContent(renderExpiredMarkdown(filterForPrefs(latestState))),
+              markdownCtrl.setContent(
+                renderExpiredMarkdown(filterForPrefs(latestState), textRenderOptions),
+              ),
               STREAM_CARD_PAUSE_UPDATE_TIMEOUT_MS,
               'card-lifetime pause update',
             );
@@ -1306,9 +1347,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+          if (shouldOpenProgressStream(filterForPrefs(state), textRenderOptions)) {
+            progress.ensureOpen();
+          }
           if (!progress.expired() && markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+            await markdownCtrl.setContent(renderText(filterForPrefs(state), textRenderOptions));
           }
         },
       );
@@ -1320,7 +1363,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
+            const body = renderText(filterForPrefs(state), textRenderOptions);
             if (body.trim()) {
               await channel.send(chatId, { markdown: body }, sendOpts);
             }
@@ -1330,7 +1373,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex' && !progress.expired()) throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
-      await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
+      await recallIfEmptyStreamedReply(
+        channel,
+        progress,
+        filterForPrefs(latestState),
+        scope,
+        textRenderOptions,
+      );
       if (progress.expired()) {
         log.warn('stream', 'card-lifetime-final-fallback', { mode: replyMode, scope });
         await sendFinalReply({
@@ -1341,6 +1390,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+          textRenderOptions,
         });
       } else if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
@@ -1351,6 +1401,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+          textRenderOptions,
         });
       }
     } else {
@@ -1376,6 +1427,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         replyMode,
         sendOpts,
         cardRenderOptions,
+        textRenderOptions,
       });
     }
   } catch (err) {
@@ -1526,8 +1578,8 @@ function streamCardSafeMs(): number {
 const STREAM_CARD_PAUSE_NOTE =
   '_⏳ 任务仍在运行，过程消息已停止更新；完成后会单独发送最终答案。_';
 
-function renderExpiredMarkdown(state: RunState): string {
-  const body = renderText({ ...state, footer: null });
+function renderExpiredMarkdown(state: RunState, options: TextRenderOptions): string {
+  const body = renderText({ ...state, footer: null }, options);
   return body.trim() ? `${body}\n\n${STREAM_CARD_PAUSE_NOTE}` : STREAM_CARD_PAUSE_NOTE;
 }
 
@@ -1583,9 +1635,9 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
  * with `renderText` in both reply modes so it matches the rule
  * `recallIfEmptyStreamedReply` applies: a stream we open is one that survives.
  */
-function shouldOpenProgressStream(state: RunState): boolean {
+function shouldOpenProgressStream(state: RunState, options: TextRenderOptions): boolean {
   if (state.terminal !== 'running') return false;
-  return renderText({ ...state, footer: null }).trim() !== '';
+  return renderText({ ...state, footer: null }, options).trim() !== '';
 }
 
 /**
@@ -1627,6 +1679,7 @@ async function recallIfEmptyStreamedReply(
   progress: LazyProgressStream,
   finalState: RunState,
   scope: string,
+  textRenderOptions: TextRenderOptions,
 ): Promise<void> {
   if (!progress.opened()) return;
   // An expired stream was deliberately left on screen with the pause notice;
@@ -1642,7 +1695,7 @@ async function recallIfEmptyStreamedReply(
     );
     return;
   }
-  if (renderText(finalState).trim() !== '') return;
+  if (renderText(finalState, textRenderOptions).trim() !== '') return;
   const result = await progress.settled.catch(() => undefined);
   await recallStreamedMessage(channel, result, scope);
 }
@@ -1673,9 +1726,10 @@ async function sendFinalReply(input: {
   state: RunState;
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
-  cardRenderOptions: { signCallback?: (action: string) => string };
+  cardRenderOptions: RunCardRenderOptions;
+  textRenderOptions: TextRenderOptions;
 }): Promise<void> {
-  const body = renderText(input.state);
+  const body = renderText(input.state, input.textRenderOptions);
 
   // Nothing deliverable to send (agent produced no text on a clean finish;
   // error/interrupt/timeout keep `body` non-empty via their notices). Skip

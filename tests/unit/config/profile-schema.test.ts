@@ -8,6 +8,7 @@ import {
   effectiveLarkCliIdentity,
   normalizeProfileConfig,
 } from '../../../src/config/profile-schema';
+import { getReasoningDisplay } from '../../../src/config/schema';
 
 const app = {
   id: 'cli_test',
@@ -49,6 +50,28 @@ describe('profile schema', () => {
       defaultMode: 'danger-full-access',
       maxMode: 'danger-full-access',
     });
+  });
+
+  it('normalizes the reasoning display preference with a legacy auto default', () => {
+    const fresh = createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } });
+    expect(fresh.preferences.reasoningDisplay).toBeUndefined();
+    expect(getReasoningDisplay(fresh)).toBe('auto');
+
+    const inline = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+      preferences: { reasoningDisplay: 'inline' },
+    });
+    expect(inline.preferences.reasoningDisplay).toBe('inline');
+    expect(getReasoningDisplay(inline)).toBe('inline');
+
+    const bogus = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      preferences: { reasoningDisplay: 'nonsense' as never },
+    });
+    expect(getReasoningDisplay(bogus)).toBe('auto');
   });
 
   it('defaults deployment mode to personal and parses team', () => {

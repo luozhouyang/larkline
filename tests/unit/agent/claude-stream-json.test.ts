@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter.js';
-import { translateEvent } from '../../../src/agent/claude/stream-json.js';
+import {
+  ClaudeStreamTranslator,
+  translateEvent,
+} from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 
 describe('Claude stream-json translator', () => {
@@ -81,6 +84,68 @@ describe('Claude stream-json translator', () => {
       { type: 'done', sessionId: 'sess-2', terminationReason: 'normal' },
     ]);
     expect([...translateEvent({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');
+  });
+
+  it('streams partial thinking deltas and skips the duplicate assistant block', () => {
+    const translator = new ClaudeStreamTranslator();
+    const events = [
+      {
+        type: 'stream_event',
+        event: { type: 'message_start', message: { id: 'msg-1' } },
+      },
+      {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'thinking_delta', thinking: 'first ' },
+        },
+      },
+      {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'thinking_delta', thinking: 'second' },
+        },
+      },
+      // Partial text deltas are ignored; the completed assistant message is
+      // still the single source of user-visible text.
+      {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'ignored' } },
+      },
+      {
+        type: 'assistant',
+        message: {
+          id: 'msg-1',
+          content: [
+            { type: 'thinking', thinking: 'first second' },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+      },
+    ];
+
+    const out: AgentEvent[] = [];
+    for (const raw of events) out.push(...translator.translate(raw));
+
+    expect(out).toEqual([
+      { type: 'thinking', delta: 'first ' },
+      { type: 'thinking', delta: 'second' },
+      { type: 'text', delta: 'answer' },
+    ]);
+  });
+
+  it('still emits assistant thinking when no partial delta arrived', () => {
+    const translator = new ClaudeStreamTranslator();
+    expect([
+      ...translator.translate({
+        type: 'assistant',
+        message: {
+          id: 'msg-2',
+          content: [{ type: 'thinking', thinking: 'whole block' }],
+        },
+      }),
+    ]).toEqual([{ type: 'thinking', delta: 'whole block' }]);
   });
 
   it('ignores unknown, empty, and incomplete raw events', () => {

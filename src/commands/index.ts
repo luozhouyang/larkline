@@ -25,12 +25,19 @@ import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
-import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
+import type {
+  AppConfig,
+  AppPreferences,
+  MessageReplyMode,
+  ReasoningDisplay,
+  TenantBrand,
+} from '../config/schema';
 import {
   getAgentStopGraceMs,
   getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
+  getReasoningDisplay,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
@@ -1749,6 +1756,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
     cotMessages: getCotMessages(ctx.controls.cfg),
+    reasoningDisplay: getReasoningDisplay(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
@@ -1819,6 +1827,14 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         : rawCotMessages === 'off'
           ? 'off'
           : getCotMessages(ctx.controls.cfg);
+  const rawReasoningDisplay = String(fv.reasoning_display ?? '').trim();
+  const reasoningDisplay: ReasoningDisplay =
+    rawReasoningDisplay === 'auto' ||
+    rawReasoningDisplay === 'off' ||
+    rawReasoningDisplay === 'inline' ||
+    rawReasoningDisplay === 'bubble'
+      ? rawReasoningDisplay
+      : getReasoningDisplay(ctx.controls.cfg);
   // Parse max_concurrent_runs; invalid input falls back to current value.
   const rawMaxCC = String(fv.max_concurrent_runs ?? '').trim();
   const parsedMaxCC = Number(rawMaxCC);
@@ -1897,6 +1913,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       messageReplyMigrated: true,
       showToolCalls,
       cotMessages,
+      reasoningDisplay,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -1943,6 +1960,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       messageReply,
       showToolCalls,
       cotMessages,
+      reasoningDisplay,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -1962,6 +1980,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         messageReply,
         showToolCalls,
         cotMessages,
+        reasoningDisplay,
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,

@@ -3,6 +3,7 @@ export type ProfileMode = "personal" | "team";
 export type LarkCliIdentity = "bot-only" | "user-default";
 export type MessageReply = "card" | "markdown" | "text";
 export type CotMessages = "off" | "brief" | "detailed";
+export type ReasoningDisplay = "auto" | "off" | "inline" | "bubble";
 
 export interface Status {
   hosted: boolean;
@@ -44,6 +45,7 @@ export interface ConfigView {
   messageReply: MessageReply;
   showToolCalls: boolean;
   cotMessages: CotMessages;
+  reasoningDisplay: ReasoningDisplay;
   maxConcurrentRuns: number;
   runIdleTimeoutMinutes: number;
   requireMentionInGroup: boolean;

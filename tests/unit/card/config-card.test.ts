@@ -8,6 +8,7 @@ const base: ConfigFormOpts = {
   messageReply: 'markdown',
   showToolCalls: false,
   cotMessages: 'off',
+  reasoningDisplay: 'auto',
   maxConcurrentRuns: 1,
   runIdleTimeoutMinutes: 0,
   requireMentionInGroup: false,

@@ -163,6 +163,57 @@ describe('COT event mapping', () => {
     expect(calls[0]?.body).toMatchObject({ receive_id: 'oc_chat', origin_message_id: 'om_origin' });
   });
 
+  it('publishes only reasoning in reasoning-only mode and creates lazily', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-reasoning-only',
+      scope: 'oc_chat',
+      inputPreview: 'think',
+    });
+
+    await consumeCotEvents(iterate([
+      { type: 'thinking', delta: 'step one' },
+      { type: 'text', delta: 'progress text' },
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+      { type: 'tool_result', id: 'tool-1', output: '/repo', isError: false },
+      { type: 'thinking', delta: 'step two' },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief', mode: 'reasoning-only' });
+
+    const eventTypes = client.events.map((event) => event.event_type);
+    expect(client.createCalls).toHaveLength(1);
+    expect(eventTypes).toContain('REASONING_START');
+    expect(eventTypes).toContain('REASONING_MESSAGE_CONTENT');
+    expect(eventTypes).toContain('REASONING_END');
+    expect(eventTypes).not.toContain('TEXT_MESSAGE_CONTENT');
+    expect(eventTypes).not.toContain('TOOL_CALL_START');
+    expect(client.completed).toEqual(['done']);
+  });
+
+  it('does not create a reasoning bubble when the run has no thinking', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-no-reasoning',
+      scope: 'oc_chat',
+      inputPreview: 'answer only',
+    });
+
+    await consumeCotEvents(iterate([
+      { type: 'text', delta: 'answer' },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief', mode: 'reasoning-only' });
+
+    expect(client.createCalls).toHaveLength(0);
+    expect(client.completed).toEqual([]);
+    expect(publisher.isStarted()).toBe(false);
+  });
+
   it('marks the publisher degraded when COT updates fail', async () => {
     const client = new FakeCotClient();
     client.failUpdate = new Error('field validation failed');
