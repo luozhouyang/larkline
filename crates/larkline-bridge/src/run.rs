@@ -1,11 +1,17 @@
 //! Run flow: policy -> card -> agent -> card updates -> session.
 //!
+//! Working directories are per chat: `/cd` persists an override in the
+//! workspace store, and every run snapshots the effective cwd before spawning
+//! the agent. Changing the cwd mid-run therefore never moves an already
+//! running agent; the next message picks up the new directory.
+//!
 //! Deliberately sequential per chat. A second message while a run is live gets
 //! a short "still working" reply instead of spawning a competing agent;
 //! `/stop` aborts the task, which drops the child (kill-on-drop).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -15,10 +21,12 @@ use lark_channel::message::{MessageChatType, MessageSenderType, NormalizedMessag
 use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
 };
-use larkline_core::{AppPaths, MessageReplyMode, ProfileConfig, SessionStore};
+use larkline_core::{
+    AppPaths, MessageReplyMode, ProfileConfig, SessionStore, TenantBrand, WorkspaceStore,
+};
 use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
 use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -39,12 +47,12 @@ pub struct Bridge {
     pub channel: Channel,
     pub profile: ProfileConfig,
     pub agent_binary: PathBuf,
-    pub cwd: PathBuf,
     pub bot_open_id: Option<String>,
     pub bot_name: Option<String>,
     paths: AppPaths,
     tokens: CallbackTokens,
     sessions: Mutex<SessionStore>,
+    workspaces: Mutex<WorkspaceStore>,
     active: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
@@ -60,16 +68,29 @@ impl Bridge {
     ) -> anyhow::Result<Self> {
         let sessions = SessionStore::load(&paths.sessions_file)
             .with_context(|| format!("cannot load {}", paths.sessions_file.display()))?;
+
+        // `workspaces.default` in the profile is authoritative. The CLI
+        // resolves its `--cwd` (otherwise `paths.default_workspace_dir`)
+        // before constructing the bridge, so `cwd` is the runtime fallback for
+        // profiles that do not define a default.
+        let default_dir = match profile_default_workspace(&profile) {
+            Some(default_dir) => default_dir,
+            None if !cwd.as_os_str().is_empty() => cwd,
+            None => paths.default_workspace_dir.clone(),
+        };
+        let workspaces = WorkspaceStore::load_with_default(&paths.workspaces_file, &default_dir)
+            .with_context(|| format!("cannot load {}", paths.workspaces_file.display()))?;
+
         Ok(Self {
             channel,
             profile,
             agent_binary,
-            cwd,
             bot_open_id,
             bot_name,
             paths,
             tokens: CallbackTokens::new(),
             sessions: Mutex::new(sessions),
+            workspaces: Mutex::new(workspaces),
             active: Mutex::new(HashMap::new()),
         })
     }
@@ -115,6 +136,7 @@ impl Bridge {
 
     async fn handle_command(&self, message: &NormalizedMessage, text: &str) -> Option<String> {
         let command = text.split_whitespace().next().unwrap_or_default();
+        let args = text.get(command.len()..).unwrap_or_default().trim();
         match command {
             "/stop" => {
                 let mut active = self.active.lock().await;
@@ -130,11 +152,79 @@ impl Bridge {
                 Ok(()) => Some("已开启新会话。".to_string()),
                 Err(err) => Some(format!("重置失败：{err}")),
             },
-            "/help" => {
-                Some("可用命令：\n/new 开启新会话\n/stop 中断当前任务\n/help 显示帮助".to_string())
-            }
+            "/cd" => Some(self.handle_cd(&message.chat_id, args).await),
+            "/pwd" => Some(self.handle_pwd(&message.chat_id).await),
+            "/status" => Some(self.handle_status(&message.chat_id).await),
+            "/help" => Some(
+                "可用命令：\n\
+                 /new 或 /reset 开启新会话\n\
+                 /cd <绝对路径> 切换工作目录\n\
+                 /pwd 显示当前工作目录\n\
+                 /status 显示当前状态\n\
+                 /stop 中断当前任务\n\
+                 /help 显示帮助"
+                    .to_string(),
+            ),
             _ => None,
         }
+    }
+
+    /// `/cd <absolute path>`: canonicalize and persist a per-chat cwd.
+    async fn handle_cd(&self, chat_id: &str, args: &str) -> String {
+        let path = match validate_cd_target(args) {
+            Ok(path) => path,
+            Err(reply) => return reply,
+        };
+        let mut workspaces = self.workspaces.lock().await;
+        match workspaces.set(chat_id, &path) {
+            Ok(()) => format!("✓ 已切换 cwd 到 {}", path.display()),
+            Err(err) => format!("保存工作目录失败：{err}"),
+        }
+    }
+
+    /// `/pwd`: the effective cwd for this chat.
+    async fn handle_pwd(&self, chat_id: &str) -> String {
+        let workspaces = self.workspaces.lock().await;
+        let cwd = effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir);
+        format!("当前 cwd：{}", cwd.display())
+    }
+
+    /// `/status`: profile/agent/app/cwd/reply-mode/resumable-session summary.
+    async fn handle_status(&self, chat_id: &str) -> String {
+        let cwd = {
+            let workspaces = self.workspaces.lock().await;
+            effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir)
+        };
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let resume = {
+            let sessions = self.sessions.lock().await;
+            sessions.resume_for(chat_id, &cwd_str).map(str::to_string)
+        };
+
+        let app = self.profile.app();
+        let app_id = app.map(|app| app.id.as_str()).unwrap_or("(未配置)");
+        let tenant = app
+            .map(|app| tenant_label(app.tenant))
+            .unwrap_or("(未配置)");
+        let session = match resume {
+            Some(id) => format!("可恢复（{}…）", id.chars().take(8).collect::<String>()),
+            None => "不可恢复（当前 cwd 下没有会话）".to_string(),
+        };
+
+        format!(
+            "📊 当前状态\n\
+             profile: {}\n\
+             agent: {}\n\
+             app id: {app_id}\n\
+             tenant: {tenant}\n\
+             cwd: {}\n\
+             reply mode: {}\n\
+             session: {session}",
+            self.paths.profile,
+            self.profile.agent_kind.display_name(),
+            cwd.display(),
+            reply_mode_label(self.profile.message_reply()),
+        )
     }
 
     /// Handle a click on a bridge-rendered button.
@@ -175,6 +265,42 @@ impl Bridge {
         }
     }
 
+    /// Effective cwd for a run, creating the directory when needed.
+    ///
+    /// A `/cd` target that cannot be created (deleted, permissions, replaced
+    /// by a file) is reported and the profile default is used instead, so the
+    /// run still has a chance to start.
+    async fn workspace_cwd(&self, chat_id: &str) -> PathBuf {
+        let (cwd, default) = {
+            let workspaces = self.workspaces.lock().await;
+            (
+                effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir),
+                default_cwd(&workspaces, &self.paths.default_workspace_dir),
+            )
+        };
+
+        match fs::create_dir_all(&cwd) {
+            Ok(()) => cwd,
+            Err(err) => {
+                tracing::warn!(
+                    cwd = %cwd.display(),
+                    error = %err,
+                    "cannot create workspace; falling back to the default"
+                );
+                if cwd != default {
+                    if let Err(err) = fs::create_dir_all(&default) {
+                        tracing::warn!(
+                            cwd = %default.display(),
+                            error = %err,
+                            "cannot create the default workspace"
+                        );
+                    }
+                }
+                default
+            }
+        }
+    }
+
     async fn run_agent(self: Arc<Self>, message: NormalizedMessage) -> anyhow::Result<()> {
         let started = Instant::now();
         // Decorate the triggering message with the "Typing" reaction for as
@@ -184,7 +310,9 @@ impl Bridge {
         let _working_reaction =
             WorkingReaction::start(self.channel.rest().clone(), message.message_id.clone());
         let chat_id = message.chat_id.clone();
-        let cwd = self.cwd.clone();
+        // Snapshot the effective cwd for the whole run: session resume/record
+        // and the agent process must agree even if `/cd` lands mid-run.
+        let cwd = self.workspace_cwd(&chat_id).await;
         let cwd_str = cwd.to_string_lossy().into_owned();
         let resume = {
             let sessions = self.sessions.lock().await;
@@ -748,6 +876,78 @@ fn truncate_chars(value: &str, max: usize) -> String {
     }
 }
 
+/// Profile-configured default cwd (`workspaces.default`), if any.
+///
+/// The profile schema keeps untyped fields in `extra`; empty/blank values are
+/// ignored, matching the TypeScript normalizer.
+fn profile_default_workspace(profile: &ProfileConfig) -> Option<PathBuf> {
+    profile
+        .extra
+        .get("workspaces")
+        .and_then(Value::as_object)
+        .and_then(|workspaces| workspaces.get("default"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Validate and canonicalize a `/cd` argument.
+///
+/// Only absolute paths are accepted; the path must exist and be a directory.
+/// Returns the canonical path (symlinks and `..` resolved) on success, or a
+/// user-facing message on failure.
+fn validate_cd_target(input: &str) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("用法：`/cd <绝对路径>`".to_string());
+    }
+    if !Path::new(input).is_absolute() {
+        return Err(format!(
+            "请使用绝对路径：`{input}`（例如 `/Users/me/project`）"
+        ));
+    }
+
+    let canonical =
+        fs::canonicalize(input).map_err(|_| format!("工作目录不存在或不可访问：`{input}`"))?;
+    if !canonical.is_dir() {
+        return Err(format!("路径不是目录：`{}`", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+/// Effective cwd for `chat_id`: explicit `/cd` override, else the profile
+/// default, else `fallback` when the store was loaded without a default.
+fn effective_cwd(store: &WorkspaceStore, chat_id: &str, fallback: &Path) -> PathBuf {
+    store
+        .workspace_for(chat_id)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// The store's profile default, with the same fallback as [`effective_cwd`].
+fn default_cwd(store: &WorkspaceStore, fallback: &Path) -> PathBuf {
+    store
+        .default_dir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn tenant_label(tenant: TenantBrand) -> &'static str {
+    match tenant {
+        TenantBrand::Feishu => "feishu",
+        TenantBrand::Lark => "lark",
+    }
+}
+
+fn reply_mode_label(mode: MessageReplyMode) -> &'static str {
+    match mode {
+        MessageReplyMode::Card => "card",
+        MessageReplyMode::Markdown => "markdown",
+        MessageReplyMode::Text => "text",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +1067,107 @@ mod tests {
         let card = build_card(&profile(), &view, "完成", Instant::now(), None);
         let text = serde_json::to_string(card.as_value()).unwrap();
         assert!(text.contains("已截断"));
+    }
+
+    #[test]
+    fn profile_default_workspace_reads_the_extra_map() {
+        let mut profile = profile();
+        assert_eq!(profile_default_workspace(&profile), None);
+
+        profile.extra.insert(
+            "workspaces".to_string(),
+            json!({ "default": "  /profile/work  " }),
+        );
+        assert_eq!(
+            profile_default_workspace(&profile),
+            Some(PathBuf::from("/profile/work"))
+        );
+
+        // Blank and non-string values are ignored, like the TS normalizer.
+        profile
+            .extra
+            .insert("workspaces".to_string(), json!({ "default": "   " }));
+        assert_eq!(profile_default_workspace(&profile), None);
+        profile
+            .extra
+            .insert("workspaces".to_string(), json!({ "default": 7 }));
+        assert_eq!(profile_default_workspace(&profile), None);
+    }
+
+    #[test]
+    fn validate_cd_target_canonicalizes_an_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        // `nested/..` exercises the canonicalization (and must resolve to the
+        // temp root, not to a path containing `..`).
+        let requested = nested.join("..");
+        let resolved = validate_cd_target(requested.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, root.path().canonicalize().unwrap());
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn validate_cd_target_rejects_relative_paths_and_empty_arguments() {
+        for input in ["", "   "] {
+            let err = validate_cd_target(input).unwrap_err();
+            assert!(err.contains("用法"), "{err}");
+        }
+        for input in ["relative/path", "~/work", "../work"] {
+            let err = validate_cd_target(input).unwrap_err();
+            assert!(err.contains("绝对路径"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_cd_target_rejects_missing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let err = validate_cd_target(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+    }
+
+    #[test]
+    fn validate_cd_target_rejects_files() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("notes.txt");
+        fs::write(&file, "hello").unwrap();
+        let err = validate_cd_target(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("不是目录"), "{err}");
+    }
+
+    #[test]
+    fn effective_cwd_prefers_the_chat_override_over_the_profile_default() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceStore::load_with_default(
+            root.path().join("workspaces.json"),
+            "/profile/default",
+        )
+        .unwrap();
+        store.set("oc_1", "/work/one").unwrap();
+
+        assert_eq!(
+            effective_cwd(&store, "oc_1", Path::new("/cli/default")),
+            PathBuf::from("/work/one")
+        );
+        assert_eq!(
+            effective_cwd(&store, "oc_2", Path::new("/cli/default")),
+            PathBuf::from("/profile/default")
+        );
+    }
+
+    #[test]
+    fn effective_cwd_uses_the_fallback_when_the_store_has_no_default() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::load(root.path().join("workspaces.json")).unwrap();
+        assert_eq!(
+            effective_cwd(&store, "oc_1", Path::new("/cli/default")),
+            PathBuf::from("/cli/default")
+        );
+        assert_eq!(
+            default_cwd(&store, Path::new("/cli/default")),
+            PathBuf::from("/cli/default")
+        );
     }
 }
