@@ -79,7 +79,8 @@ Ported:
 - QR onboarding (`larkline onboard`) with the registration device flow
 - OS daemon lifecycle (`start`/`stop`/`restart`/`status`/`unregister`) with
   launchd, systemd --user and schtasks renderers
-- `ps` / `kill` over the shared process registry (read and terminate only)
+- `ps` / `kill` over the shared process registry, with `run` registering and
+  unregistering its own process
 
 ## Still to port and known gaps
 
@@ -111,10 +112,14 @@ primitive so it can be picked up without re-deriving the design.
 6. **Topic/thread scopes** — sessions and the pending queue are keyed by
    `chat_id`; topic groups share one session. The TypeScript bridge uses
    `chatId:threadId`.
-7. **Process registry writer** — `ps` and `kill` read
-   `registry/processes.json`, but no Rust code registers or unregisters a
-   `run` process. A Rust-only setup therefore shows an empty list; entries
-   written by the TypeScript bridge remain readable.
+7. **Registry bot names and stale detection** — `run` registers its process
+   on startup and removes it on normal exit and on ctrl-c/SIGTERM, so both
+   implementations share one `ps` list. The entry has no `botName`:
+   `lark-channel` 0.6 exposes no bot-identity accessor, so the name is not
+   known after the WebSocket handshake and `ps`/`status` fall back to the app
+   id for Rust entries. Stale cleanup probes pid liveness instead of the
+   TypeScript runtime locks, because the Rust `run` does not acquire those
+   locks yet.
 8. **Keepalive watchdog** — not started. `lark-channel` 0.6 exposes neither a
    WebSocket connection-status hook nor an in-process force-reconnect handle;
    see `crates/larkline-bridge/src/keepalive.rs` and its `KEEPALIVE_GAPS`.
@@ -174,8 +179,11 @@ Releases are tag-driven. Pushing a `v*` tag runs
 `.github/workflows/release.yml`:
 
 1. `cargo fmt --all -- --check` and `cargo test --workspace` on Linux.
-2. Build Linux `x86_64` and `aarch64`, a macOS universal binary (Developer ID
-   signed and notarized), and Windows `x86_64`.
+2. Build statically linked Linux `x86_64` and `aarch64` binaries with the musl
+   targets (`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`), a
+   macOS universal binary (Developer ID signed and notarized), and Windows
+   `x86_64`. The Linux jobs fail unless `file` reports `statically linked`, so
+   the release never depends on the runner's glibc.
 3. Generate `SHA256SUMS` over every asset and create the GitHub Release.
 
 The macOS job fails loudly when the Apple signing/notarization secrets are

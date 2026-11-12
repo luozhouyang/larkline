@@ -17,6 +17,7 @@ use larkline_lark::Channel;
 
 use crate::cli::{Cli, RunArgs};
 use crate::context::AppContext;
+use crate::registry::{RegisterOptions, Registration};
 
 pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     let ctx = AppContext::load(cli)?;
@@ -91,6 +92,31 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     )?);
     println!("sessions: {}", bridge.sessions_path().display());
 
+    // Register this process before connecting so `larkline ps` / `kill` can see
+    // it from the moment it starts talking to Feishu. Registration prunes dead
+    // entries and writes atomically under the registry lock.
+    //
+    // `botName` is intentionally absent: `lark-channel` 0.6 has no bot-identity
+    // accessor, so the display name is not known after the WebSocket
+    // handshake. `Registration::update_bot_name` is the hook for when the SDK
+    // exposes one.
+    let registration = Registration::register(
+        &ctx.root_dir,
+        RegisterOptions {
+            app_id: app.id.clone(),
+            tenant: app.tenant,
+            profile_name: ctx.profile_name().to_string(),
+            agent_kind: profile.agent_kind,
+            config_path: ctx.config_file.clone(),
+            version: larkline_core::VERSION.to_string(),
+        },
+    )?;
+    println!(
+        "process: {} (pid {})",
+        registration.id(),
+        std::process::id()
+    );
+
     // The in-meeting agent polls `bots/events` on its own Tokio task. Starting
     // it here (rather than inside `Bridge::new`) keeps construction synchronous
     // and makes the runtime dependency explicit.
@@ -163,14 +189,55 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
             Ok(_) => Ok(()),
             Err(err) => Err(anyhow::Error::from(err)),
         },
-        _ = tokio::signal::ctrl_c() => {
+        _ = wait_for_shutdown() => {
             println!("\nstopping");
             Ok(())
         }
     };
 
+    // Unregister first: leaving meetings can take up to five seconds, while
+    // `larkline kill` only waits two before escalating to SIGKILL. Removing the
+    // entry up front means a forced stop does not leave a stale entry behind.
+    if let Err(err) = registration.unregister() {
+        // Shutdown must not fail because the state directory became read-only;
+        // the next writer prunes the pid anyway.
+        tracing::warn!(error = %err, "failed to remove the process registry entry");
+    }
+
     // Leave the meetings we joined before dropping the bridge, so the bot does
     // not linger as a participant after the process exits.
     bridge.stop_meeting().await;
     outcome
+}
+
+/// Resolve on ctrl-c, or on SIGTERM where the platform has it.
+///
+/// SIGTERM matters for the OS service managers (`larkline start` installs a
+/// launchd/systemd unit) which stop the bridge with that signal instead of a
+/// terminal interrupt.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "cannot listen for SIGTERM; only ctrl-c will stop the bridge"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

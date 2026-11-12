@@ -11,6 +11,7 @@ mod commands;
 mod context;
 mod daemon;
 mod ps;
+mod registry;
 
 use clap::Parser;
 use cli::{Cli, Commands};

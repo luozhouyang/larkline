@@ -69,8 +69,8 @@ sh /tmp/larkline-install.sh --dir "$HOME/bin"
 | 平台 | 发布产物 | 说明 |
 |---|---|---|
 | macOS（Apple Silicon + Intel） | `larkline-darwin-universal.zip` | Universal 二进制，Developer ID 签名并由 Apple notarize |
-| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | 在 Ubuntu 22.04 上构建 |
-| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | 在 Ubuntu 24.04 ARM 上构建 |
+| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | 静态链接（musl），不依赖 glibc |
+| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | 静态链接（musl），在 Ubuntu 24.04 ARM 上构建 |
 | Windows x86_64 | `larkline-windows-x86_64.zip` | 未签名；首次运行可能触发 SmartScreen 警告 |
 
 Windows 上请从 release zip 解压 `larkline.exe` 并放进 `PATH`。安装脚本是 POSIX `sh` 脚本，Windows 上直接用 zip 最省事。
@@ -173,7 +173,7 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 
 全局选项：`--home <path>`（默认 `$LARKLINE_HOME` 或 `~/.larkline`）、`--profile <name>`（默认 `$LARKLINE_PROFILE` 或当前 profile）、`-v` / `-vv` 提高日志级别。
 
-`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。Rust bridge 目前不会注册自己的 `run` 进程，所以纯 Rust 环境下列表为空；迁移期间由 TypeScript bridge 写入的条目仍然可以读取。
+`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。`larkline run` 启动时会注册自己的进程，正常退出和 ctrl-c/SIGTERM 时移除条目，因此 Rust 和 TypeScript 进程共用同一份列表。`botName` 只有 TypeScript bridge 会填写：Rust SDK 没有读取 bot 身份的接口，所以 Rust 条目回退显示 app id。
 
 ## 飞书内命令
 
@@ -350,7 +350,7 @@ Rust bridge 暂未实现以下 TypeScript 功能：
 - Agent 权限模式（`permissions.defaultAccess` / `maxAccess`）；当前 run 使用完整权限。
 - 入站图片和文件下载。agent 目前只收到文本 prompt。
 - 按话题 / thread 拆分的会话；会话目前按 chat id 存储。
-- Keepalive watchdog 和进程注册表写入。
+- Keepalive watchdog，以及 Rust 注册条目的 bot 名称补全（`lark-channel` 0.6 没有读取 bot 身份的接口）。
 
 每项缺口的原因和当前状态见 [Rust 移植说明](./docs/RUST-PORT.md)。
 
@@ -366,7 +366,7 @@ Rust bridge 暂未实现以下 TypeScript 功能：
 
 **Windows 提示 SmartScreen 警告。** Windows 二进制目前没有代码签名。macOS 版本已签名并 notarize；Linux 版本未签名，但提供校验和。
 
-**`larkline ps` 是空的。** Rust bridge 目前不会注册自己的进程，所以纯 Rust 环境下列表为空。这是已知缺口，不是错误。
+**`larkline ps` 里有 stale 条目。** 被 SIGKILL 杀掉或崩溃的进程没法自己注销。下一次 `larkline run` 会清理死 pid；在那之前 `ps` 会把它们标成 `(stale)`，`kill` 不会向它们发信号。
 
 **怎么卸载？** 先 `larkline stop`，再 `larkline unregister`，删除 `larkline` 二进制；如果也要删除本地状态，再删除 `~/.larkline`。
 
@@ -382,7 +382,7 @@ cargo test --workspace
 ./target/release/larkline doctor
 ```
 
-需要 Rust 1.85 或更新版本。CI 在 macOS、Ubuntu 和 Windows 上跑测试；格式检查和 clippy 只在 Linux 上跑。发布由 tag 触发：推送 `v*` tag 后会运行发布流水线，执行格式检查和测试，构建 Linux x86_64/aarch64、macOS Universal（签名并 notarize）和 Windows x86_64，然后上传产物、`SHA256SUMS` 并创建 GitHub Release。
+需要 Rust 1.85 或更新版本。CI 在 macOS、Ubuntu 和 Windows 上跑测试；格式检查和 clippy 只在 Linux 上跑。发布由 tag 触发：推送 `v*` tag 后会运行发布流水线，执行格式检查和测试，构建静态链接（musl）的 Linux x86_64/aarch64、macOS Universal（签名并 notarize）和 Windows x86_64，然后上传产物、`SHA256SUMS` 并创建 GitHub Release。
 
 ## 许可
 

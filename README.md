@@ -69,8 +69,8 @@ The installer downloads the matching asset and verifies it against the release's
 | Platform | Release asset | Notes |
 |---|---|---|
 | macOS (Apple Silicon + Intel) | `larkline-darwin-universal.zip` | Universal binary, Developer ID-signed and notarized by Apple |
-| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | Built on Ubuntu 22.04 |
-| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | Built on Ubuntu 24.04 ARM |
+| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | Statically linked (musl), no glibc dependency |
+| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | Statically linked (musl), built on Ubuntu 24.04 ARM |
 | Windows x86_64 | `larkline-windows-x86_64.zip` | Unsigned; SmartScreen may warn on first run |
 
 On Windows, extract `larkline.exe` from the release zip and put it on `PATH`. The installer is a POSIX `sh` script, so the zip is the simplest option there.
@@ -173,7 +173,7 @@ Daemon stdout/stderr logs are under `~/.larkline/profiles/<profile>/logs/daemon/
 
 Global options: `--home <path>` (defaults to `$LARKLINE_HOME` or `~/.larkline`), `--profile <name>` (defaults to `$LARKLINE_PROFILE` or the active profile), and `-v`/`-vv` for more logging.
 
-`ps` and `kill` read `~/.larkline/registry/processes.json`. The Rust bridge does not register its own `run` process yet, so a Rust-only setup shows an empty list; entries written by the TypeScript bridge are still readable during migration.
+`ps` and `kill` read `~/.larkline/registry/processes.json`. `larkline run` registers its process at startup and removes it on normal exit and on ctrl-c/SIGTERM, so Rust and TypeScript processes share one list. `botName` is only filled in by the TypeScript bridge; the Rust SDK has no bot-identity accessor, so Rust entries show the app id instead.
 
 ## Commands inside Feishu / Lark
 
@@ -350,7 +350,7 @@ The Rust bridge does not yet implement these TypeScript features:
 - Agent permission modes (`permissions.defaultAccess` / `maxAccess`); runs currently use full access.
 - Inbound image and file download. Agent runs receive text prompts only.
 - Topic/thread-scoped sessions; sessions are keyed by chat id.
-- The keepalive watchdog and the process-registry writer.
+- The keepalive watchdog and bot-name enrichment for Rust-owned registry entries (`lark-channel` 0.6 exposes no bot identity).
 
 See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reasons behind each gap.
 
@@ -366,7 +366,7 @@ See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reason
 
 **Windows shows a SmartScreen warning.** The Windows binary is not code-signed yet. The macOS build is signed and notarized; the Linux builds are unsigned but checksummed.
 
-**`larkline ps` shows nothing.** The Rust bridge does not register its own process yet, so the list is empty in a Rust-only setup. This is a known gap, not an error.
+**`larkline ps` shows stale entries.** A process that was killed with SIGKILL (or crashed) cannot unregister itself. The next `larkline run` prunes dead pids; until then `ps` marks those entries `(stale)` and `kill` refuses to signal them.
 
 **How do I uninstall?** Run `larkline stop`, then `larkline unregister`, remove the `larkline` binary, and delete `~/.larkline` if you also want to remove local state.
 
@@ -382,7 +382,7 @@ cargo test --workspace
 ./target/release/larkline doctor
 ```
 
-Rust 1.85 or newer is required. CI runs the test suite on macOS, Ubuntu and Windows; formatting and clippy run on Linux. Releases are tag-driven: pushing a `v*` tag runs the release workflow, which formats and tests the workspace, builds Linux x86_64/aarch64, a signed and notarized macOS universal binary, and Windows x86_64, then publishes the assets with `SHA256SUMS` and a GitHub Release.
+Rust 1.85 or newer is required. CI runs the test suite on macOS, Ubuntu and Windows; formatting and clippy run on Linux. Releases are tag-driven: pushing a `v*` tag runs the release workflow, which formats and tests the workspace, builds statically linked (musl) Linux x86_64/aarch64, a signed and notarized macOS universal binary, and Windows x86_64, then publishes the assets with `SHA256SUMS` and a GitHub Release.
 
 ## License
 
