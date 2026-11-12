@@ -992,7 +992,7 @@ fn spawn_comment_run(
     let bridge = Arc::clone(bridge);
     Arc::clone(&bridge).spawn_tracked(&thread_scope, async move {
         let _run_guard = run_guard;
-        let reaction = CommentTypingReaction::start(bridge.channel.rest().clone(), &mention);
+        let reaction = CommentTypingReaction::start(bridge.rest().clone(), &mention);
         let view = run_comment_agent(&bridge, &event, &mention, &task_scope).await;
         let text = comment_reply_text(&view, bridge.profile.agent_kind.display_name());
         post_comment_reply(&bridge, &mention, &text).await;
@@ -1011,7 +1011,7 @@ async fn fetch_mention(
         event.file_type.clone(),
         event.comment_id.clone(),
     );
-    let comment = match comments::fetch(bridge.channel.rest(), &reference).await {
+    let comment = match comments::fetch(bridge.rest(), &reference).await {
         Ok(Some(comment)) => comment,
         Ok(None) => {
             tracing::info!(
@@ -1184,7 +1184,7 @@ async fn run_comment_agent_with_wait(
 /// TypeScript bridge's `topLevel: true` fast path. In-thread replies still use
 /// `comments::reply`, which falls back to top-level on 1069302.
 async fn post_comment_reply(bridge: &Bridge, mention: &CommentMention, text: &str) {
-    let rest = bridge.channel.rest();
+    let rest = bridge.rest();
     let result = if mention.is_whole_document {
         comments::reply_top_level(rest, &mention.file_token, &mention.file_type, text).await
     } else {

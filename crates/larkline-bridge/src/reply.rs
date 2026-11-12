@@ -27,8 +27,10 @@
 //! half to be a Feishu chat id (`oc_…`).
 
 use lark_channel::Card;
-use lark_channel::message::{MessageId, Recipient};
-use larkline_lark::{Channel, StreamingCard};
+use lark_channel::message::MessageId;
+use larkline_lark::LarkResult;
+
+use crate::transport::{BridgeStream, BridgeTransport, StreamTarget};
 
 /// Where one outbound reply should go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,24 +73,18 @@ pub(crate) fn reply_route<'a>(scope: &str, source_message_id: Option<&'a str>) -
 /// A threaded reply that the API rejects falls back to a top-level chat
 /// message so the user still gets the answer; the failure is logged.
 pub(crate) async fn send_text(
-    channel: &Channel,
+    transport: &dyn BridgeTransport,
     scope: &str,
     chat_id: &str,
     source_message_id: Option<&str>,
     text: impl Into<String>,
-) -> larkline_lark::LarkResult<MessageId> {
+) -> LarkResult<MessageId> {
     let text = text.into();
     match reply_route(scope, source_message_id) {
-        ReplyRoute::Chat => channel.send_text(chat_id, text).await,
+        ReplyRoute::Chat => transport.send_text(chat_id, text).await,
         ReplyRoute::Thread { parent_message_id } => {
             let parent = MessageId(parent_message_id.to_owned());
-            match channel
-                .sender()
-                .text_reply(parent, text.clone())
-                .reply_in_thread(true)
-                .send()
-                .await
-            {
+            match transport.reply_text(&parent, text.clone()).await {
                 Ok(id) => Ok(id),
                 Err(error) => {
                     tracing::warn!(
@@ -97,7 +93,7 @@ pub(crate) async fn send_text(
                         parent = %parent_message_id,
                         "thread reply failed; falling back to a top-level message"
                     );
-                    channel.send_text(chat_id, text).await
+                    transport.send_text(chat_id, text).await
                 }
             }
         }
@@ -111,30 +107,18 @@ pub(crate) async fn send_text(
 /// reply that the API rejects falls back to a top-level chat message, mirroring
 /// [`send_text`].
 pub(crate) async fn send_markdown(
-    channel: &Channel,
+    transport: &dyn BridgeTransport,
     scope: &str,
     chat_id: &str,
     source_message_id: Option<&str>,
     markdown: impl Into<String>,
-) -> larkline_lark::LarkResult<MessageId> {
+) -> LarkResult<MessageId> {
     let markdown = markdown.into();
     match reply_route(scope, source_message_id) {
-        ReplyRoute::Chat => {
-            channel
-                .sender()
-                .markdown_message(Recipient::Chat(chat_id.to_owned()), markdown)
-                .send()
-                .await
-        }
+        ReplyRoute::Chat => transport.send_markdown(chat_id, markdown).await,
         ReplyRoute::Thread { parent_message_id } => {
             let parent = MessageId(parent_message_id.to_owned());
-            match channel
-                .sender()
-                .markdown_reply(parent, markdown.clone())
-                .reply_in_thread(true)
-                .send()
-                .await
-            {
+            match transport.reply_markdown(&parent, markdown.clone()).await {
                 Ok(id) => Ok(id),
                 Err(error) => {
                     tracing::warn!(
@@ -143,11 +127,7 @@ pub(crate) async fn send_markdown(
                         parent = %parent_message_id,
                         "thread markdown reply failed; falling back to a top-level message"
                     );
-                    channel
-                        .sender()
-                        .markdown_message(Recipient::Chat(chat_id.to_owned()), markdown)
-                        .send()
-                        .await
+                    transport.send_markdown(chat_id, markdown).await
                 }
             }
         }
@@ -158,23 +138,17 @@ pub(crate) async fn send_markdown(
 /// [`reply_route`]. A threaded card that the API rejects falls back to a
 /// top-level card, mirroring [`send_text`].
 pub(crate) async fn send_card(
-    channel: &Channel,
+    transport: &dyn BridgeTransport,
     scope: &str,
     chat_id: &str,
     source_message_id: Option<&str>,
     card: &Card,
-) -> larkline_lark::LarkResult<MessageId> {
+) -> LarkResult<MessageId> {
     match reply_route(scope, source_message_id) {
-        ReplyRoute::Chat => channel.send_card(chat_id, card).await,
+        ReplyRoute::Chat => transport.send_card(chat_id, card).await,
         ReplyRoute::Thread { parent_message_id } => {
             let parent = MessageId(parent_message_id.to_owned());
-            match channel
-                .sender()
-                .card_reply(parent, card.clone())
-                .reply_in_thread(true)
-                .send()
-                .await
-            {
+            match transport.reply_card(&parent, card).await {
                 Ok(id) => Ok(id),
                 Err(error) => {
                     tracing::warn!(
@@ -183,7 +157,7 @@ pub(crate) async fn send_card(
                         parent = %parent_message_id,
                         "thread card reply failed; falling back to a top-level card"
                     );
-                    channel.send_card(chat_id, card).await
+                    transport.send_card(chat_id, card).await
                 }
             }
         }
@@ -199,23 +173,24 @@ pub(crate) async fn send_card(
 /// entity is left unused and the error is returned, exactly like the top-level
 /// path: the caller falls back to [`send_card`].
 pub(crate) async fn start_streaming_card(
-    channel: &Channel,
+    transport: &dyn BridgeTransport,
     scope: &str,
     chat_id: &str,
     source_message_id: Option<&str>,
     card: Card,
     element_id: &str,
-) -> larkline_lark::LarkResult<StreamingCard> {
+) -> LarkResult<Box<dyn BridgeStream>> {
     match reply_route(scope, source_message_id) {
-        ReplyRoute::Chat => StreamingCard::start(channel, chat_id, card, element_id).await,
+        ReplyRoute::Chat => {
+            transport
+                .start_stream(StreamTarget::Chat(chat_id), card, element_id)
+                .await
+        }
         ReplyRoute::Thread { parent_message_id } => {
-            StreamingCard::start_reply(
-                channel,
-                MessageId(parent_message_id.to_owned()),
-                card,
-                element_id,
-            )
-            .await
+            let parent = MessageId(parent_message_id.to_owned());
+            transport
+                .start_stream(StreamTarget::Thread(&parent), card, element_id)
+                .await
         }
     }
 }

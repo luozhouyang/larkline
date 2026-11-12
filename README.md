@@ -307,7 +307,7 @@ The Rust bridge implements a subset of the TypeScript access model:
 - `access.admins` gates `/config set`, `/meeting` and `/stop <scope>`; while `admins` is empty, `access.allowedUsers` acts as the admin set. The runtime app owner is also accepted, resolved from the Applications API and cached for 30 minutes.
 - `access.allowedChats` is not applied to ordinary messages yet. It is only consulted when verifying card-button clicks.
 
-The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` and `/remove` are not ported yet. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
+`/invite` and `/remove` maintain the user, admin and group lists. The TypeScript owner bypass for ordinary messages, team-mode usage for ordinary messages and per-chat `chatRequireMention` overrides are not applied yet; `allowedChats` is consulted only for card-click verification. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
 
 ### Meetings
 
@@ -352,18 +352,28 @@ The app needs the VC bot scopes, and the tenant must support the VC bot capabili
 
 If both `~/.lark-channel` and `~/.larkline` exist, nothing is renamed; the existing `~/.larkline` wins. No re-onboarding and no App Secret re-entry are needed.
 
-### Not yet ported
+### Remaining gaps
 
-The Rust bridge does not yet implement these TypeScript features:
+The bridge has an injectable outbound transport (`BridgeTransport`) plus
+end-to-end run-flow tests (`crates/larkline-bridge/tests/run_flow.rs`) covering
+the happy path, `/stop`, the idle timeout, markdown mode and attachment
+failures. Only these items remain:
 
-- The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` / `/remove`, and `allowedChats` for ordinary messages. (The runtime app owner is resolved for admin commands only.)
-- `/ws` named workspaces, `/resume`, `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`.
-- The full `/config` card form; the text subset cannot edit the COT/reasoning presentation settings, access or lark-cli policy. (COT process messages and the reasoning bubble themselves are ported.)
-- Inbound image and file download. Agent runs receive text prompts only.
-- Wiki comment targets; `doc`, `docx`, `sheet` and `file` are supported.
-- End-of-meeting summary threading: summaries go to the configured origin chat or owner DM as top-level messages.
-- The keepalive watchdog and bot-name enrichment for Rust-owned registry entries (`lark-channel` 0.6 exposes no bot identity).
-- The remaining TypeScript test suite; the Rust workspace ports the implemented behaviour, while the TypeScript sources and vitest specs stay in the tree as reference.
+- **Apple release secrets**: the macOS release job needs Developer ID signing
+  and notarization credentials that are still pending; Windows Authenticode
+  signing is not configured either.
+- **Wiki comments**: `wiki` comment targets are logged and skipped; `doc`,
+  `docx`, `sheet` and `file` are supported.
+- **Meeting summary threading**: end-of-meeting summaries go to the configured
+  origin chat or owner DM as top-level messages, not into the originating topic.
+- **Session catalog**: `sessions.json.catalog.json` is not written or read;
+  resume is keyed by scope and working directory.
+- **Non-TS extras and remaining parity edges**: access-control edges (the
+  TypeScript owner bypass for ordinary messages, team-mode usage for ordinary
+  messages, per-chat `chatRequireMention` overrides and `allowedChats` on
+  ordinary messages), Windows Authenticode signing, bot-name enrichment for
+  Rust-owned `ps` entries, and the live keepalive watchdog (`lark-channel` 0.6
+  exposes no connection-status or force-reconnect hook).
 
 See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reasons behind each gap.
 

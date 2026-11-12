@@ -307,7 +307,7 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 - `access.admins` 控制 `/config set`、`/meeting` 和 `/stop <scope>`；`admins` 为空时，`access.allowedUsers` 作为管理员集合。运行时应用 owner 也可以通过；owner 从 Applications API 解析并缓存 30 分钟。
 - `access.allowedChats` 暂不作用于普通消息，只在校验卡片按钮点击时使用。
 
-普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` 和 `/remove` 尚未移植。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
+`/invite` 和 `/remove` 已用于维护用户、管理员和群名单。普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖尚未生效；`allowedChats` 只用于卡片按钮校验。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
 
 ### 会议
 
@@ -352,18 +352,25 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 
 如果 `~/.lark-channel` 和 `~/.larkline` 同时存在，不会做 rename，已有的 `~/.larkline` 优先。不需要重新扫码，也不需要重新输入 App Secret。
 
-### 尚未移植
+### 剩余缺口
 
-Rust bridge 暂未实现以下 TypeScript 功能：
+bridge 的出站 transport 可注入（`BridgeTransport`），并且有端到端 run-flow 测试
+（`crates/larkline-bridge/tests/run_flow.rs`），覆盖正常流程、`/stop`、空闲超时、
+markdown 模式和附件下载失败。目前只剩以下项目：
 
-- 普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。（运行时应用 owner 只用于管理员命令。）
-- `/ws` 命名工作空间、`/resume`、`/timeout`、飞书内 `/ps`、`/exit`、`/reconnect`、`/doctor`。
-- 完整的 `/config` 卡片表单；文本子集尚不能修改 COT / 思考展示设置、访问控制和 lark-cli 策略（COT 过程消息与思考气泡本身已移植）。
-- 入站图片和文件下载。agent 目前只收到文本 prompt。
-- Wiki 评论目标；目前支持 `doc`、`docx`、`sheet` 和 `file`。
-- 会议纪要的 thread 归属：纪要会作为顶层消息发到配置的来源聊天或 owner 私聊。
-- Keepalive watchdog，以及 Rust 注册条目的 bot 名称补全（`lark-channel` 0.6 没有读取 bot 身份的接口）。
-- 完整的 TypeScript 测试套件；Rust workspace 只覆盖已实现的行为，TypeScript 源码和 vitest 用例仍作为参考留在仓库里。
+- **Apple 发布 secrets**：macOS 发布流水线需要 Developer ID 签名和 notarize
+  凭据，目前仍待配置；Windows Authenticode 签名也未配置。
+- **Wiki 评论**：`wiki` 评论目标目前只记录日志并跳过；已支持 `doc`、`docx`、
+  `sheet` 和 `file`。
+- **会议纪要 thread 归属**：纪要会作为顶层消息发到配置的来源聊天或 owner
+  私聊，不会发进会议来源话题。
+- **Session catalog**：不读也不写 `sessions.json.catalog.json`；恢复会话只按
+  scope 和工作目录匹配。
+- **非 TS 附加项与剩余边界**：普通消息上尚未生效的访问控制边界（TypeScript
+  owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、
+  普通消息上的 `allowedChats`）、Windows Authenticode 签名、Rust `ps` 条目的
+  bot 名称补全，以及在线 keepalive watchdog（`lark-channel` 0.6 没有连接状态或
+  强制重连接口）。
 
 每项缺口的原因和当前状态见 [Rust 移植说明](./docs/RUST-PORT.md)。
 

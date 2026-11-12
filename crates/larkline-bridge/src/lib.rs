@@ -22,6 +22,7 @@ pub mod reply;
 pub mod run;
 pub mod run_limit;
 pub mod text_render;
+pub mod transport;
 
 pub use callback::{
     CallbackAuth, CallbackExpected, CallbackKey, CallbackPayload, CallbackRejection,
@@ -49,6 +50,7 @@ pub use permissions::{AccessMode, ClaudePermissionMode, RunPermissions};
 pub use run::{Bridge, scope_key};
 pub use run_limit::{MAX_CONCURRENT_RUNS, RunLimiter, RunPermit};
 pub use text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};
+pub use transport::{BridgeStream, BridgeTransport, ReactionTransport, StreamTarget};
 
 /// Serializes fake-agent script creation and spawning in unit tests.
 ///

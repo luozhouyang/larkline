@@ -144,103 +144,49 @@ Ported:
 - process registry writer: `run` registers and unregisters its own process with
   an advisory lock, atomic replace, dead-pid pruning and a 64-entry cap;
   `ps` / `kill` read the shared registry
+- injectable outbound transport: `BridgeTransport` / `BridgeStream` (implemented
+  by `larkline_lark::Channel`) covers text/card sends, threaded replies,
+  message-card updates, CardKit entity creation and streaming cards; the
+  working reaction has its own `ReactionTransport` injection point.
+  `Bridge::new_with_transport` builds a bridge around a recording fake, so the
+  real run flow can be tested without a `Channel` or a network
+- end-to-end run-flow tests (`crates/larkline-bridge/tests/run_flow.rs`) with a
+  fake agent binary speaking Claude `stream-json` plus the fake transport:
+  happy path (running card -> text/tool events -> terminal card with the final
+  answer), cooperative `/stop` (terminal `⏹ 已被中断` card with the partial
+  answer and no live button), idle-watchdog timeout (terminal notice, no
+  button), markdown mode (one markdown element, no tool panel/footer element or
+  stop button) and a failing attachment download that does not fail the run
 
-## Still to port and known gaps
+## Remaining gaps
 
-Ordered roughly by user impact. Each item names the reason or the missing
-primitive so it can be picked up without re-deriving the design.
+Only the items below are still open. The injectable outbound transport and the
+end-to-end run flow are covered by unit and integration tests; the remaining
+items are listed here so they can be picked up without re-deriving the design.
 
-1. **Access-control parity** — `crates/larkline-bridge/src/policy.rs` implements
-   the `allowedUsers` allowlist and the group `@`-mention rule only. Runtime
-   app-owner discovery now gates admin commands, but not ordinary messages;
-   the TypeScript owner bypass, team mode for usage, per-chat
-   `chatRequireMention` overrides, `allowedChats` for ordinary messages and
-   `/invite` / `/remove` are still missing. Consequence: with `allowedUsers`
-   empty, DMs are open to anyone who can reach the app. `allowedChats` is
-   consulted only by the card-click check.
-2. **In-chat command parity** — missing `/ws` (named workspaces), `/resume`,
-   in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`. `/config` is a text
-   subset that can read and set `messageReply`, `showToolCalls` and
-   `maxConcurrentRuns`; the CardKit form, COT/reasoning/access/lark-cli
-   settings are not implemented.
-3. **Idle timeout / watchdog for comment and meeting runs** — permission modes
-   are now read from `permissions.defaultAccess` / `maxAccess` (with legacy
-   `sandbox` fallback) and passed to Codex as `--sandbox` and Claude as
-   `--permission-mode`; see `crates/larkline-bridge/src/permissions.rs`. The IM
-   run flow now applies the idle watchdog and `/timeout` override; comment and
-   meeting runs have their own loops and still use only the 30-minute
-   `RUN_TIMEOUT` cap. `agent_stop_grace_ms` is parsed but unused.
-4. **Presentation parity** — COT process messages and the reasoning bubble are
-   ported (see the "Ported" list), so the remaining gap is configuration and
-   edge behavior. The rich card matches the TypeScript content model (reasoning
-   panel, per-tool panels, collapse rules, terminal notices, footer status and
-   stop button), but three presentation details are deliberate Rust
-   simplifications: tool inputs/outputs are stored bounded (4k chars) instead
-   of raw; a `final_text` event is folded into the trailing text block so a
-   final-only agent still renders (TS keeps it out of `blocks`); and individual
-   tool panels below the three-call threshold start collapsed
-   (`expanded: false`) exactly as in the TS snapshot. The rich-card terminal
-   timeout notice reports the minutes configured by the idle watchdog (or 30
-   when the wall-clock safety net fired with the watchdog disabled); an
-   agent-reported timeout without minutes renders `⏱ 0 分钟`. The text renderer
-   honors `reasoningDisplay: inline` only; `auto` is card-only, `off` hides
-   reasoning and `bubble` publishes the reasoning-only COT bubble.
-   `markdown` mode is a one-element streaming card with tool summaries from
-   the text renderer but no tool panel, footer element or stop button. COT
-   gaps: `cotMessages` / `reasoningDisplay` cannot be changed from the in-chat
-   `/config` text subset, and the run-flow wiring is covered through `CotRun`
-   with a fake transport rather than an end-to-end run test (the bridge
-   `Channel` has no injectable transport).
-5. **Attachments** — inbound images and files are not downloaded. `AgentSpec`
-   always carries an empty image list, so the agent receives text prompts only.
-6. **Topic-scope edge cases** — topic scoping is implemented from the event's
-   `thread_id`. A topic-group event that drops `thread_id` falls back to the
-   chat scope because the Rust bridge does no message-lookup backfill. Agent-
-   rendered card callbacks bind the plain chat id: the click event carries no
-   thread id, so a topic run cannot be verified for those callbacks.
-7. **Registry bot names and stale detection** — the writer now takes the
-   registry lock, prunes dead pids and writes atomically. The entry has no
-   `botName`: `lark-channel` 0.6 exposes no bot-identity accessor, so the name
-   is not known after the WebSocket handshake. Rust `ps` output shows the
-   profile, agent, pid and start time; it does not display a bot name or app
-   id. Stale cleanup probes pid liveness instead of
-   the TypeScript runtime locks, because the Rust `run` does not acquire those
-   locks yet. The TypeScript lock is a `proper-lockfile` directory while the
-   Rust one is a regular file; both avoid interleaving but are not
-   interchangeable representations.
-8. **Keepalive watchdog** — not started. `lark-channel` 0.6 exposes neither a
-   WebSocket connection-status hook nor an in-process force-reconnect handle;
-   see `crates/larkline-bridge/src/keepalive.rs` and its `KEEPALIVE_GAPS`.
-9. **Comments** — `wiki` file types are logged and skipped (no wiki token
-   resolution). Comment runs are registered and abortable with
-   `/stop comment:<hash>`; the event frame is acknowledged before the run
-   starts, so an acknowledged comment event cannot be redelivered while its
-   run is in flight.
-10. **Meetings** — opt-in through `profile.extra.meeting.enabled`. The manager
-    consumes push frames and polls `bots/events`; no `lark-cli` preflight probe
-    is run (only the response classifier is ported). End-of-meeting summaries
-    are sent as top-level IM messages to the configured origin/owner target;
-    they are not threaded into the originating topic. The app needs the VC bot
-    scopes and a tenant that supports the capability.
-11. **Callbacks** — the profile App Secret is now callback key version 1 by
-    default, matching TypeScript (`lark-cli` tokens verify without extra
-    configuration); explicit `extra.callback.secret`, `extra.callback.keys` or
-    `LARKLINE_CALLBACK_SECRET` still take precedence. Replay protection is
-    durable: accepted nonces are written through to
-    `profiles/<name>/callback-nonces.json` and loaded by the next bridge
-    instance, so a restart cannot replay a token. The file keeps the TS flat
-    `nonce -> "used" | "revoked"` shape plus a reserved expiry sidecar, so a
-    TypeScript bridge can still read it after a downgrade. `run_id` and
-    `policy_fingerprint` are not bound because the Rust bridge keeps neither.
-12. **Session catalog** — `sessions.json.catalog.json` is not written or read;
-    resume is keyed by scope and cwd only.
-13. **Test parity** — the Rust workspace has unit and integration tests for the
-    ported modules, but the TypeScript sources and vitest suite remain the
-    behavioural reference and have not all been ported as Rust specs.
-14. **Release signing** — the macOS job requires Apple Developer ID and
-    notarization secrets that are still pending in the release environment;
-    without them it fails rather than publishing an unsigned binary. Windows
-    Authenticode signing is not configured.
+1. **Apple release secrets** — the macOS release job requires Apple Developer
+   ID signing and notarization credentials that are not configured in the
+   release environment. Without them the job fails loudly instead of
+   publishing an unsigned binary. Windows Authenticode signing is also not
+   configured (see the non-TS extras below).
+2. **Wiki comments** — cloud-doc comment events for `doc`, `docx`, `sheet` and
+   `file` are supported; `wiki` file types are logged and skipped because no
+   wiki-token resolution is implemented.
+3. **Meeting summary threading** — end-of-meeting summaries are sent as
+   top-level IM messages to the configured origin chat or owner DM; they are
+   not threaded into the topic the meeting started from.
+4. **Session catalog** — `sessions.json.catalog.json` is neither written nor
+   read; resume is keyed by scope and working directory only.
+5. **Non-TS extras and remaining parity edges** — access-control edges that the
+   message path still does not apply (the TypeScript owner bypass for ordinary
+   messages, team-mode usage for ordinary messages, per-chat
+   `chatRequireMention` overrides, and `allowedChats` on ordinary messages;
+   `allowedChats` is consulted only for card-click verification), plus the
+   non-TypeScript extras: Windows Authenticode signing, bot-name enrichment for
+   Rust-owned `ps` registry entries (`lark-channel` 0.6 exposes no bot-identity
+   accessor) and the live keepalive watchdog (`lark-channel` 0.6 exposes
+   neither a WebSocket status hook nor a force-reconnect handle; the typed gap
+   lives in `crates/larkline-bridge/src/keepalive.rs`).
 
 ## Upgrade network dependency
 

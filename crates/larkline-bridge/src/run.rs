@@ -105,8 +105,8 @@ use larkline_core::{
     config::{ProfileMode, ReasoningDisplay},
 };
 use larkline_lark::cot::{CotClient, CotTransport};
-use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
-use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
+use larkline_lark::reactions::TYPING;
+use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -129,6 +129,7 @@ use crate::render::{
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
 use crate::text_render::{TextFormat, TextRenderOptions, render_text, render_text_without_footer};
+use crate::transport::{BridgeStream, BridgeTransport, ReactionTransport};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
@@ -231,7 +232,14 @@ fn scope_belongs_to_chat(scope: &str, chat_id: &str) -> bool {
 }
 
 pub struct Bridge {
-    pub channel: Channel,
+    /// Outbound message/card transport. Production wraps the `lark-channel`
+    /// [`Channel`]; tests inject a fake so the run flow stays offline.
+    pub transport: Arc<dyn BridgeTransport>,
+    /// Authenticated REST client for comments, COT, meetings and owner lookup.
+    rest: RestClient,
+    /// Working-reaction calls. Production reuses [`Bridge::rest`]; tests inject
+    /// a no-op so a run never touches the network.
+    reaction_transport: Arc<dyn ReactionTransport>,
     pub profile: ProfileConfig,
     pub agent_binary: PathBuf,
     pub bot_open_id: Option<String>,
@@ -282,6 +290,12 @@ pub struct Bridge {
     /// wraps the channel's REST client; tests inject a fake so no COT call
     /// ever reaches the network.
     cot_transport: Arc<dyn CotTransport>,
+    /// Wall-clock length of one configured idle-timeout minute.
+    ///
+    /// Production always uses [`Duration::from_secs(60)`]; the run-flow
+    /// integration tests set a short unit so the watchdog can be exercised
+    /// deterministically without waiting a real minute.
+    idle_timeout_unit: Duration,
 }
 
 /// The running VC-bot manager and the handle that stops its poll task.
@@ -480,6 +494,16 @@ fn resolve_idle_timeout_minutes(
     }
 }
 
+/// Convert configured idle-timeout minutes into a wall-clock duration.
+///
+/// `unit` is one minute in production (`60s`); the run-flow integration tests
+/// use a short unit so a one-minute scope override expires in tens of
+/// milliseconds while the rendered notice still reports the configured
+/// minutes. An absurd hand-edited value saturates instead of panicking.
+fn idle_timeout_duration(minutes: Option<u64>, unit: Duration) -> Option<Duration> {
+    minutes.map(|minutes| unit.saturating_mul(u32::try_from(minutes).unwrap_or(u32::MAX)))
+}
+
 /// The wall-clock deadline for a run.
 ///
 /// TS has no wall clock, so the 30-minute cap is armed only when the idle
@@ -504,6 +528,8 @@ fn wall_clock_deadline(
 struct IdleWatchdog {
     /// Configured idle timeout in minutes; `None` = off.
     minutes: Option<u64>,
+    /// The same timeout as a wall-clock duration.
+    timeout: Option<Duration>,
     /// `tool_use` ids without a matching `tool_result` yet.
     in_flight_tools: HashSet<String>,
     /// When the watchdog would fire; `None` while paused or disabled.
@@ -511,9 +537,10 @@ struct IdleWatchdog {
 }
 
 impl IdleWatchdog {
-    fn new(minutes: Option<u64>, now: tokio::time::Instant) -> Self {
+    fn new(minutes: Option<u64>, unit: Duration, now: tokio::time::Instant) -> Self {
         let mut watchdog = Self {
             minutes,
+            timeout: idle_timeout_duration(minutes, unit),
             in_flight_tools: HashSet::new(),
             deadline: None,
         };
@@ -550,14 +577,10 @@ impl IdleWatchdog {
     }
 
     fn rearm(&mut self, now: tokio::time::Instant) {
-        let Some(minutes) = self.minutes else {
-            self.deadline = None;
-            return;
-        };
         self.deadline = if self.in_flight_tools.is_empty() {
             // `checked_add` keeps a hand-edited, absurd override from
             // panicking: an unrepresentable deadline behaves as disabled.
-            now.checked_add(Duration::from_secs(minutes.saturating_mul(60)))
+            self.timeout.and_then(|timeout| now.checked_add(timeout))
         } else {
             None
         };
@@ -638,8 +661,74 @@ impl Bridge {
     /// unless a key is configured explicitly. The value is consumed into the
     /// (redacted) [`CallbackAuth`], where it stays for token verification, and
     /// is never logged as plaintext.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Channel,
+        profile: ProfileConfig,
+        agent_binary: PathBuf,
+        cwd: PathBuf,
+        bot_open_id: Option<String>,
+        bot_name: Option<String>,
+        paths: AppPaths,
+        app_secret: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        // The production transport is the `lark-channel` channel itself; the
+        // media cache reuses its authenticated OpenAPI client.
+        let media = MediaCache::for_channel(&paths, &channel);
+        let transport: Arc<dyn BridgeTransport> = Arc::new(channel.clone());
+        Self::build(
+            transport,
+            channel.rest().clone(),
+            media,
+            profile,
+            agent_binary,
+            cwd,
+            bot_open_id,
+            bot_name,
+            paths,
+            app_secret,
+        )
+    }
+
+    /// Build a bridge with an injected outbound transport and REST client.
+    ///
+    /// This is the constructor used by the end-to-end run-flow tests: the fake
+    /// transport records text/card sends and streaming frames, while the REST
+    /// client is never called because the COT transport, attachment downloader
+    /// and reaction transport are injected too. `media` owns the attachment
+    /// downloader, so callers can start with a failing/offline one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_transport(
+        transport: Arc<dyn BridgeTransport>,
+        rest: RestClient,
+        media: MediaCache,
+        profile: ProfileConfig,
+        agent_binary: PathBuf,
+        cwd: PathBuf,
+        bot_open_id: Option<String>,
+        bot_name: Option<String>,
+        paths: AppPaths,
+        app_secret: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            transport,
+            rest,
+            media,
+            profile,
+            agent_binary,
+            cwd,
+            bot_open_id,
+            bot_name,
+            paths,
+            app_secret,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        transport: Arc<dyn BridgeTransport>,
+        rest: RestClient,
+        media: MediaCache,
         profile: ProfileConfig,
         agent_binary: PathBuf,
         cwd: PathBuf,
@@ -691,16 +780,16 @@ impl Bridge {
         tracing::info!(cap = run_limit.cap(), "global agent run concurrency cap");
         // The owner lookup reuses the bridge's tenant token cache. It stays
         // lazy: no request is made until an admin-gated command needs it.
-        let owner = OwnerGate::new(Arc::new(RestOwnerSource::new(channel.rest().clone())));
-        // Attachments share the channel's authenticated OpenAPI transport and
-        // live under the profile's `media/` directory.
-        let media = MediaCache::for_channel(&paths, &channel);
+        let owner = OwnerGate::new(Arc::new(RestOwnerSource::new(rest.clone())));
         // COT messages reuse the same tenant token cache as every other REST
         // call; the transport is injectable so tests stay offline.
-        let cot_transport: Arc<dyn CotTransport> = Arc::new(CotClient::new(channel.rest().clone()));
+        let cot_transport: Arc<dyn CotTransport> = Arc::new(CotClient::new(rest.clone()));
+        let reaction_transport: Arc<dyn ReactionTransport> = Arc::new(rest.clone());
 
         Ok(Self {
-            channel,
+            transport,
+            rest,
+            reaction_transport,
             profile,
             agent_binary,
             bot_open_id,
@@ -725,7 +814,34 @@ impl Bridge {
             run_generations: StdMutex::new(HashMap::new()),
             meeting: StdMutex::new(None),
             cot_transport,
+            idle_timeout_unit: Duration::from_secs(60),
         })
+    }
+
+    /// Override the wall-clock length of one idle-timeout minute.
+    ///
+    /// Production keeps the default of 60 seconds. This exists for the
+    /// run-flow integration tests: a `/timeout 1` scope override then expires
+    /// after `unit` instead of after a real minute, while the rendered notice
+    /// still reports the configured minutes.
+    pub fn with_idle_timeout_unit(mut self, unit: Duration) -> Self {
+        self.idle_timeout_unit = unit;
+        self
+    }
+
+    /// Replace the working-reaction transport.
+    ///
+    /// Production reuses the REST client created by [`Bridge::new`]; tests
+    /// inject a no-op so a run never calls the reaction endpoints.
+    pub fn with_reaction_transport(mut self, transport: Arc<dyn ReactionTransport>) -> Self {
+        self.reaction_transport = transport;
+        self
+    }
+
+    /// Authenticated REST client shared by comments, COT, meetings and the
+    /// owner lookup. Comment runs also use it directly for in-thread replies.
+    pub(crate) fn rest(&self) -> &RestClient {
+        &self.rest
     }
 
     /// Replace the COT transport.
@@ -772,7 +888,7 @@ impl Bridge {
         }
 
         let api: Arc<dyn meeting::MeetingApi> =
-            Arc::new(meeting::RestMeetingApi::new(self.channel.rest().clone()));
+            Arc::new(meeting::RestMeetingApi::new(self.rest().clone()));
         let host: Arc<dyn MeetingHost> = Arc::new(BridgeMeetingHost {
             bridge: Arc::downgrade(self),
         });
@@ -1079,7 +1195,7 @@ impl Bridge {
             tokio::spawn(async move {
                 if let Some(reply) = bridge.handle_command(&message, &text).await {
                     if let Err(err) = reply::send_text(
-                        &bridge.channel,
+                        &*bridge.transport,
                         &meeting_scope,
                         &message.chat_id,
                         Some(&message.message_id),
@@ -1101,7 +1217,7 @@ impl Bridge {
             // Topic scopes reply to the triggering message with
             // `reply_in_thread`; everything else stays a top-level send.
             if let Err(err) = reply::send_text(
-                &self.channel,
+                &*self.transport,
                 &scope,
                 &message.chat_id,
                 Some(&message.message_id),
@@ -2084,11 +2200,15 @@ impl Bridge {
         };
         // The TS bridge skips the typing reaction while a COT bubble is the
         // progress surface (the bubble itself is the acknowledgement).
-        let _working_reaction = (!cot_path)
-            .then(|| WorkingReaction::start(self.channel.rest().clone(), last_message_id.clone()));
+        let _working_reaction = (!cot_path).then(|| {
+            WorkingReaction::start(
+                Arc::clone(&self.reaction_transport),
+                last_message_id.clone(),
+            )
+        });
 
         let mut view = RunView::default();
-        let mut streaming: Option<StreamingCard> = None;
+        let mut streaming: Option<Box<dyn BridgeStream>> = None;
         let mut message_id: Option<String> = None;
         if let Some(format) = card_format {
             let card = self.initial_card(&scope, &profile, &view, started, format);
@@ -2097,7 +2217,7 @@ impl Bridge {
             // reference message cannot be created, the plain message path below
             // is the fallback (and is the only path when streaming is off).
             match reply::start_streaming_card(
-                &self.channel,
+                &*self.transport,
                 &scope,
                 &chat_id,
                 Some(&last_message_id),
@@ -2107,7 +2227,7 @@ impl Bridge {
             .await
             {
                 Ok(handle) => {
-                    message_id = Some(handle.message_id().0.clone());
+                    message_id = Some(handle.message_id().to_string());
                     streaming = Some(handle);
                 }
                 Err(err) => {
@@ -2116,7 +2236,7 @@ impl Bridge {
                         "cannot start streaming card; falling back to message card"
                     );
                     match reply::send_card(
-                        &self.channel,
+                        &*self.transport,
                         &scope,
                         &chat_id,
                         Some(&last_message_id),
@@ -2180,7 +2300,7 @@ impl Bridge {
         // live-but-active run for as long as the agent keeps producing events.
         let now = tokio::time::Instant::now();
         let deadline = wall_clock_deadline(idle_minutes, now);
-        let mut watchdog = IdleWatchdog::new(idle_minutes, now);
+        let mut watchdog = IdleWatchdog::new(idle_minutes, self.idle_timeout_unit, now);
         // CardKit closes a streaming entity around ten minutes; pause the
         // progress card at the crate's safe age and deliver the answer
         // separately when the run finishes.
@@ -2328,7 +2448,7 @@ impl Bridge {
                 // answer is still sent below; a notice failure is only logged.
                 tracing::warn!(scope = %scope, reason = %reason, "COT publishing degraded");
                 if let Err(err) = reply::send_markdown(
-                    &self.channel,
+                    &*self.transport,
                     &scope,
                     &chat_id,
                     Some(&last_message_id),
@@ -2368,7 +2488,7 @@ impl Bridge {
         &self,
         scope: &str,
         chat_id: &str,
-        streaming: &mut Option<StreamingCard>,
+        streaming: &mut Option<Box<dyn BridgeStream>>,
         message_id: Option<&str>,
         source_message_id: Option<&str>,
         view: &RunView,
@@ -2382,7 +2502,7 @@ impl Bridge {
         if reply_mode == MessageReplyMode::Text {
             let body = text_final_body(&profile, view);
             if let Err(err) =
-                reply::send_text(&self.channel, scope, chat_id, source_message_id, body).await
+                reply::send_text(&*self.transport, scope, chat_id, source_message_id, body).await
             {
                 tracing::warn!(error = %err, chat = %chat_id, "cannot send final answer");
             }
@@ -2461,7 +2581,7 @@ impl Bridge {
                 // renderer's formatting (reasoning/tools per profile).
                 let body = markdown_final_body(&profile, view);
                 if let Err(err) =
-                    reply::send_markdown(&self.channel, scope, chat_id, source_message_id, body)
+                    reply::send_markdown(&*self.transport, scope, chat_id, source_message_id, body)
                         .await
                 {
                     tracing::warn!(error = %err, chat = %chat_id, "cannot send final markdown answer");
@@ -2473,7 +2593,7 @@ impl Bridge {
                 // card. A card send failure falls back to markdown rather than
                 // losing the answer.
                 let card = self.final_card(view, started);
-                match reply::send_card(&self.channel, scope, chat_id, source_message_id, &card)
+                match reply::send_card(&*self.transport, scope, chat_id, source_message_id, &card)
                     .await
                 {
                     Ok(_) => {}
@@ -2485,7 +2605,7 @@ impl Bridge {
                         );
                         let body = markdown_final_body(&profile, view);
                         if let Err(err) = reply::send_markdown(
-                            &self.channel,
+                            &*self.transport,
                             scope,
                             chat_id,
                             source_message_id,
@@ -2530,13 +2650,13 @@ impl Bridge {
     /// Push the current view to the run card.
     ///
     /// While the CardKit entity is live the whole card is PUT back through
-    /// [`StreamingCard::set_card`]. Once it is expired, finished, or a write
+    /// [`crate::transport::BridgeStream::set_card`]. Once it is expired, finished, or a write
     /// failed, the same message is updated through the message API for the
     /// rest of the run (and only inside the safe window).
     async fn refresh_card(
         &self,
         scope: &str,
-        streaming: &mut Option<StreamingCard>,
+        streaming: &mut Option<Box<dyn BridgeStream>>,
         message_id: Option<&str>,
         view: &RunView,
         started: Instant,
@@ -2577,7 +2697,7 @@ impl Bridge {
     async fn pause_progress(
         &self,
         scope: &str,
-        streaming: &mut Option<StreamingCard>,
+        streaming: &mut Option<Box<dyn BridgeStream>>,
         message_id: Option<&str>,
         view: &RunView,
         started: Instant,
@@ -2603,7 +2723,7 @@ impl Bridge {
         }
         if !written {
             if let Some(message_id) = message_id {
-                if let Err(err) = self.channel.update_card_message(message_id, &card).await {
+                if let Err(err) = self.transport.update_card_message(message_id, &card).await {
                     tracing::warn!(error = %err, "paused message-card update failed");
                 }
             }
@@ -2665,7 +2785,7 @@ impl Bridge {
             return false;
         };
         let card = self.live_card_for(scope, view, started, format);
-        match self.channel.update_card_message(message_id, &card).await {
+        match self.transport.update_card_message(message_id, &card).await {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!(error = %err, "card update failed");
@@ -2834,7 +2954,14 @@ impl MeetingHost for BridgeMeetingHost {
         // The thread path only applies to chat ids; `ou_*` is a DM and has no
         // thread to reply into.
         if let (Some(scope), true) = (target.scope, to.starts_with("oc_")) {
-            match reply::send_text(&bridge.channel, scope, to, target.parent_message_id, text).await
+            match reply::send_text(
+                &*bridge.transport,
+                scope,
+                to,
+                target.parent_message_id,
+                text,
+            )
+            .await
             {
                 Ok(_) => tracing::info!(
                     to = %to,
@@ -2863,13 +2990,18 @@ impl MeetingHost for BridgeMeetingHost {
         } else {
             Recipient::Chat(to.to_string())
         };
-        match bridge
-            .channel
-            .sender()
-            .text_message(recipient, text.to_string())
-            .send()
-            .await
-        {
+        let result = match recipient {
+            Recipient::User(open_id) => {
+                bridge
+                    .transport
+                    .send_dm_text(&open_id, text.to_string())
+                    .await
+            }
+            Recipient::Chat(chat_id) => {
+                bridge.transport.send_text(&chat_id, text.to_string()).await
+            }
+        };
+        match result {
             Ok(_) => tracing::info!(
                 to = %to,
                 chars = text.chars().count(),
@@ -3058,25 +3190,25 @@ impl ReactionState {
 /// it is best-effort, and a process exit before it runs can leave the
 /// reaction behind.
 struct WorkingReaction {
-    rest: RestClient,
+    reactions: Arc<dyn ReactionTransport>,
     message_id: String,
     state: Arc<StdMutex<ReactionState>>,
 }
 
 impl WorkingReaction {
-    fn start(rest: RestClient, message_id: String) -> Self {
+    fn start(reactions: Arc<dyn ReactionTransport>, message_id: String) -> Self {
         let guard = Self {
-            rest,
+            reactions,
             message_id,
             state: Arc::new(StdMutex::new(ReactionState::default())),
         };
         lock_state(&guard.state).begin_add();
 
-        let rest = guard.rest.clone();
+        let reactions = Arc::clone(&guard.reactions);
         let message_id = guard.message_id.clone();
         let state = Arc::clone(&guard.state);
         tokio::spawn(async move {
-            match add_reaction(&rest, &message_id, TYPING).await {
+            match reactions.add(&message_id, TYPING).await {
                 Ok(reaction_id) => {
                     tracing::debug!(
                         message_id = %message_id,
@@ -3086,7 +3218,7 @@ impl WorkingReaction {
                     let remove_now = lock_state(&state).added(&reaction_id);
                     if remove_now {
                         // The run ended before the add landed; clean up here.
-                        if let Err(err) = remove_reaction(&rest, &message_id, &reaction_id).await {
+                        if let Err(err) = reactions.remove(&message_id, &reaction_id).await {
                             tracing::warn!(
                                 error = %err,
                                 message_id = %message_id,
@@ -3114,10 +3246,10 @@ impl Drop for WorkingReaction {
         let Some(reaction_id) = lock_state(&self.state).finish() else {
             return;
         };
-        let rest = self.rest.clone();
+        let reactions = Arc::clone(&self.reactions);
         let message_id = self.message_id.clone();
         let removal = async move {
-            if let Err(err) = remove_reaction(&rest, &message_id, &reaction_id).await {
+            if let Err(err) = reactions.remove(&message_id, &reaction_id).await {
                 tracing::warn!(
                     error = %err,
                     message_id = %message_id,
@@ -4131,7 +4263,7 @@ mod tests {
     #[test]
     fn idle_watchdog_pauses_while_a_tool_is_in_flight_and_rearms_when_it_returns() {
         let start = tokio::time::Instant::now();
-        let mut watchdog = IdleWatchdog::new(Some(1), start);
+        let mut watchdog = IdleWatchdog::new(Some(1), Duration::from_secs(60), start);
         assert_eq!(
             watchdog.deadline(),
             Some(start + Duration::from_secs(60)),
@@ -4208,7 +4340,7 @@ mod tests {
     #[test]
     fn idle_watchdog_rearms_on_text_and_thinking_activity() {
         let start = tokio::time::Instant::now();
-        let mut watchdog = IdleWatchdog::new(Some(2), start);
+        let mut watchdog = IdleWatchdog::new(Some(2), Duration::from_secs(60), start);
         let first = watchdog.deadline().unwrap();
         let text_at = start + Duration::from_secs(30);
         watchdog.observe(&AgentEvent::Text { delta: "hi".into() }, text_at);
@@ -4234,13 +4366,16 @@ mod tests {
         assert_eq!(wall_clock_deadline(Some(15), now), None);
         // Idle watchdog off: the 30-minute cap stays as the safety net.
         assert_eq!(wall_clock_deadline(None, now), Some(now + RUN_TIMEOUT));
-        assert_eq!(IdleWatchdog::new(None, now).deadline(), None);
+        assert_eq!(
+            IdleWatchdog::new(None, Duration::from_secs(60), now).deadline(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn idle_expiry_stops_the_run_and_renders_the_ts_timeout_notice() {
         let start = tokio::time::Instant::now();
-        let watchdog = IdleWatchdog::new(Some(15), start);
+        let watchdog = IdleWatchdog::new(Some(15), Duration::from_secs(60), start);
         let mut source = PendingSource;
         let mut pending = EventSource::next_events(&mut source);
         let interrupt = RunInterrupt::new();
