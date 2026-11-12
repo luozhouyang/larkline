@@ -42,14 +42,21 @@
 //! }
 //! ```
 //!
-//! The long connection forwards every event type the app subscribes to and
-//! does not drop the header, so the information the TypeScript bridge used is
-//! all there — it is merely untyped. [`parse_comment_event`] re-implements the
-//! SDK's `normalizeComment` on top of `raw`; [`CommentEventParse`] describes
-//! the three outcomes. Nothing is faked: an event that does not match the
-//! comment event type is reported as [`CommentEventParse::NotAComment`], and a
-//! comment event missing a required field as
-//! [`CommentEventParse::Incomplete`].
+//! Unlike the TypeScript SDK's dispatcher, `lark-channel` does not filter by
+//! event type: every payload the server pushes is parsed and handed to the
+//! handler, and the header survives. So the information the TypeScript bridge
+//! used is all there — it is merely untyped. [`parse_comment_event`]
+//! re-implements the SDK's `normalizeComment` on top of `raw`;
+//! [`CommentEventParse`] describes the three outcomes. Nothing is faked: an
+//! event that does not match the comment event type is reported as
+//! [`CommentEventParse::NotAComment`], and a comment event missing a required
+//! field as [`CommentEventParse::Incomplete`].
+//!
+//! The one operational prerequisite is the same as for the TypeScript bridge:
+//! the Feishu app must subscribe to the 云文档评论 event
+//! (`drive.notice.comment_add_v1`) in the developer console. The long
+//! connection only pushes subscribed event types; `EventLoopOptions` and the
+//! WebSocket endpoint request carry no event-type list of their own.
 //!
 //! ## Flow
 //!
@@ -76,12 +83,12 @@
 //!   skipped instead of being resolved (see [`SUPPORTED_FILE_TYPES`]).
 //! * **`/stop`**: comment runs are detached from the event loop and are not
 //!   registered in `Bridge::active`, so `/stop comment:<hash>` cannot abort
-//!   one yet. The run is bounded by [`RUN_TIMEOUT`].
+//!   one yet. The run is bounded by `RUN_TIMEOUT`.
 //! * **Acknowledgement**: the CLI acknowledges the WebSocket frame immediately
 //!   and runs the comment in a spawned task (a run may take up to
-//!   [`RUN_TIMEOUT`]; holding the event loop for that long would stall
+//!   `RUN_TIMEOUT`; holding the event loop for that long would stall
 //!   heartbeats and every other event). Feishu can therefore not redeliver a
-//!   comment while its run is in flight; [`CommentRunGuard`] still keeps a
+//!   comment while its run is in flight; `CommentRunGuard` still keeps a
 //!   redelivery from starting a second concurrent run in the same thread.
 
 use std::collections::HashSet;
@@ -533,7 +540,10 @@ pub fn build_comment_prompt(mention: &CommentMention) -> String {
     parts.push(String::new());
     parts.push(format!("用户的问题：{}", mention.question));
     parts.push(String::new());
-    parts.push(comment_read_instruction(&mention.file_type));
+    parts.push(comment_read_instruction(
+        &mention.file_type,
+        &mention.file_token,
+    ));
     parts.push(String::new());
     parts.push(
         "评论回复由 bridge 负责：不要调用云文档评论或回复接口，也不要给评论添加或删除 reaction；最终答案直接用纯文本交给 bridge。"
@@ -547,9 +557,11 @@ pub fn build_comment_prompt(mention: &CommentMention) -> String {
     parts.join("\n")
 }
 
-fn comment_read_instruction(file_type: &str) -> String {
+fn comment_read_instruction(file_type: &str, file_token: &str) -> String {
     match file_type {
-        "doc" | "docx" => "读取文档内容：优先使用当前 docs v2 读取命令：\n  `lark-cli docs +fetch --api-version v2 --doc <file_token> --doc-format markdown`\n如果本机 lark-cli 不支持上述参数，不要在同一错误上反复重试；使用当前可用的等价读取命令读取同一 file_token。".to_string(),
+        "doc" | "docx" => format!(
+            "读取文档内容：优先使用当前 docs v2 读取命令：\n  `lark-cli docs +fetch --api-version v2 --doc {file_token} --doc-format markdown`\n如果本机 lark-cli 不支持上述参数，不要在同一错误上反复重试；使用当前可用的等价读取命令读取同一 file_token。"
+        ),
         "sheet" => "读取表格内容：这是 sheet 类型，不要使用 docs +fetch。请按当前可用的表格读取工具或本机 lark-cli 支持的表格读取命令读取同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。".to_string(),
         _ => "读取文件内容：这是 file 类型，不要使用 docs +fetch。请按当前可用的云空间文件工具或本机 lark-cli 支持的文件读取/下载命令处理同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。".to_string(),
     }
@@ -1380,7 +1392,10 @@ mod tests {
         assert!(prompt.contains("> selected text"));
         assert!(prompt.contains("1. context"));
         assert!(prompt.contains("用户的问题：explain this"));
-        assert!(prompt.contains("docs +fetch"));
+        assert!(
+            prompt.contains("lark-cli docs +fetch --api-version v2 --doc doccn_token"),
+            "the read instruction must carry the real file token: {prompt}"
+        );
         assert!(prompt.contains("直接用纯文本"));
 
         let whole = CommentMention {
@@ -1492,5 +1507,19 @@ mod tests {
         assert_eq!(strip_markdown("**bold** __bold__"), "bold bold");
         assert_eq!(strip_markdown("# 一级"), "一级");
         assert_eq!(strip_markdown("  # 不是标题"), "  # 不是标题");
+    }
+
+    #[test]
+    fn one_run_per_comment_thread_is_enforced() {
+        // Unique scope so the process-global guard cannot collide with other
+        // tests running in parallel.
+        let scope = "comment:test-one-run-per-thread";
+        let first = CommentRunGuard::acquire(scope).expect("first acquire");
+        assert!(
+            CommentRunGuard::acquire(scope).is_none(),
+            "a second event for the same thread must not start another run"
+        );
+        drop(first);
+        assert!(CommentRunGuard::acquire(scope).is_some());
     }
 }

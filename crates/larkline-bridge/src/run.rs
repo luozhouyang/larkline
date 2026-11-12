@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use lark_channel::event::CardActionEvent;
-use lark_channel::message::{MessageChatType, MessageSenderType, NormalizedMessage};
+use lark_channel::message::{MessageChatType, MessageSenderType, NormalizedMessage, Recipient};
 use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
 };
@@ -41,6 +42,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::CallbackTokens;
+use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
 use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
 use crate::render::RunView;
@@ -86,6 +88,15 @@ pub struct Bridge {
     /// Id for the next run; guards [`Bridge::finish_run`] against a late guard
     /// from an aborted run clearing its successor's block.
     next_run_id: AtomicU64,
+    /// In-meeting agent runtime; `Some` only while `extra.meeting.enabled` is
+    /// on and [`Bridge::start_meeting`] ran inside a Tokio runtime.
+    meeting: StdMutex<Option<MeetingRuntime>>,
+}
+
+/// The running VC-bot manager and the handle that stops its poll task.
+struct MeetingRuntime {
+    manager: Arc<MeetingManager>,
+    handle: MeetingHandle,
 }
 
 /// One live agent run owned by a chat.
@@ -151,7 +162,120 @@ impl Bridge {
             pending_wakeup: Notify::new(),
             pending_driver_started: AtomicBool::new(false),
             next_run_id: AtomicU64::new(1),
+            meeting: StdMutex::new(None),
         })
+    }
+
+    /// Start the in-meeting agent (VC bot) manager.
+    ///
+    /// No-op (returns `false`) when `extra.meeting.enabled` is not set, when
+    /// there is no Tokio runtime to host the poll task, or when a manager is
+    /// already live (returns `true` then). The manager is stopped and its
+    /// meetings are left by [`Bridge::stop_meeting`].
+    pub fn start_meeting(self: &Arc<Self>) -> bool {
+        let config = meeting::config_from_profile(&self.profile);
+        if !config.enabled {
+            return false;
+        }
+        let mut slot = lock(&self.meeting);
+        if slot.is_some() {
+            return true;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::warn!("no tokio runtime available to start the meeting manager");
+            return false;
+        }
+
+        let api: Arc<dyn meeting::MeetingApi> =
+            Arc::new(meeting::RestMeetingApi::new(self.channel.rest().clone()));
+        let host: Arc<dyn MeetingHost> = Arc::new(BridgeMeetingHost {
+            bridge: Arc::downgrade(self),
+        });
+        // The CLI routes `vc.bot.*` frames off its long connection, so the push
+        // lane is wired; `received` only moves once a frame actually arrives.
+        let agent = AgentSettings {
+            kind: self.profile.agent_kind,
+            binary: self.agent_binary.clone(),
+            bot_open_id: self
+                .bot_open_id
+                .clone()
+                .or_else(|| config.bot_open_id.clone()),
+            bot_name: self.bot_name.clone().or_else(|| config.bot_name.clone()),
+        };
+        let manager = Arc::new(MeetingManager::new(config, agent, api, host));
+        manager.set_push_hooked(true, None);
+        let handle = manager.start();
+        tracing::info!(
+            trigger = %manager.config().trigger,
+            poll_interval_ms = manager.config().poll_interval_ms,
+            "meeting agent started"
+        );
+        *slot = Some(MeetingRuntime { manager, handle });
+        true
+    }
+
+    /// Stop the meeting manager and leave every meeting (5s budget).
+    pub async fn stop_meeting(self: &Arc<Self>) {
+        let runtime = lock(&self.meeting).take();
+        let Some(runtime) = runtime else {
+            return;
+        };
+        runtime.handle.stop();
+        runtime.manager.interrupt_all();
+        if tokio::time::timeout(Duration::from_secs(5), runtime.manager.leave_all())
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out leaving meetings on shutdown");
+        }
+    }
+
+    /// The live meeting manager, when the capability is enabled and started.
+    pub fn meeting_manager(&self) -> Option<Arc<MeetingManager>> {
+        lock(&self.meeting)
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime.manager))
+    }
+
+    /// Route one `vc.bot.*` long-connection frame to the meeting manager.
+    ///
+    /// Called for `ChannelEvent::Unknown` payloads by the CLI event loop;
+    /// returns `true` when the frame belonged to the in-meeting agent.
+    pub fn handle_meeting_event(self: &Arc<Self>, raw: &Value) -> bool {
+        let Some(manager) = self.meeting_manager() else {
+            return false;
+        };
+        manager.handle_push(raw)
+    }
+
+    /// `/meeting …`: config check, admin gate, then the manager's command.
+    async fn handle_meeting_command(
+        self: &Arc<Self>,
+        message: &NormalizedMessage,
+        args: &str,
+    ) -> String {
+        let config = meeting::config_from_profile(&self.profile);
+        if !config.enabled {
+            return meeting::MEETING_DISABLED_REPLY.to_string();
+        }
+        let sender_id = if message.sender.open_id.is_empty() {
+            message.sender_id.as_str()
+        } else {
+            message.sender.open_id.as_str()
+        };
+        if !meeting::can_run_meeting_command(&self.profile, sender_id) {
+            tracing::info!(command = "/meeting", "admin-deny");
+            return meeting::MEETING_DENIED_REPLY.to_string();
+        }
+        if !self.start_meeting() {
+            return meeting::MEETING_NOT_READY_REPLY.to_string();
+        }
+        let Some(manager) = self.meeting_manager() else {
+            return meeting::MEETING_NOT_READY_REPLY.to_string();
+        };
+        manager
+            .handle_command(args, sender_id, &message.chat_id)
+            .await
     }
 
     pub fn sessions_path(&self) -> &std::path::Path {
@@ -164,6 +288,23 @@ impl Bridge {
         }
         let text = message.text.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+
+        // `/meeting ask|notes` can run the agent for up to `RUN_TIMEOUT`. The
+        // CLI awaits this handler before it can answer a WebSocket heartbeat,
+        // so meeting commands are detached and send their own reply — the same
+        // reason file-comment runs are spawned by the event loop.
+        if is_meeting_command(&text) {
+            self.discard_pending(&message.chat_id);
+            let bridge = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Some(reply) = bridge.handle_command(&message, &text).await {
+                    if let Err(err) = bridge.channel.send_text(&message.chat_id, reply).await {
+                        tracing::warn!(error = %err, "cannot send /meeting reply");
+                    }
+                }
+            });
             return;
         }
 
@@ -185,7 +326,7 @@ impl Bridge {
     /// reply into the comment thread live in [`crate::comments`].
     ///
     /// Callers spawn this instead of awaiting it: an agent run may take up to
-    /// [`RUN_TIMEOUT`], and the event loop must stay free to acknowledge
+    /// `RUN_TIMEOUT`, and the event loop must stay free to acknowledge
     /// frames and answer heartbeats.
     pub async fn handle_comment_event(self: &Arc<Self>, raw: &Value) {
         crate::comments::handle_comment_mention(self, raw).await;
@@ -352,7 +493,11 @@ impl Bridge {
         dropped
     }
 
-    async fn handle_command(&self, message: &NormalizedMessage, text: &str) -> Option<String> {
+    async fn handle_command(
+        self: &Arc<Self>,
+        message: &NormalizedMessage,
+        text: &str,
+    ) -> Option<String> {
         let command = text.split_whitespace().next().unwrap_or_default();
         let args = text.get(command.len()..).unwrap_or_default().trim();
         match command {
@@ -371,6 +516,7 @@ impl Bridge {
             "/cd" => Some(self.handle_cd(&message.chat_id, args).await),
             "/pwd" => Some(self.handle_pwd(&message.chat_id).await),
             "/status" => Some(self.handle_status(&message.chat_id).await),
+            "/meeting" => Some(self.handle_meeting_command(message, args).await),
             "/help" => Some(
                 "可用命令：\n\
                  /new 或 /reset 开启新会话\n\
@@ -378,6 +524,7 @@ impl Bridge {
                  /pwd 显示当前工作目录\n\
                  /status 显示当前状态\n\
                  /stop 中断当前任务\n\
+                 /meeting 会议智能体（入会/离会/纪要，需管理员）\n\
                  /help 显示帮助"
                     .to_string(),
             ),
@@ -836,8 +983,83 @@ impl Bridge {
     }
 }
 
-/// Join a batch's text into the `<user_input>` body.
+/// [`MeetingHost`] adapter that borrows the bridge weakly.
 ///
+/// The manager lives inside the bridge, so a strong `Arc<Bridge>` here would
+/// be a reference cycle (bridge -> manager -> bridge). The CLI stops the
+/// manager explicitly; the weak handle also keeps the cycle from leaking when
+/// a bridge is dropped first.
+struct BridgeMeetingHost {
+    bridge: std::sync::Weak<Bridge>,
+}
+
+#[async_trait]
+impl MeetingHost for BridgeMeetingHost {
+    async fn workspace_cwd(&self, scope: &str) -> PathBuf {
+        match self.bridge.upgrade() {
+            Some(bridge) => Bridge::workspace_cwd(&bridge, scope).await,
+            None => std::env::temp_dir(),
+        }
+    }
+
+    async fn resume_session(&self, scope: &str, cwd: &str) -> Option<String> {
+        let bridge = self.bridge.upgrade()?;
+        bridge
+            .sessions
+            .lock()
+            .await
+            .resume_for(scope, cwd)
+            .map(str::to_string)
+    }
+
+    async fn save_session(&self, scope: &str, session_key: &str, cwd: &str) {
+        let Some(bridge) = self.bridge.upgrade() else {
+            return;
+        };
+        if let Err(err) = bridge.sessions.lock().await.set(scope, session_key, cwd) {
+            tracing::warn!(error = %err, "cannot persist meeting session");
+        }
+    }
+
+    async fn send_im_text(&self, to: &str, text: &str) {
+        let Some(bridge) = self.bridge.upgrade() else {
+            return;
+        };
+        // `ou_*` is an open id (a direct message), anything else is a chat id —
+        // the TypeScript `channel.send` accepts both in one call.
+        let recipient = if to.starts_with("ou_") {
+            Recipient::User(to.to_string())
+        } else {
+            Recipient::Chat(to.to_string())
+        };
+        match bridge
+            .channel
+            .sender()
+            .text_message(recipient, text.to_string())
+            .send()
+            .await
+        {
+            Ok(_) => tracing::info!(
+                to = %to,
+                chars = text.chars().count(),
+                "meeting message sent over IM"
+            ),
+            Err(err) => tracing::warn!(
+                to = %to,
+                error = %err,
+                "cannot send meeting message over IM"
+            ),
+        }
+    }
+}
+
+/// True for `/meeting` and `/meeting <sub…>` — the command whose `ask`/`notes`
+/// subcommands await an agent run.
+fn is_meeting_command(text: &str) -> bool {
+    text.split_whitespace().next() == Some("/meeting")
+}
+
+/// Join a batch's text into the `<user_input>` body.
 /// Mirrors the TS `buildPrompt`: single-message batches stay verbatim; merged
 /// batches prefix each non-empty segment with `[sender]:` so the agent can tell
 /// who said what, and segments are separated by a blank line.
@@ -1476,6 +1698,59 @@ mod tests {
             .extra
             .insert("workspaces".to_string(), json!({ "default": 7 }));
         assert_eq!(profile_default_workspace(&profile), None);
+    }
+
+    #[tokio::test]
+    async fn meeting_manager_starts_only_when_the_profile_opts_in() {
+        let root = tempfile::tempdir().expect("temp home");
+        let paths = AppPaths::resolve(root.path(), "test").expect("app paths");
+        let workspace = root.path().join("workspace");
+        let channel = Channel::new("cli_test_app", "secret", TenantBrand::Feishu);
+        let agent = PathBuf::from("/nonexistent/larkline-test-agent");
+
+        // Disabled by default: no manager, and pushes are not consumed.
+        let bridge = Arc::new(
+            Bridge::new(
+                channel.clone(),
+                profile(),
+                agent.clone(),
+                workspace.clone(),
+                None,
+                None,
+                paths.clone(),
+            )
+            .expect("bridge"),
+        );
+        assert!(!bridge.start_meeting());
+        assert!(bridge.meeting_manager().is_none());
+        assert!(!bridge.handle_meeting_event(&json!({
+            "header": {"event_type": "vc.bot.meeting_ended_v1"},
+            "event": {"meeting": {"id": "70001"}}
+        })));
+
+        // Enabling it in `extra.meeting` starts the poll task and routes pushes.
+        let mut enabled = profile();
+        enabled.extra.insert(
+            "meeting".to_string(),
+            json!({"enabled": true, "trigger": "@小助手"}),
+        );
+        let bridge = Arc::new(
+            Bridge::new(channel, enabled, agent, workspace, None, None, paths).expect("bridge"),
+        );
+        assert!(bridge.start_meeting());
+        let manager = bridge.meeting_manager().expect("manager");
+        assert_eq!(manager.config().trigger, "@小助手");
+        assert!(bridge.handle_meeting_event(&json!({
+            "header": {"event_type": "vc.bot.meeting_ended_v1"},
+            "event": {"meeting": {"id": "70001"}}
+        })));
+        assert_eq!(manager.push_health().received, 1);
+        assert!(!bridge.handle_meeting_event(&json!({
+            "header": {"event_type": "im.message.receive_v1"}
+        })));
+
+        bridge.stop_meeting().await;
+        assert!(bridge.meeting_manager().is_none());
     }
 
     #[test]

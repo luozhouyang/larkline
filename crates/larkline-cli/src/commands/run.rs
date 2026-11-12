@@ -60,6 +60,18 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         profile.message_reply(),
         profile.max_concurrent_runs()
     );
+    let meeting_config = larkline_bridge::meeting::config_from_profile(&profile);
+    println!(
+        "meeting: {} (trigger {:?}, poll {}ms, respondIn {:?})",
+        if meeting_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        meeting_config.trigger,
+        meeting_config.poll_interval_ms,
+        meeting_config.respond_in
+    );
 
     if args.dry_run {
         println!("\ndry run ok; no connection made");
@@ -78,6 +90,17 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     )?);
     println!("sessions: {}", bridge.sessions_path().display());
 
+    // The in-meeting agent polls `bots/events` on its own Tokio task. Starting
+    // it here (rather than inside `Bridge::new`) keeps construction synchronous
+    // and makes the runtime dependency explicit.
+    if meeting_config.enabled {
+        if bridge.start_meeting() {
+            println!("meeting poller: started");
+        } else {
+            println!("meeting poller: could not start (no tokio runtime?)");
+        }
+    }
+
     let connector = OpenApiWebSocketEventConnector::new(
         channel.openapi().clone(),
         TokioTungsteniteWebSocketTransport::new(),
@@ -88,7 +111,7 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     );
 
     println!("\nconnecting to the Feishu long connection… (ctrl-c to stop)");
-    tokio::select! {
+    let outcome: anyhow::Result<()> = tokio::select! {
         result = event_loop.run({
             let bridge = Arc::clone(&bridge);
             move |event| {
@@ -110,11 +133,11 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
                         }
                         ChannelEvent::Unknown { raw, .. } => {
                             // The SDK types only messages and card actions.
-                            // Cloud-doc comment @-mentions
-                            // (`drive.notice.comment_add_v1`) arrive here with
-                            // the whole platform payload; hand them to the
-                            // comment flow, which parses that payload itself.
                             if larkline_bridge::comments::is_file_comment_event(&raw) {
+                                // Cloud-doc comment @-mentions
+                                // (`drive.notice.comment_add_v1`) arrive here
+                                // with the whole platform payload; hand them to
+                                // the comment flow, which parses it itself.
                                 tracing::info!("inbound file-comment event");
                                 // Detached on purpose: a comment run can take
                                 // minutes, and the event loop must keep
@@ -123,6 +146,10 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
                                 tokio::spawn(async move {
                                     bridge.handle_comment_event(&raw).await;
                                 });
+                            } else if bridge.handle_meeting_event(&raw) {
+                                // `vc.bot.meeting_*` frames feed the meeting
+                                // manager; the poller is the gap-fill lane.
+                                tracing::debug!("routed meeting event");
                             } else {
                                 tracing::debug!("ignoring unhandled event type");
                             }
@@ -131,14 +158,18 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
                     Ok(WebSocketEventAck::ok())
                 }
             }
-        }) => {
-            if let Err(err) = result {
-                return Err(anyhow::Error::from(err));
-            }
-        }
+        }) => match result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(anyhow::Error::from(err)),
+        },
         _ = tokio::signal::ctrl_c() => {
             println!("\nstopping");
+            Ok(())
         }
-    }
-    Ok(())
+    };
+
+    // Leave the meetings we joined before dropping the bridge, so the bot does
+    // not linger as a participant after the process exits.
+    bridge.stop_meeting().await;
+    outcome
 }
