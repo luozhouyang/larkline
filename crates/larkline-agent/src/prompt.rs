@@ -69,3 +69,91 @@ mod tests {
         assert_eq!(with_id.matches("## 你的身份").count(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Agent prompt assembly (port of `src/agent/prompt.ts`)
+// ---------------------------------------------------------------------------
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptMention {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_bot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptContext {
+    pub chat_id: String,
+    pub chat_type: String,
+    pub sender_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// `"user"` or `"bot"`; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_open_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<PromptMention>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ids: Option<Vec<String>>,
+    /// `"im"`, `"card"` or `"comment"`.
+    pub source: String,
+}
+
+/// Build the per-message prompt. `<`/`>`/`&` are escaped so the injected JSON
+/// can never be confused for the XML-ish section tags.
+pub fn build_agent_prompt(context: &PromptContext, user_input: &str) -> String {
+    let context_json = safe_json(context);
+    let input_json = safe_json(&serde_json::json!({ "text": user_input }));
+    format!(
+        "<bridge_context>\n{context_json}\n</bridge_context>\n\n<user_input>\n{input_json}\n</user_input>"
+    )
+}
+
+fn safe_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "null".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn wraps_context_and_user_input() {
+        let ctx = PromptContext {
+            chat_id: "oc_1".into(),
+            chat_type: "p2p".into(),
+            sender_id: "ou_1".into(),
+            sender_name: None,
+            sender_type: Some("user".into()),
+            bot_open_id: Some("ou_bot".into()),
+            mentions: None,
+            thread_id: None,
+            message_ids: None,
+            source: "im".into(),
+        };
+        let prompt = build_agent_prompt(&ctx, "hello <world>");
+        assert!(prompt.starts_with("<bridge_context>"));
+        assert!(prompt.contains("\"chatId\":\"oc_1\""));
+        assert!(prompt.contains("<user_input>"));
+        // Angle brackets from user text must not break the section markers.
+        assert!(!prompt.contains("hello <world>"));
+        assert!(prompt.contains("\\u003cworld\\u003e"));
+    }
+}

@@ -11,6 +11,7 @@ pub mod error;
 pub mod keystore;
 pub mod lock;
 pub mod paths;
+pub mod session;
 pub mod store;
 
 pub use config::{
@@ -21,6 +22,7 @@ pub use error::{CoreError, Result};
 pub use keystore::Keystore;
 pub use lock::FileLock;
 pub use paths::AppPaths;
+pub use session::{SessionEntry, SessionStore};
 
 /// Crate version, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

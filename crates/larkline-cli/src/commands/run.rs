@@ -5,12 +5,15 @@
 //! top of this in the next milestone; `--dry-run` validates everything the
 //! loop needs without connecting.
 
+use std::sync::Arc;
+
 use anyhow::{Context as _, bail};
 use lark_channel::event::{
     ChannelEvent, EventLoop, EventLoopOptions, OpenApiWebSocketEventConnector,
 };
 use lark_channel::lark_openapi::{TokioTungsteniteWebSocketTransport, WebSocketEventAck};
 use larkline_agent::resolve_executable;
+use larkline_bridge::Bridge;
 use larkline_lark::Channel;
 
 use crate::cli::{Cli, RunArgs};
@@ -64,6 +67,17 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     }
 
     let channel = Channel::new(app.id.clone(), secret, app.tenant);
+    let bridge = Arc::new(Bridge::new(
+        channel.clone(),
+        profile.clone(),
+        agent_binary.path.clone(),
+        cwd.clone(),
+        None,
+        None,
+        ctx.paths.clone(),
+    )?);
+    println!("sessions: {}", bridge.sessions_path().display());
+
     let connector = OpenApiWebSocketEventConnector::new(
         channel.openapi().clone(),
         TokioTungsteniteWebSocketTransport::new(),
@@ -75,28 +89,22 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
 
     println!("\nconnecting to the Feishu long connection… (ctrl-c to stop)");
     tokio::select! {
-        result = event_loop.run(|event| async move {
-            match &event.event {
-                ChannelEvent::Message(message) => {
-                    println!(
-                        "[message] chat={} sender={} type={} text={:?}",
-                        message.chat_id,
-                        message.sender_id,
-                        message.message_type,
-                        truncate(&message.text, 120)
-                    );
-                }
-                ChannelEvent::CardAction(action) => {
-                    println!(
-                        "[card] event={} operator={:?} action={:?}",
-                        action.context.event_id, action.operator, action.action
-                    );
-                }
-                ChannelEvent::Unknown { raw, .. } => {
-                    println!("[event] unknown payload={raw}");
+        result = event_loop.run({
+            let bridge = Arc::clone(&bridge);
+            move |event| {
+                let bridge = Arc::clone(&bridge);
+                async move {
+                    if let ChannelEvent::Message(message) = event.event.clone() {
+                        tracing::info!(
+                            chat = %message.chat_id,
+                            sender = %message.sender_id,
+                            "inbound message"
+                        );
+                        bridge.handle_message(*message).await;
+                    }
+                    Ok(WebSocketEventAck::ok())
                 }
             }
-            Ok(WebSocketEventAck::ok())
         }) => {
             if let Err(err) = result {
                 return Err(anyhow::Error::from(err));
@@ -107,14 +115,4 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        value.to_string()
-    } else {
-        let mut out: String = value.chars().take(max).collect();
-        out.push('…');
-        out
-    }
 }

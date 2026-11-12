@@ -49,17 +49,20 @@ Ported and tested:
 - Claude argv builder + `stream-json` translator (port of `claude/*`)
 - bridge system prompt extraction, executable discovery
 - `lark-channel` wiring: send text/card, update card, tenant-token REST client
-- `run` connects the real WebSocket event stream and logs inbound events
+- **run flow**: inbound message -> policy -> streaming card -> spawn agent ->
+  event translation -> throttled card updates -> session persistence
+- session store (resume only from the same cwd), `/stop`, `/new`, `/help`
+- agent process runner: stdin prompt, stderr drain, kill-on-drop, 30 min cap
+- `/stop` aborts the task, which drops the child process
 
 Still to port (rough order):
 
-1. run flow: policy -> card -> spawn agent -> stream into card -> session
-2. session/workspace stores, pending queue, active runs, keepalive
-3. commands (`/config`, `/stop`, …) and card callback dispatch
-4. comments, meetings, reactions (raw REST endpoints)
-5. QR app registration (device flow: `begin` + poll)
-6. daemon install (launchd/systemd/schtasks) and `ps`/`kill`
-7. port the remaining 113 TypeScript test files as behaviour specs
+1. card callback dispatch and the remaining in-chat commands (`/config`, …)
+2. workspace store, pending queue, max-concurrency handling, keepalive
+3. comments, meetings, reactions (raw REST endpoints)
+4. QR app registration (device flow: `begin` + poll)
+5. daemon install (launchd/systemd/schtasks) and `ps`/`kill`
+6. port the remaining TypeScript test files as behaviour specs
 
 ## Build & test
 

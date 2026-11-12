@@ -894,8 +894,10 @@ dependencies = [
 name = "larkline-bridge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
+ "lark-channel",
  "larkline-agent",
  "larkline-core",
  "larkline-lark",

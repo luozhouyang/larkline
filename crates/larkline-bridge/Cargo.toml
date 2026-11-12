@@ -10,7 +10,9 @@ repository.workspace = true
 [dependencies]
 larkline-core.workspace = true
 larkline-lark.workspace = true
+lark-channel = { version = "0.6", features = ["websocket"] }
 larkline-agent.workspace = true
+anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
