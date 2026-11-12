@@ -1648,6 +1648,7 @@ mod tests {
                 None,
                 None,
                 paths,
+                None,
             )
             .expect("bridge"),
         )

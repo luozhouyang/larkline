@@ -35,20 +35,26 @@
 //!
 //! ## Key configuration
 //!
-//! The TypeScript bridge signs with key version 1 = the profile's App Secret
-//! (`src/bot/channel.ts`). The Rust `Bridge` is not handed that secret, so the
-//! same algorithm runs with a key configured explicitly; the bridge and the
-//! card-signing client must share the value. Sources, first one wins:
+//! The TypeScript bridge signs with key version 1 = the raw profile App Secret
+//! (`src/bot/channel.ts` constructs `new CallbackAuth({ keys: [{ version: 1,
+//! secret: appSecret }] })`), and `lark-cli` mints `bridge_token` values with
+//! the same key. The Rust bridge therefore takes the resolved App Secret and
+//! installs it as key version 1 by default. Explicit keys still win, so an
+//! operator who deliberately shared a separate callback secret keeps that
+//! behaviour. Sources, first one wins:
 //!
 //! 1. profile `extra.callback.keys`:
 //!    `[{"version": 1, "secret": "…", "retired": false}]`
 //! 2. profile `extra.callback.secret` (or `extra.callbackSecret`): version 1
-//! 3. environment `LARKLINE_CALLBACK_SECRET`: version 1
+//! 3. environment `LARKLINE_CALLBACK_SECRET` / `LARK_CHANNEL_CALLBACK_SECRET`:
+//!    version 1
+//! 4. the profile's resolved App Secret: version 1
 //!
-//! With no key configured nothing verifies: [`CallbackAuth::from_profile`]
-//! returns `None`, the bridge fails closed and logs that agent callbacks are
-//! disabled. Retired keys keep verifying old buttons but are never used to
-//! sign.
+//! With no explicit key and no App Secret nothing verifies:
+//! [`CallbackAuth::from_profile_and_app_secret`] returns `None`, the bridge
+//! fails closed and logs that agent callbacks are disabled. Retired keys keep verifying old buttons but are never used to
+//! sign. The secret is never logged: [`CallbackKey`]'s `Debug` redacts it and
+//! [`CallbackAuth`] only exposes key versions.
 //!
 //! ### What the signer must put in the payload
 //!
@@ -337,8 +343,27 @@ impl CallbackAuth {
     }
 
     /// Build a verifier from the profile's `extra` map, then the environment.
+    ///
+    /// The App Secret fallback is opt-in through
+    /// [`CallbackAuth::from_profile_and_app_secret`]; this constructor keeps
+    /// the pre-existing "explicit key only" behaviour for callers that do not
+    /// have a resolved secret.
     pub fn from_profile(profile: &ProfileConfig) -> Option<Self> {
         Self::from_profile_with(profile, |name| std::env::var(name).ok())
+    }
+
+    /// Build a verifier from the profile's `extra` map, then the environment,
+    /// falling back to the resolved App Secret as key version 1.
+    ///
+    /// This matches TypeScript exactly: `startChannel` builds `CallbackAuth`
+    /// with `{ version: 1, secret: appSecret }`, so tokens minted by a
+    /// bridge-aware `lark-cli` verify with no extra configuration. Explicit
+    /// `extra.callback.*` keys and environment secrets keep precedence.
+    pub fn from_profile_and_app_secret(
+        profile: &ProfileConfig,
+        app_secret: Option<&str>,
+    ) -> Option<Self> {
+        Self::from_profile_with_app_secret(profile, |name| std::env::var(name).ok(), app_secret)
     }
 
     /// [`CallbackAuth::from_profile`] with an injectable environment, so the
@@ -347,7 +372,30 @@ impl CallbackAuth {
         profile: &ProfileConfig,
         env: impl Fn(&str) -> Option<String>,
     ) -> Option<Self> {
-        Self::new(configured_keys(profile, env))
+        Self::from_profile_with_app_secret(profile, env, None)
+    }
+
+    /// [`CallbackAuth::from_profile_with`] plus an injectable App Secret.
+    ///
+    /// The App Secret is used raw, without trimming or transformation: that is
+    /// the exact HMAC key TypeScript passes to `createHmac('sha256', secret)`.
+    /// It is only considered when the explicit sources produced no key.
+    pub(crate) fn from_profile_with_app_secret(
+        profile: &ProfileConfig,
+        env: impl Fn(&str) -> Option<String>,
+        app_secret: Option<&str>,
+    ) -> Option<Self> {
+        let mut keys = configured_keys(profile, env);
+        if keys.is_empty() {
+            if let Some(secret) = app_secret.filter(|secret| !secret.is_empty()) {
+                keys.push(CallbackKey {
+                    version: 1,
+                    secret: secret.to_string(),
+                    retired: false,
+                });
+            }
+        }
+        Self::new(keys)
     }
 
     /// Number of configured key versions (for startup logging).
@@ -988,8 +1036,104 @@ mod tests {
     }
 
     #[test]
+    fn app_secret_becomes_key_version_one() {
+        // A `lark-cli` signer uses the raw App Secret, exactly like TypeScript
+        // (`createHmac('sha256', appSecret)`). The verifier must accept that
+        // token with no `extra.callback.*` configuration.
+        let signer = auth(&[(1, "app-s3cret", false)]);
+        let token = signer
+            .sign_at(&sign_input("nonce_app", AGENT_CALLBACK_ACTION), NOW)
+            .expect("token");
+
+        let verifier =
+            CallbackAuth::from_profile_with_app_secret(&profile(), |_| None, Some("app-s3cret"))
+                .expect("app secret configures a key");
+        assert_eq!(verifier.key_versions(), vec![1]);
+        let payload = verifier
+            .verify_at(&token, &expected(AGENT_CALLBACK_ACTION), NOW + 1)
+            .expect("app-secret token verifies");
+        assert_eq!(payload.kv, 1);
+
+        // The secret is used raw, with no trimming: TypeScript passes the
+        // resolved value straight to HMAC.
+        let spaced = CallbackAuth::from_profile_with_app_secret(
+            &profile(),
+            |_| None,
+            Some("  app-s3cret  "),
+        )
+        .expect("configured");
+        assert_eq!(spaced.keys[0].secret, "  app-s3cret  ");
+    }
+
+    #[test]
+    fn explicit_keys_and_environment_win_over_the_app_secret() {
+        // `extra.callback.keys` (then `extra.callback.secret`) beats both the
+        // environment and the App Secret.
+        let mut subject = profile();
+        subject.extra.insert(
+            "callback".to_string(),
+            json!({
+                "keys": [
+                    { "version": 1, "secret": "from-extra" },
+                    { "version": 2, "secret": "newer", "retired": true }
+                ]
+            }),
+        );
+        let configured = CallbackAuth::from_profile_with_app_secret(
+            &subject,
+            |_| Some("from-env".into()),
+            Some("app-secret"),
+        )
+        .expect("configured");
+        assert_eq!(configured.key_versions(), vec![1, 2]);
+        assert_eq!(configured.keys[0].secret, "from-extra");
+
+        // An environment secret beats the App Secret too.
+        let from_env = CallbackAuth::from_profile_with_app_secret(
+            &profile(),
+            |name| (name == CALLBACK_SECRET_ENV).then(|| "from-env".into()),
+            Some("app-secret"),
+        )
+        .expect("configured");
+        assert_eq!(from_env.keys[0].secret, "from-env");
+
+        // A token signed with the App Secret is rejected when an explicit key
+        // is configured: the fallback is not silently added as key v1.
+        let app_signer = auth(&[(1, "app-secret", false)]);
+        let app_token = app_signer
+            .sign_at(&sign_input("nonce_app", AGENT_CALLBACK_ACTION), NOW)
+            .expect("token");
+        let explicit = CallbackAuth::from_profile_with_app_secret(
+            &profile_with_callback_secret("explicit"),
+            |_| None,
+            Some("app-secret"),
+        )
+        .expect("configured");
+        assert_eq!(explicit.key_versions(), vec![1]);
+        assert_eq!(explicit.keys[0].secret, "explicit");
+        assert_eq!(
+            explicit.verify_at(&app_token, &expected(AGENT_CALLBACK_ACTION), NOW),
+            Err(CallbackRejection::BadSignature)
+        );
+    }
+
+    fn profile_with_callback_secret(secret: &str) -> ProfileConfig {
+        let mut profile = profile();
+        profile
+            .extra
+            .insert("callback".to_string(), json!({ "secret": secret }));
+        profile
+    }
+
+    #[test]
     fn no_configured_key_disables_the_verifier() {
         assert!(CallbackAuth::from_profile_with(&profile(), |_| None).is_none());
+        // No explicit key and no App Secret: fail closed rather than accept
+        // tokens under an empty key.
+        assert!(CallbackAuth::from_profile_with_app_secret(&profile(), |_| None, None).is_none());
+        assert!(
+            CallbackAuth::from_profile_with_app_secret(&profile(), |_| None, Some("")).is_none()
+        );
         // Blank values never count as a key.
         assert!(
             CallbackAuth::new(vec![CallbackKey {
@@ -1005,6 +1149,20 @@ mod tests {
             json!({ "secret": "   ", "keys": [] }),
         );
         assert!(CallbackAuth::from_profile_with(&profile, |_| None).is_none());
+    }
+
+    #[test]
+    fn debug_output_redacts_key_material() {
+        let auth = CallbackAuth::from_profile_with_app_secret(
+            &profile(),
+            |_| None,
+            Some("super-secret-app-key"),
+        )
+        .expect("configured");
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("super-secret-app-key"), "{debug}");
+        assert!(debug.contains("CallbackKey"), "{debug}");
+        assert!(debug.contains("version: 1"), "{debug}");
     }
 
     #[test]

@@ -8,9 +8,9 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use larkline_agent::SandboxMode;
 use larkline_agent::{AgentEvent, TerminationReason};
 use larkline_bridge::agent_runner::{AgentProcess, AgentSpec};
+use larkline_bridge::permissions::{AccessMode, RunPermissions};
 use larkline_bridge::render::RunView;
 use larkline_core::AgentKind;
 
@@ -40,7 +40,11 @@ async fn streams_and_folds_a_fake_claude_run() {
         prompt: "hello".into(),
         session_id: None,
         model: None,
-        sandbox: SandboxMode::WorkspaceWrite,
+        permissions: RunPermissions {
+            default_access: AccessMode::Workspace,
+            max_access: AccessMode::Workspace,
+            claude_permission_mode: None,
+        },
         bot_open_id: Some("ou_bot".into()),
         bot_name: None,
     })
@@ -78,7 +82,7 @@ async fn missing_binary_is_reported() {
         prompt: "hello".into(),
         session_id: None,
         model: None,
-        sandbox: SandboxMode::WorkspaceWrite,
+        permissions: RunPermissions::default(),
         bot_open_id: None,
         bot_name: None,
     })

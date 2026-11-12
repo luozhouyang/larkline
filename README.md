@@ -286,11 +286,11 @@ The encryption key is derived from the machine's hostname and your user name, pl
 |---|---|
 | `LARKLINE_HOME` | State root. Defaults to `~/.larkline`; `--home` overrides it. |
 | `LARKLINE_PROFILE` | Profile for this process. `--profile` overrides it. |
-| `LARKLINE_CALLBACK_SECRET` | HMAC key used to verify card buttons rendered by the agent. If it is not configured, those clicks are rejected. |
+| `LARKLINE_CALLBACK_SECRET` | Optional override for the HMAC key used to verify card buttons rendered by the agent. When absent, the profile App Secret is used as key version 1 (same as TypeScript). |
 
 The pre-rename fallbacks `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE` and `LARK_CHANNEL_CALLBACK_SECRET` are still read when the new names are absent.
 
-For callbacks, the key can also come from the profile's `callback.secret` (or `callback.keys` for key rotation). The bridge and the card-signing client must share the same value.
+For callbacks, the key defaults to the profile App Secret, so tokens minted by a bridge-aware `lark-cli` verify with no extra configuration. An explicit `callback.secret` (or `callback.keys` for key rotation) or `LARKLINE_CALLBACK_SECRET` still takes precedence. The bridge and the card-signing client must share the same value.
 
 ### Working directories
 
@@ -359,7 +359,6 @@ The Rust bridge does not yet implement these TypeScript features:
 - The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` / `/remove`, and `allowedChats` for ordinary messages. (The runtime app owner is resolved for admin commands only.)
 - `/ws` named workspaces, `/resume`, `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`.
 - The full `/config` card form and the remaining presentation settings (COT process messages, reasoning bubble/panel, access and lark-cli policy).
-- Agent permission modes (`permissions.defaultAccess` / `maxAccess`); runs currently use full access.
 - Inbound image and file download. Agent runs receive text prompts only.
 - Wiki comment targets; `doc`, `docx`, `sheet` and `file` are supported.
 - End-of-meeting summary threading: summaries go to the configured origin chat or owner DM as top-level messages.

@@ -102,7 +102,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
-use larkline_agent::{AgentEvent, PromptContext, SandboxMode, TerminationReason};
+use larkline_agent::{AgentEvent, PromptContext, TerminationReason};
 use larkline_core::ProfileConfig;
 use larkline_lark::comments::{self, Comment, CommentRef, CommentReply};
 use larkline_lark::reactions::TYPING;
@@ -112,6 +112,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
+use crate::permissions::RunPermissions;
 use crate::render::RunView;
 use crate::run::{Bridge, RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT, ReactionState};
 
@@ -1108,7 +1109,7 @@ async fn run_comment_agent_with_wait(
         prompt,
         session_id: resume.clone(),
         model: None,
-        sandbox: SandboxMode::DangerFullAccess,
+        permissions: RunPermissions::from_profile(&bridge.live_profile()),
         bot_open_id: bridge.bot_open_id.clone(),
         bot_name: bridge.bot_name.clone(),
     };
@@ -1675,6 +1676,7 @@ mod tests {
                 None,
                 None,
                 paths,
+                None,
             )
             .expect("bridge"),
         )

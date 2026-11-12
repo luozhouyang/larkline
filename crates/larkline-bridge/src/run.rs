@@ -80,7 +80,7 @@ use lark_channel::message::{
     MessageChatType, MessageSenderInfo, MessageSenderType, NormalizedMessage, Recipient,
 };
 use larkline_agent::{
-    AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
+    AgentEvent, PromptContext, PromptMention, TerminationReason, build_agent_prompt,
 };
 use larkline_core::{
     AppPaths, CoreError, MessageReplyMode, Preferences, ProfileConfig, SessionStore, TenantBrand,
@@ -98,6 +98,7 @@ use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
 use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
 use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
+use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
     CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, card_status, card_summary, render_card,
@@ -469,6 +470,16 @@ impl Drop for TrackedRunGuard {
 }
 
 impl Bridge {
+    /// Build a bridge.
+    ///
+    /// `app_secret` is the profile's resolved App Secret. It becomes callback
+    /// key version 1 (the same key TypeScript uses), so `lark-cli`-minted
+    /// `bridge_token` values verify by default. Explicit `extra.callback.*`
+    /// keys or `LARKLINE_CALLBACK_SECRET` still take precedence. Pass `None`
+    /// when no secret could be resolved; agent callbacks then fail closed
+    /// unless a key is configured explicitly. The value is consumed into the
+    /// (redacted) [`CallbackAuth`], where it stays for token verification, and
+    /// is never logged as plaintext.
     pub fn new(
         channel: Channel,
         profile: ProfileConfig,
@@ -477,6 +488,7 @@ impl Bridge {
         bot_open_id: Option<String>,
         bot_name: Option<String>,
         paths: AppPaths,
+        app_secret: Option<&str>,
     ) -> anyhow::Result<Self> {
         let sessions = SessionStore::load(&paths.sessions_file)
             .with_context(|| format!("cannot load {}", paths.sessions_file.display()))?;
@@ -493,7 +505,7 @@ impl Bridge {
         let workspaces = WorkspaceStore::load_with_default(&paths.workspaces_file, &default_dir)
             .with_context(|| format!("cannot load {}", paths.workspaces_file.display()))?;
 
-        let callback_auth = CallbackAuth::from_profile(&profile);
+        let callback_auth = CallbackAuth::from_profile_and_app_secret(&profile, app_secret);
         match callback_auth.as_ref() {
             Some(auth) => tracing::info!(
                 key_versions = ?auth.key_versions(),
@@ -501,7 +513,7 @@ impl Bridge {
             ),
             None => tracing::info!(
                 "agent card callbacks are disabled: no callback key configured \
-                 (profile extra.callback.secret or {})",
+                 (profile extra.callback.secret, {}, or the profile App Secret)",
                 crate::callback::CALLBACK_SECRET_ENV
             ),
         }
@@ -570,6 +582,7 @@ impl Bridge {
         let agent = AgentSettings {
             kind: profile.agent_kind,
             binary: self.agent_binary.clone(),
+            permissions: RunPermissions::from_profile(&profile),
             bot_open_id: self
                 .bot_open_id
                 .clone()
@@ -1869,7 +1882,7 @@ impl Bridge {
             prompt,
             session_id: resume,
             model: None,
-            sandbox: SandboxMode::DangerFullAccess,
+            permissions: RunPermissions::from_profile(&profile),
             bot_open_id: self.bot_open_id.clone(),
             bot_name: self.bot_name.clone(),
         };
@@ -4005,6 +4018,7 @@ mod tests {
                 None,
                 None,
                 paths.clone(),
+                None,
             )
             .expect("bridge"),
         );
@@ -4022,7 +4036,8 @@ mod tests {
             json!({"enabled": true, "trigger": "@小助手"}),
         );
         let bridge = Arc::new(
-            Bridge::new(channel, enabled, agent, workspace, None, None, paths).expect("bridge"),
+            Bridge::new(channel, enabled, agent, workspace, None, None, paths, None)
+                .expect("bridge"),
         );
         assert!(bridge.start_meeting());
         let manager = bridge.meeting_manager().expect("manager");
@@ -4150,16 +4165,40 @@ mod tests {
     // ---- card callbacks -------------------------------------------------
 
     fn test_bridge(root: &Path, profile: ProfileConfig) -> Arc<Bridge> {
+        test_bridge_with_app_secret(root, profile, None)
+    }
+
+    /// Bridge with the profile's resolved App Secret threaded through exactly
+    /// as `larkline run` does.
+    fn test_bridge_with_app_secret(
+        root: &Path,
+        profile: ProfileConfig,
+        app_secret: Option<&str>,
+    ) -> Arc<Bridge> {
         // Never hit the owner API from a unit test: the real source would try
         // to reach Feishu. Tests that exercise owner gating install their own
         // FakeOwnerSource with `test_bridge_with_owner`.
-        test_bridge_with_owner(root, profile, FakeOwnerSource::failure("offline test"))
+        test_bridge_with_owner_and_secret(
+            root,
+            profile,
+            FakeOwnerSource::failure("offline test"),
+            app_secret,
+        )
     }
 
     fn test_bridge_with_owner(
         root: &Path,
         profile: ProfileConfig,
         owner_source: Arc<dyn OwnerSource>,
+    ) -> Arc<Bridge> {
+        test_bridge_with_owner_and_secret(root, profile, owner_source, None)
+    }
+
+    fn test_bridge_with_owner_and_secret(
+        root: &Path,
+        profile: ProfileConfig,
+        owner_source: Arc<dyn OwnerSource>,
+        app_secret: Option<&str>,
     ) -> Arc<Bridge> {
         let paths = AppPaths::resolve(root, "test").expect("app paths");
         let channel = Channel::new("cli_test_app", "secret", TenantBrand::Feishu);
@@ -4171,22 +4210,29 @@ mod tests {
             None,
             None,
             paths,
+            app_secret,
         )
         .expect("bridge");
         bridge.owner = OwnerGate::new(owner_source);
         Arc::new(bridge)
     }
 
-    fn callback_profile(secret: &str) -> ProfileConfig {
-        let mut profile = profile();
-        profile
-            .extra
-            .insert("callback".to_string(), json!({ "secret": secret }));
+    /// Profile whose access policy accepts the fixture clicker (`ou_1`).
+    fn clickable_profile() -> ProfileConfig {
         // Card-click access uses the TS union; allow the fixture clicker.
+        let mut profile = profile();
         profile.access = Some(Access {
             allowed_users: vec!["ou_1".into()],
             ..Access::default()
         });
+        profile
+    }
+
+    fn callback_profile(secret: &str) -> ProfileConfig {
+        let mut profile = clickable_profile();
+        profile
+            .extra
+            .insert("callback".to_string(), json!({ "secret": secret }));
         profile
     }
 
@@ -4427,6 +4473,59 @@ mod tests {
 
         assert!(bridge.handle_card_action(&event).await.is_none());
         assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_callback_verifies_with_the_profile_app_secret() {
+        // `larkline run` resolves the App Secret and hands it to `Bridge::new`;
+        // the bridge installs it as key v1 exactly like TypeScript, so a
+        // token minted by lark-cli verifies with no `extra.callback.*`.
+        let root = tempfile::tempdir().unwrap();
+        let bridge =
+            test_bridge_with_app_secret(root.path(), clickable_profile(), Some("app-s3cret"));
+        let token = sign_callback("app-s3cret", "nonce_app_secret");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": token,
+            "choice": "b"
+        }));
+
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        let batch = take_batch(&bridge);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].text, r#"[card-click] {"choice":"b"}"#);
+    }
+
+    #[tokio::test]
+    async fn explicit_callback_key_wins_over_the_profile_app_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge_with_app_secret(
+            root.path(),
+            callback_profile("explicit"),
+            Some("app-s3cret"),
+        );
+
+        // The App Secret is not added as a fallback key version when an
+        // explicit key exists: its token is rejected.
+        let app_token = sign_callback("app-s3cret", "nonce_app_fallback");
+        let app_event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": app_token
+        }));
+        assert!(bridge.handle_card_action(&app_event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+
+        // The explicitly configured key still verifies.
+        let explicit_token = sign_callback("explicit", "nonce_explicit");
+        let explicit_event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": explicit_token,
+            "choice": "a"
+        }));
+        assert!(bridge.handle_card_action(&explicit_event).await.is_none());
+        let batch = take_batch(&bridge);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].text, r#"[card-click] {"choice":"a"}"#);
     }
 
     #[tokio::test]

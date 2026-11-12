@@ -80,7 +80,7 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let channel = Channel::new(app.id.clone(), secret, app.tenant);
+    let channel = Channel::new(app.id.clone(), secret.clone(), app.tenant);
     let bridge = Arc::new(Bridge::new(
         channel.clone(),
         profile.clone(),
@@ -89,6 +89,7 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         None,
         None,
         ctx.paths.clone(),
+        Some(secret.as_str()),
     )?);
     println!("sessions: {}", bridge.sessions_path().display());
 

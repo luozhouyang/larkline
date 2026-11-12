@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use larkline_agent::{AgentEvent, SandboxMode, TerminationReason};
+use larkline_agent::{AgentEvent, TerminationReason};
 use larkline_core::{AgentKind, ProfileConfig};
 use larkline_lark::{
     EventsPage, JoinResult, MeetingActivityItem, RestClient, RestError, RestResult, VcBotClient,
@@ -95,6 +95,7 @@ use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
+use crate::permissions::RunPermissions;
 use crate::render::RunView;
 use crate::run::{RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT};
 use crate::run_limit::RunLimiter;
@@ -1655,6 +1656,8 @@ pub trait MeetingHost: Send + Sync {
 pub struct AgentSettings {
     pub kind: AgentKind,
     pub binary: PathBuf,
+    /// Profile-resolved access policy applied to every meeting run.
+    pub permissions: RunPermissions,
     pub bot_open_id: Option<String>,
     pub bot_name: Option<String>,
 }
@@ -2327,7 +2330,7 @@ impl MeetingManager {
             prompt,
             session_id: resume.clone(),
             model: None,
-            sandbox: SandboxMode::DangerFullAccess,
+            permissions: self.agent.permissions,
             bot_open_id: self.agent.bot_open_id.clone(),
             bot_name: self.agent.bot_name.clone(),
         };
@@ -2999,6 +3002,7 @@ mod tests {
             AgentSettings {
                 kind: AgentKind::Claude,
                 binary,
+                permissions: RunPermissions::default(),
                 bot_open_id: None,
                 bot_name: None,
             },
@@ -3023,6 +3027,7 @@ mod tests {
                 AgentSettings {
                     kind: AgentKind::Claude,
                     binary,
+                    permissions: RunPermissions::default(),
                     bot_open_id: None,
                     bot_name: None,
                 },
@@ -3050,6 +3055,7 @@ mod tests {
                 None,
                 None,
                 paths,
+                None,
             )
             .expect("bridge"),
         )
@@ -4288,6 +4294,7 @@ mod tests {
                 AgentSettings {
                     kind: AgentKind::Claude,
                     binary: bridge.agent_binary.clone(),
+                    permissions: RunPermissions::default(),
                     bot_open_id: None,
                     bot_name: None,
                 },

@@ -12,6 +12,7 @@ pub mod keepalive;
 pub mod meeting;
 pub mod owner;
 pub mod pending;
+pub mod permissions;
 pub mod policy;
 pub mod render;
 pub mod reply;
@@ -34,6 +35,7 @@ pub use owner::{
     can_run_admin_command, parse_owner_id,
 };
 pub use pending::{PendingQueue, PushOutcome, QueueLimits};
+pub use permissions::{AccessMode, ClaudePermissionMode, RunPermissions};
 pub use run::{Bridge, scope_key};
 pub use run_limit::{MAX_CONCURRENT_RUNS, RunLimiter, RunPermit};
 pub use text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};

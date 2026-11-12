@@ -11,12 +11,14 @@ use std::process::Stdio;
 use anyhow::{Context as _, anyhow};
 use larkline_agent::{
     AgentEvent, BridgePromptContext, ClaudeArgsInput, ClaudeStreamTranslator, CodexArgsInput,
-    CodexFinishReason, CodexJsonlTranslator, SandboxMode, build_bridge_system_prompt,
-    build_claude_args, build_codex_args, prefix_bridge_system_prompt,
+    CodexFinishReason, CodexJsonlTranslator, build_bridge_system_prompt, build_claude_args,
+    build_codex_args, prefix_bridge_system_prompt,
 };
 use larkline_core::AgentKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
+
+use crate::permissions::RunPermissions;
 
 #[derive(Debug, Clone)]
 pub struct AgentSpec {
@@ -26,7 +28,9 @@ pub struct AgentSpec {
     pub prompt: String,
     pub session_id: Option<String>,
     pub model: Option<String>,
-    pub sandbox: SandboxMode,
+    /// Profile-resolved access policy for this run. The adapters turn it into
+    /// Codex's `--sandbox` and Claude's `--permission-mode`.
+    pub permissions: RunPermissions,
     pub bot_open_id: Option<String>,
     pub bot_name: Option<String>,
 }
@@ -64,6 +68,53 @@ pub struct AgentProcess {
     _system_prompt: Option<TempFile>,
 }
 
+/// Build the adapter argv and the stdin prompt for one run.
+///
+/// Extracted from [`AgentProcess::spawn`] so argv construction is testable
+/// without spawning a process. The permission policy flows through
+/// [`AgentSpec::permissions`] into `build_claude_args` /
+/// `build_codex_args`; TypeScript does the same through `AgentRunOptions`.
+fn build_agent_args(
+    spec: &AgentSpec,
+    system_prompt_file: &Path,
+) -> anyhow::Result<(Vec<String>, String)> {
+    match spec.kind {
+        AgentKind::Claude => Ok((
+            build_claude_args(&ClaudeArgsInput {
+                permission_mode: Some(spec.permissions.claude_permission_mode().as_str()),
+                system_prompt_file: Some(system_prompt_file),
+                session_id: spec.session_id.as_deref(),
+                model: spec.model.as_deref(),
+            }),
+            spec.prompt.clone(),
+        )),
+        AgentKind::Codex => {
+            let args = build_codex_args(&CodexArgsInput {
+                cwd: spec.cwd.to_string_lossy().into_owned(),
+                sandbox: spec.permissions.sandbox(),
+                thread_id: spec.session_id.clone(),
+                images: Vec::new(),
+                ignore_user_config: false,
+                ignore_rules: None,
+                model: spec.model.clone(),
+            })
+            .map_err(|e| anyhow!("invalid codex arguments: {e}"))?;
+            // Codex has no `--append-system-prompt-file`; the system prompt is
+            // prepended to the stdin prompt instead.
+            Ok((
+                args,
+                prefix_bridge_system_prompt(
+                    &spec.prompt,
+                    Some(&BridgePromptContext {
+                        bot_open_id: spec.bot_open_id.clone(),
+                        bot_name: spec.bot_name.clone(),
+                    }),
+                ),
+            ))
+        }
+    }
+}
+
 impl AgentProcess {
     pub async fn spawn(spec: AgentSpec) -> anyhow::Result<Self> {
         let system_prompt = build_bridge_system_prompt(Some(&BridgePromptContext {
@@ -72,46 +123,15 @@ impl AgentProcess {
         }));
 
         let system_prompt_file = TempFile::new(&system_prompt)?;
-        let (args, stdin_prompt) = match spec.kind {
-            AgentKind::Claude => (
-                build_claude_args(&ClaudeArgsInput {
-                    permission_mode: None,
-                    system_prompt_file: Some(&system_prompt_file.path),
-                    session_id: spec.session_id.as_deref(),
-                    model: spec.model.as_deref(),
-                }),
-                spec.prompt.clone(),
-            ),
-            AgentKind::Codex => {
-                let args = build_codex_args(&CodexArgsInput {
-                    cwd: spec.cwd.to_string_lossy().into_owned(),
-                    sandbox: spec.sandbox,
-                    thread_id: spec.session_id.clone(),
-                    images: Vec::new(),
-                    ignore_user_config: false,
-                    ignore_rules: None,
-                    model: spec.model.clone(),
-                })
-                .map_err(|e| anyhow!("invalid codex arguments: {e}"))?;
-                // Codex has no `--append-system-prompt-file`; the system
-                // prompt is prepended to the stdin prompt instead.
-                (
-                    args,
-                    prefix_bridge_system_prompt(
-                        &spec.prompt,
-                        Some(&BridgePromptContext {
-                            bot_open_id: spec.bot_open_id.clone(),
-                            bot_name: spec.bot_name.clone(),
-                        }),
-                    ),
-                )
-            }
-        };
+        let (args, stdin_prompt) = build_agent_args(&spec, &system_prompt_file.path)?;
 
         tracing::info!(
             agent = spec.kind.binary_name(),
             cwd = %spec.cwd.display(),
             resume = spec.session_id.is_some(),
+            access = spec.permissions.effective_access().as_str(),
+            sandbox = spec.permissions.sandbox().as_str(),
+            claude_permission_mode = spec.permissions.claude_permission_mode().as_str(),
             "spawning agent"
         );
 
@@ -248,5 +268,101 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::AccessMode;
+
+    fn spec(kind: AgentKind, permissions: RunPermissions) -> AgentSpec {
+        AgentSpec {
+            kind,
+            binary: PathBuf::from("/nonexistent/agent"),
+            cwd: PathBuf::from("/work"),
+            prompt: "hello".into(),
+            session_id: None,
+            model: None,
+            permissions,
+            bot_open_id: None,
+            bot_name: None,
+        }
+    }
+
+    fn permissions(default_access: AccessMode, max_access: AccessMode) -> RunPermissions {
+        RunPermissions {
+            default_access,
+            max_access,
+            claude_permission_mode: None,
+        }
+    }
+
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|window| window[0] == flag)
+            .map(|window| window[1].as_str())
+    }
+
+    #[test]
+    fn claude_argv_reflects_the_effective_access() {
+        for (access, expected) in [
+            (AccessMode::ReadOnly, "plan"),
+            (AccessMode::Workspace, "acceptEdits"),
+            (AccessMode::Full, "bypassPermissions"),
+        ] {
+            let (args, stdin) = build_agent_args(
+                &spec(AgentKind::Claude, permissions(access, access)),
+                Path::new("/tmp/system.md"),
+            )
+            .expect("claude args");
+            assert_eq!(
+                arg_after(&args, "--permission-mode"),
+                Some(expected),
+                "access {access:?}"
+            );
+            // Claude gets the prompt on stdin, not argv.
+            assert_eq!(stdin, "hello");
+            assert!(!args.iter().any(|arg| arg == "hello"));
+        }
+    }
+
+    #[test]
+    fn codex_argv_reflects_the_effective_access() {
+        for (access, expected) in [
+            (AccessMode::ReadOnly, "read-only"),
+            (AccessMode::Workspace, "workspace-write"),
+            (AccessMode::Full, "danger-full-access"),
+        ] {
+            let (args, stdin) = build_agent_args(
+                &spec(AgentKind::Codex, permissions(access, access)),
+                Path::new("/tmp/system.md"),
+            )
+            .expect("codex args");
+            assert_eq!(
+                arg_after(&args, "--sandbox"),
+                Some(expected),
+                "access {access:?}"
+            );
+            // The Codex system prompt is prepended to stdin.
+            assert!(stdin.contains("hello"));
+        }
+    }
+
+    #[test]
+    fn clamping_applies_before_argv_is_built() {
+        // Requested full, capped at workspace: both adapters must see the cap.
+        let capped = permissions(AccessMode::Full, AccessMode::Workspace);
+        let (claude, _) = build_agent_args(
+            &spec(AgentKind::Claude, capped),
+            Path::new("/tmp/system.md"),
+        )
+        .expect("claude args");
+        assert_eq!(arg_after(&claude, "--permission-mode"), Some("acceptEdits"));
+
+        let (codex, _) =
+            build_agent_args(&spec(AgentKind::Codex, capped), Path::new("/tmp/system.md"))
+                .expect("codex args");
+        assert_eq!(arg_after(&codex, "--sandbox"), Some("workspace-write"));
     }
 }

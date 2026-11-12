@@ -138,11 +138,12 @@ primitive so it can be picked up without re-deriving the design.
    is a text subset that can read and set `messageReply`, `showToolCalls` and
    `maxConcurrentRuns`; the CardKit form, COT/reasoning/access/lark-cli
    settings are not implemented.
-3. **Permission modes** — `permissions.defaultAccess` / `maxAccess` and the
-   legacy `sandbox` field are not read. Runs, comment runs and meeting runs
-   hardcode `SandboxMode::DangerFullAccess`. The idle watchdog and `/timeout`
-   are also not wired; `agent_stop_grace_ms` and session idle timeouts are
-   parsed but unused.
+3. **Idle timeout / watchdog** — permission modes are now read from
+   `permissions.defaultAccess` / `maxAccess` (with legacy `sandbox` fallback)
+   and passed to Codex as `--sandbox` and Claude as `--permission-mode`; see
+   `crates/larkline-bridge/src/permissions.rs`. The idle watchdog and
+   `/timeout` are still not wired; `agent_stop_grace_ms` and session idle
+   timeouts are parsed but unused.
 4. **Presentation parity** — no COT process messages and no reasoning bubble.
    The rich card now matches the TypeScript content model (reasoning panel,
    per-tool panels, collapse rules, terminal notices, footer status and stop
@@ -189,13 +190,13 @@ primitive so it can be picked up without re-deriving the design.
     are sent as top-level IM messages to the configured origin/owner target;
     they are not threaded into the originating topic. The app needs the VC bot
     scopes and a tenant that supports the capability.
-11. **Callbacks** — agent-rendered callbacks need an explicit key
-    (`extra.callback.secret`, `extra.callback.keys` or
-    `LARKLINE_CALLBACK_SECRET`); the TypeScript bridge could sign with the App
-    Secret, which is not handed to `Bridge`. Replay protection is in-memory,
-    so a token replayed after a restart is accepted until it expires. `run_id`
-    and `policy_fingerprint` are not bound because the Rust bridge keeps
-    neither.
+11. **Callbacks** — the profile App Secret is now callback key version 1 by
+    default, matching TypeScript (`lark-cli` tokens verify without extra
+    configuration); explicit `extra.callback.secret`, `extra.callback.keys` or
+    `LARKLINE_CALLBACK_SECRET` still take precedence. Replay protection is
+    in-memory, so a token replayed after a restart is accepted until it
+    expires. `run_id` and `policy_fingerprint` are not bound because the Rust
+    bridge keeps neither.
 12. **Session catalog** — `sessions.json.catalog.json` is not written or read;
     resume is keyed by scope and cwd only.
 13. **Test parity** — the Rust workspace has unit and integration tests for the

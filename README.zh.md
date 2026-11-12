@@ -286,11 +286,11 @@ larkline secrets remove app-cli_xxx
 |---|---|
 | `LARKLINE_HOME` | 状态根目录，默认 `~/.larkline`；`--home` 优先。 |
 | `LARKLINE_PROFILE` | 当前进程使用的 profile；`--profile` 优先。 |
-| `LARKLINE_CALLBACK_SECRET` | 校验 agent 渲染的卡片按钮时使用的 HMAC key。未配置时这类点击会被拒绝。 |
+| `LARKLINE_CALLBACK_SECRET` | 校验 agent 渲染的卡片按钮时使用的 HMAC key，可选覆盖。未配置时默认使用 profile 的 App Secret 作为 key version 1（与 TypeScript 一致）。 |
 
 改名前的回退变量 `LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`LARK_CHANNEL_CALLBACK_SECRET` 在新变量不存在时仍然生效。
 
-卡片回调的 key 也可以来自 profile 的 `callback.secret`（密钥轮换时用 `callback.keys`）。bridge 和负责签名卡片的客户端必须使用同一个值。
+卡片回调的 key 默认使用 profile 的 App Secret，因此 bridge-aware `lark-cli` 签发的 token 无需额外配置即可校验。显式配置的 `callback.secret`（密钥轮换时用 `callback.keys`）或 `LARKLINE_CALLBACK_SECRET` 仍然优先。bridge 和负责签名卡片的客户端必须使用同一个值。
 
 ### 工作目录
 
@@ -359,7 +359,6 @@ Rust bridge 暂未实现以下 TypeScript 功能：
 - 普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。（运行时应用 owner 只用于管理员命令。）
 - `/ws` 命名工作空间、`/resume`、`/timeout`、飞书内 `/ps`、`/exit`、`/reconnect`、`/doctor`。
 - 完整的 `/config` 卡片表单，以及其余展示设置（COT 过程消息、思考内容气泡 / 面板、访问控制和 lark-cli 策略）。
-- Agent 权限模式（`permissions.defaultAccess` / `maxAccess`）；当前 run 使用完整权限。
 - 入站图片和文件下载。agent 目前只收到文本 prompt。
 - Wiki 评论目标；目前支持 `doc`、`docx`、`sheet` 和 `file`。
 - 会议纪要的 thread 归属：纪要会作为顶层消息发到配置的来源聊天或 owner 私聊。
