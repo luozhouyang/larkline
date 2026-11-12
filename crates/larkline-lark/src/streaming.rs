@@ -181,6 +181,29 @@ impl StreamingState {
         }
     }
 
+    /// Decides what a whole-card entity update should do and advances the state.
+    ///
+    /// Unlike [`StreamingState::plan_content`] there is no cheap no-op check:
+    /// the card document is opaque here, so every call inside the window plans
+    /// a write. [`StreamingState::record_card_written`] forgets the last
+    /// streamed element content, because the new card may have replaced it.
+    pub fn plan_card(&mut self, now: Instant) -> UpdatePlan {
+        if self.phase != Phase::Live {
+            return UpdatePlan::Skip {
+                reason: SkipReason::NotLive,
+            };
+        }
+        if !self.within_window(now) {
+            self.phase = Phase::Expired;
+            return UpdatePlan::Skip {
+                reason: SkipReason::Expired,
+            };
+        }
+        UpdatePlan::Send {
+            sequence: self.next_sequence(),
+        }
+    }
+
     /// Decides what the final update should do and closes the card.
     ///
     /// The card is finished even when nothing is written: after `finish` no
@@ -239,6 +262,15 @@ impl StreamingState {
         self.phase = Phase::Failed;
     }
 
+    /// Records a whole-card write that the server accepted.
+    ///
+    /// The new card document may have replaced the streamed element, so the
+    /// remembered element content is discarded. A later `finish` therefore
+    /// writes the final frame again instead of assuming it is already shown.
+    pub fn record_card_written(&mut self) {
+        self.last_content = None;
+    }
+
     /// Allocates the next CardKit sequence number.
     pub(crate) fn next_sequence(&mut self) -> u32 {
         self.sequence = self.sequence.saturating_add(1);
@@ -249,8 +281,9 @@ impl StreamingState {
 /// A live CardKit 2.0 streaming card.
 ///
 /// Created by [`StreamingCard::start`], which creates the entity and sends the
-/// message that references it. Call [`StreamingCard::set_content`] while the
-/// agent runs and [`StreamingCard::finish`] once it is done.
+/// message that references it. Call [`StreamingCard::set_content`] (one
+/// element) or [`StreamingCard::set_card`] (the whole card) while the agent
+/// runs and [`StreamingCard::finish`] once it is done.
 ///
 /// If the entity cannot be created, `start` returns the SDK error before any
 /// message exists: fall back to [`Channel::send_card`] plus
@@ -391,6 +424,61 @@ impl StreamingCard {
                     message_id = self.message_id.0.as_str(),
                     ?reason,
                     "streaming card update skipped"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Replaces the whole CardKit entity with a new card document.
+    ///
+    /// This is the bridge-friendly path for cards with several elements
+    /// (answer, tool list, footer, stop button): CardKit has no multi-element
+    /// content update, so the complete card is PUT back with the shared
+    /// sequence counter and the same [`CARD_SAFE_AGE`] guard as
+    /// [`StreamingCard::set_content`].
+    ///
+    /// Returns `Ok(true)` when the card was written and `Ok(false)` when the
+    /// card is finished/expired. A server error is returned as `Err` and marks
+    /// the card dead; the caller can then continue with message-level updates
+    /// through [`StreamingCard::message_id`].
+    ///
+    /// No two-write de-duplication is done: the card document is opaque, so
+    /// every in-window call is sent. The last streamed element content is
+    /// forgotten after a successful write.
+    pub async fn set_card(&mut self, card: &Card) -> LarkResult<bool> {
+        let now = Instant::now();
+        match self.state.plan_card(now) {
+            UpdatePlan::Send { sequence } => {
+                let result = self
+                    .channel
+                    .openapi()
+                    .update_card_entity(&self.card_id, card, CardUpdateOptions::new(sequence))
+                    .await;
+                match result {
+                    Ok(()) => {
+                        self.state.record_card_written();
+                        Ok(true)
+                    }
+                    Err(error) => {
+                        self.state.mark_failed();
+                        tracing::warn!(
+                            error = %error,
+                            card_id = self.card_id.as_str(),
+                            message_id = self.message_id.0.as_str(),
+                            sequence,
+                            "streaming card entity update failed; falling back to message updates"
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            UpdatePlan::Skip { reason } => {
+                tracing::debug!(
+                    card_id = self.card_id.as_str(),
+                    message_id = self.message_id.0.as_str(),
+                    ?reason,
+                    "streaming card entity update skipped"
                 );
                 Ok(false)
             }
@@ -657,6 +745,73 @@ mod tests {
     }
 
     #[test]
+    fn whole_card_updates_share_the_sequence_counter() {
+        let (mut state, now) = state();
+        assert_eq!(
+            state.plan_content("element", now),
+            UpdatePlan::Send { sequence: 1 }
+        );
+        state.record_written("element");
+
+        assert_eq!(state.plan_card(now), UpdatePlan::Send { sequence: 2 });
+        state.record_card_written();
+        assert_eq!(state.sequence(), 2);
+
+        assert_eq!(state.plan_card(now), UpdatePlan::Send { sequence: 3 });
+        assert_eq!(state.sequence(), 3);
+    }
+
+    #[test]
+    fn whole_card_updates_stop_after_the_safe_age() {
+        let (mut state, created_at) = state();
+        assert_eq!(
+            state.plan_card(created_at + CARD_SAFE_AGE),
+            UpdatePlan::Skip {
+                reason: SkipReason::Expired
+            }
+        );
+        assert!(!state.is_live());
+        assert_eq!(state.sequence(), 0, "no sequence consumed by an expiry");
+
+        assert_eq!(
+            state.plan_card(created_at + 2 * CARD_SAFE_AGE),
+            UpdatePlan::Skip {
+                reason: SkipReason::NotLive
+            }
+        );
+        assert_eq!(state.sequence(), 0);
+    }
+
+    #[test]
+    fn whole_card_update_forgets_the_last_streamed_content() {
+        let (mut state, now) = state();
+        assert_eq!(
+            state.plan_content("same", now),
+            UpdatePlan::Send { sequence: 1 }
+        );
+        state.record_written("same");
+        assert_eq!(state.last_content(), Some("same"));
+
+        assert_eq!(state.plan_card(now), UpdatePlan::Send { sequence: 2 });
+        // A planned write does not change what the card currently shows.
+        assert_eq!(state.last_content(), Some("same"));
+
+        state.record_card_written();
+        assert_eq!(
+            state.last_content(),
+            None,
+            "a whole-card write replaces the streamed element"
+        );
+
+        // The card may already show the final text, but that cannot be proven
+        // after a whole-card write, so finish writes the final frame again.
+        assert_eq!(
+            state.plan_finish("same", now),
+            FinishPlan::Send { sequence: 3 }
+        );
+    }
+
+    #[test]
     fn updates_stop_once_the_safe_age_elapses() {
         let (mut state, created_at) = state();
         let just_inside = created_at + CARD_SAFE_AGE - Duration::from_millis(1);
@@ -780,6 +935,12 @@ mod tests {
         assert_eq!(
             state.plan_finish("more", now),
             FinishPlan::Skip {
+                reason: SkipReason::NotLive
+            }
+        );
+        assert_eq!(
+            state.plan_card(now),
+            UpdatePlan::Skip {
                 reason: SkipReason::NotLive
             }
         );

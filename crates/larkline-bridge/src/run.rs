@@ -16,7 +16,7 @@ use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
 };
 use larkline_core::{AppPaths, MessageReplyMode, ProfileConfig, SessionStore};
-use larkline_lark::Channel;
+use larkline_lark::{CARD_SAFE_AGE, Channel, STREAMING_ELEMENT_ID, StreamingCard};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -33,11 +33,6 @@ const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Cards over this many characters are truncated (CardKit caps JSON size).
 const MAX_CARD_CHARS: usize = 8_000;
-/// Feishu force-finalizes a CardKit streaming card about 10 minutes after it
-/// is created; every later update is silently discarded. Stop updating well
-/// before that and deliver the final answer as a separate message instead
-/// (the same mitigation the TypeScript bridge applies).
-const CARD_SAFE_AGE: Duration = Duration::from_secs(8 * 60 + 30);
 
 pub struct Bridge {
     pub channel: Channel,
@@ -194,13 +189,32 @@ impl Bridge {
         let use_card = self.profile.message_reply() != MessageReplyMode::Text;
 
         let mut view = RunView::default();
+        let mut streaming: Option<StreamingCard> = None;
         let mut message_id: Option<String> = None;
         if use_card {
             let card = build_card(&self.profile, &view, "启动中", started, None);
-            match self.channel.send_card(&chat_id, &card).await {
-                Ok(id) => message_id = Some(id.0),
+            // Prefer a CardKit 2.0 streaming entity: every later update is one
+            // whole-card PUT with its own sequence. If either the entity or the
+            // reference message cannot be created, the plain message path below
+            // is the fallback (and is the only path when streaming is off).
+            match StreamingCard::start(&self.channel, &chat_id, card.clone(), STREAMING_ELEMENT_ID)
+                .await
+            {
+                Ok(handle) => {
+                    message_id = Some(handle.message_id().0.clone());
+                    streaming = Some(handle);
+                }
                 Err(err) => {
-                    tracing::warn!(error = %err, "cannot send run card; falling back to text");
+                    tracing::warn!(
+                        error = %err,
+                        "cannot start streaming card; falling back to message card"
+                    );
+                    match self.channel.send_card(&chat_id, &card).await {
+                        Ok(id) => message_id = Some(id.0),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "cannot send run card; falling back to text");
+                        }
+                    }
                 }
             }
         }
@@ -225,8 +239,15 @@ impl Bridge {
                     message: message.clone(),
                     termination_reason: TerminationReason::Failed,
                 });
-                self.finalize(&chat_id, message_id.as_deref(), &view, use_card, started)
-                    .await;
+                self.finalize(
+                    &chat_id,
+                    &mut streaming,
+                    message_id.as_deref(),
+                    &view,
+                    use_card,
+                    started,
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -256,13 +277,15 @@ impl Bridge {
                     if view.finished {
                         break;
                     }
-                    if use_card
-                        && message_id.is_some()
-                        && last_update.elapsed() >= CARD_UPDATE_INTERVAL
-                        && within_card_window(started.elapsed())
-                    {
-                        self.update_card(&chat_id, message_id.as_deref(), &view, started)
-                            .await;
+                    if use_card && last_update.elapsed() >= CARD_UPDATE_INTERVAL {
+                        self.refresh_card(
+                            &chat_id,
+                            &mut streaming,
+                            message_id.as_deref(),
+                            &view,
+                            started,
+                        )
+                        .await;
                         last_update = Instant::now();
                     }
                 }
@@ -276,23 +299,55 @@ impl Bridge {
             }
         }
 
-        self.finalize(&chat_id, message_id.as_deref(), &view, use_card, started)
-            .await;
+        self.finalize(
+            &chat_id,
+            &mut streaming,
+            message_id.as_deref(),
+            &view,
+            use_card,
+            started,
+        )
+        .await;
         Ok(())
     }
 
     async fn finalize(
         &self,
         chat_id: &str,
+        streaming: &mut Option<StreamingCard>,
         message_id: Option<&str>,
         view: &RunView,
         use_card: bool,
         started: Instant,
     ) {
-        if use_card && within_card_window(started.elapsed()) {
-            if let Some(id) = message_id {
-                self.update_card(chat_id, Some(id), view, started).await;
-                return;
+        if use_card {
+            if let Some(handle) = streaming.as_mut() {
+                // The final frame is a whole-card PUT with streaming mode off
+                // and no stop button (build_card omits the button when `stop`
+                // is None). set_card applies the CARD_SAFE_AGE guard; when the
+                // window is gone or the card is dead the answer goes out as a
+                // separate message instead.
+                let card = self.final_card(view, started);
+                match handle.set_card(&card).await {
+                    Ok(true) => return,
+                    Ok(false) => {
+                        tracing::debug!(
+                            "streaming card window closed; sending the answer as a message"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "final streaming card update failed; sending the answer as a message"
+                        );
+                    }
+                }
+            } else if started.elapsed() < CARD_SAFE_AGE {
+                if let Some(message_id) = message_id {
+                    self.update_card(chat_id, Some(message_id), view, started)
+                        .await;
+                    return;
+                }
             }
         }
         let answer = view.best_answer().trim();
@@ -302,6 +357,66 @@ impl Bridge {
             truncate_chars(answer, 4_000)
         };
         let _ = self.channel.send_text(chat_id, body).await;
+    }
+
+    /// Push the current view to the run card.
+    ///
+    /// While the CardKit entity is live the whole card is PUT back through
+    /// [`StreamingCard::set_card`]. Once it is expired, finished, or a write
+    /// failed, the same message is updated through the message API for the
+    /// rest of the run (and only inside the safe window).
+    async fn refresh_card(
+        &self,
+        chat_id: &str,
+        streaming: &mut Option<StreamingCard>,
+        message_id: Option<&str>,
+        view: &RunView,
+        started: Instant,
+    ) {
+        if let Some(handle) = streaming.as_mut() {
+            if handle.is_live() {
+                let card = larkline_lark::enable_streaming(self.live_card(chat_id, view, started))
+                    .expect("builder-produced run card is valid");
+                match handle.set_card(&card).await {
+                    Ok(true) => return,
+                    Ok(false) => {
+                        tracing::debug!(
+                            "streaming card window closed; falling back to message updates"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "streaming card update failed; falling back to message updates"
+                        );
+                    }
+                }
+            }
+        }
+        if started.elapsed() < CARD_SAFE_AGE {
+            self.update_card(chat_id, message_id, view, started).await;
+        }
+    }
+
+    /// Card for a running frame (streaming mode stays on, signed stop button).
+    fn live_card(&self, chat_id: &str, view: &RunView, started: Instant) -> lark_channel::Card {
+        let token = if view.finished {
+            None
+        } else {
+            Some(self.tokens.sign(chat_id, "stop"))
+        };
+        build_card(
+            &self.profile,
+            view,
+            card_status(view),
+            started,
+            token.as_deref().map(|token| (chat_id, token)),
+        )
+    }
+
+    /// Card for the last frame (streaming mode off, no stop button).
+    fn final_card(&self, view: &RunView, started: Instant) -> lark_channel::Card {
+        build_card(&self.profile, view, card_status(view), started, None)
     }
 
     async fn update_card(
@@ -314,25 +429,7 @@ impl Bridge {
         let Some(message_id) = message_id else {
             return;
         };
-        let status = if view.error.is_some() {
-            "失败"
-        } else if view.finished {
-            "完成"
-        } else {
-            "运行中"
-        };
-        let token = if view.finished {
-            None
-        } else {
-            Some(self.tokens.sign(chat_id, "stop"))
-        };
-        let card = build_card(
-            &self.profile,
-            view,
-            status,
-            started,
-            token.as_deref().map(|token| (chat_id, token)),
-        );
+        let card = self.live_card(chat_id, view, started);
         if let Err(err) = self.channel.update_card_message(message_id, &card).await {
             tracing::warn!(error = %err, "card update failed");
         }
@@ -393,7 +490,13 @@ fn build_card(
         truncate_chars(answer, MAX_CARD_CHARS)
     };
 
-    let mut elements = vec![json!({ "tag": "markdown", "content": body })];
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": body,
+        // Stable id so CardKit can also stream just the answer element later;
+        // the run flow currently uses whole-card updates.
+        "element_id": STREAMING_ELEMENT_ID,
+    })];
     if !view.tools.is_empty() {
         let tools: Vec<String> = view
             .tools
@@ -450,9 +553,15 @@ fn build_card(
     lark_channel::Card::from_value(value).expect("run card is valid")
 }
 
-/// True while the card is still safe to update (see `CARD_SAFE_AGE`).
-fn within_card_window(elapsed: Duration) -> bool {
-    elapsed < CARD_SAFE_AGE
+/// One-line status for the card footer.
+fn card_status(view: &RunView) -> &'static str {
+    if view.error.is_some() {
+        "失败"
+    } else if view.finished {
+        "完成"
+    } else {
+        "运行中"
+    }
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -501,12 +610,22 @@ mod tests {
     }
 
     #[test]
-    fn card_window_stops_before_the_server_cutoff() {
-        assert!(within_card_window(Duration::from_secs(60)));
-        assert!(within_card_window(CARD_SAFE_AGE - Duration::from_secs(1)));
-        assert!(!within_card_window(CARD_SAFE_AGE));
-        assert!(!within_card_window(Duration::from_secs(11 * 60)));
-        // The guard must stay below the 10 minute server cutoff.
+    fn run_card_exposes_the_streaming_element_and_safe_window() {
+        let card = build_card(
+            &profile(),
+            &RunView::default(),
+            "运行中",
+            Instant::now(),
+            Some(("oc_1", "deadbeef")),
+        );
+        assert_eq!(
+            card.as_value()["body"]["elements"][0]["element_id"],
+            STREAMING_ELEMENT_ID
+        );
+
+        // The bridge guard is the crate's CardKit constant, below Feishu's
+        // ~10 minute server cutoff.
+        assert_eq!(CARD_SAFE_AGE, Duration::from_secs(8 * 60 + 30));
         assert!(CARD_SAFE_AGE < Duration::from_secs(10 * 60));
     }
 
