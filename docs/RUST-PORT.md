@@ -54,10 +54,14 @@ Ported and tested:
 - session store (resume only from the same cwd), `/stop`, `/new`, `/help`
 - agent process runner: stdin prompt, stderr drain, kill-on-drop, 30 min cap
 - `/stop` aborts the task, which drops the child process
+- signed card callbacks: running cards carry a HMAC-signed ⏹ button; clicks
+  are verified per chat and abort the run (agent-rendered callbacks are not
+  forwarded yet)
 
 Still to port (rough order):
 
-1. card callback dispatch and the remaining in-chat commands (`/config`, …)
+1. CardKit streaming entities (create/update by card id, 8.5 min safe window)
+2. remaining in-chat commands (`/config`, …) and agent-rendered callbacks
 2. workspace store, pending queue, max-concurrency handling, keepalive
 3. comments, meetings, reactions (raw REST endpoints)
 4. QR app registration (device flow: `begin` + poll)

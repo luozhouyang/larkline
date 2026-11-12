@@ -94,13 +94,21 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
             move |event| {
                 let bridge = Arc::clone(&bridge);
                 async move {
-                    if let ChannelEvent::Message(message) = event.event.clone() {
-                        tracing::info!(
-                            chat = %message.chat_id,
-                            sender = %message.sender_id,
-                            "inbound message"
-                        );
-                        bridge.handle_message(*message).await;
+                    match event.event.clone() {
+                        ChannelEvent::Message(message) => {
+                            tracing::info!(
+                                chat = %message.chat_id,
+                                sender = %message.sender_id,
+                                "inbound message"
+                            );
+                            bridge.handle_message(*message).await;
+                        }
+                        ChannelEvent::CardAction(action) => {
+                            if let Some(status) = bridge.handle_card_action(&action).await {
+                                tracing::info!(%status, "card action handled");
+                            }
+                        }
+                        ChannelEvent::Unknown { .. } => {}
                     }
                     Ok(WebSocketEventAck::ok())
                 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use lark_channel::event::CardActionEvent;
 use lark_channel::message::{MessageChatType, MessageSenderType, NormalizedMessage};
 use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
@@ -21,6 +22,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
+use crate::callback::CallbackTokens;
 use crate::policy;
 use crate::render::RunView;
 
@@ -40,6 +42,7 @@ pub struct Bridge {
     pub bot_open_id: Option<String>,
     pub bot_name: Option<String>,
     paths: AppPaths,
+    tokens: CallbackTokens,
     sessions: Mutex<SessionStore>,
     active: Mutex<HashMap<String, JoinHandle<()>>>,
 }
@@ -64,6 +67,7 @@ impl Bridge {
             bot_open_id,
             bot_name,
             paths,
+            tokens: CallbackTokens::new(),
             sessions: Mutex::new(sessions),
             active: Mutex::new(HashMap::new()),
         })
@@ -132,6 +136,44 @@ impl Bridge {
         }
     }
 
+    /// Handle a click on a bridge-rendered button.
+    ///
+    /// Returns a short user-facing status when the click was ours, `None` for
+    /// foreign callbacks (agent-sent cards) which are not forwarded yet.
+    pub async fn handle_card_action(&self, action: &CardActionEvent) -> Option<String> {
+        let value = action.action.value.as_object()?;
+        if value.get("__bridge_cb").and_then(|v| v.as_bool()) != Some(true) {
+            return None;
+        }
+        let action_name = value.get("action")?.as_str()?;
+        let scope = value
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let token = value
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !self.tokens.verify(scope, action_name, token) {
+            tracing::warn!(scope, action_name, "rejected card callback with bad token");
+            return Some("操作已失效，请重新发起。".to_string());
+        }
+
+        match action_name {
+            "stop" => {
+                let mut active = self.active.lock().await;
+                match active.remove(scope) {
+                    Some(handle) => {
+                        handle.abort();
+                        Some("已停止当前任务。".to_string())
+                    }
+                    None => Some("当前没有正在运行的任务。".to_string()),
+                }
+            }
+            _ => None,
+        }
+    }
+
     async fn run_agent(self: Arc<Self>, message: NormalizedMessage) -> anyhow::Result<()> {
         let started = Instant::now();
         let chat_id = message.chat_id.clone();
@@ -149,7 +191,7 @@ impl Bridge {
         let mut view = RunView::default();
         let mut message_id: Option<String> = None;
         if use_card {
-            let card = build_card(&self.profile, &view, "启动中", started);
+            let card = build_card(&self.profile, &view, "启动中", started, None);
             match self.channel.send_card(&chat_id, &card).await {
                 Ok(id) => message_id = Some(id.0),
                 Err(err) => {
@@ -213,7 +255,7 @@ impl Bridge {
                         && message_id.is_some()
                         && last_update.elapsed() >= CARD_UPDATE_INTERVAL
                     {
-                        self.update_card(message_id.as_deref(), &view, started)
+                        self.update_card(&chat_id, message_id.as_deref(), &view, started)
                             .await;
                         last_update = Instant::now();
                     }
@@ -243,7 +285,7 @@ impl Bridge {
     ) {
         if use_card {
             if let Some(id) = message_id {
-                self.update_card(Some(id), view, started).await;
+                self.update_card(chat_id, Some(id), view, started).await;
                 return;
             }
         }
@@ -256,7 +298,13 @@ impl Bridge {
         let _ = self.channel.send_text(chat_id, body).await;
     }
 
-    async fn update_card(&self, message_id: Option<&str>, view: &RunView, started: Instant) {
+    async fn update_card(
+        &self,
+        chat_id: &str,
+        message_id: Option<&str>,
+        view: &RunView,
+        started: Instant,
+    ) {
         let Some(message_id) = message_id else {
             return;
         };
@@ -267,7 +315,18 @@ impl Bridge {
         } else {
             "运行中"
         };
-        let card = build_card(&self.profile, view, status, started);
+        let token = if view.finished {
+            None
+        } else {
+            Some(self.tokens.sign(chat_id, "stop"))
+        };
+        let card = build_card(
+            &self.profile,
+            view,
+            status,
+            started,
+            token.as_deref().map(|token| (chat_id, token)),
+        );
         if let Err(err) = self.channel.update_card_message(message_id, &card).await {
             tracing::warn!(error = %err, "card update failed");
         }
@@ -319,6 +378,7 @@ fn build_card(
     view: &RunView,
     status: &str,
     started: Instant,
+    stop: Option<(&str, &str)>,
 ) -> lark_channel::Card {
     let answer = view.best_answer().trim();
     let body = if answer.is_empty() {
@@ -340,6 +400,22 @@ fn build_card(
         elements.push(json!({
             "tag": "markdown",
             "content": format!("**工具**\n{}", tools.join("\n"))
+        }));
+    }
+    if let Some((scope, token)) = stop {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "⏹ 停止" },
+            "type": "danger",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "__bridge_cb": true,
+                    "action": "stop",
+                    "scope": scope,
+                    "token": token
+                }
+            }]
         }));
     }
     elements.push(json!({
@@ -406,11 +482,31 @@ mod tests {
             thread_id: None,
             termination_reason: TerminationReason::Normal,
         });
-        let card = build_card(&profile(), &view, "完成", Instant::now());
+        let card = build_card(&profile(), &view, "完成", Instant::now(), None);
         let text = serde_json::to_string(card.as_value()).unwrap();
         assert!(text.contains("hello"));
         assert!(text.contains("Bash"));
         assert!(text.contains("完成"));
+    }
+
+    #[test]
+    fn running_card_carries_signed_stop_button() {
+        let view = RunView::default();
+        let card = build_card(
+            &profile(),
+            &view,
+            "运行中",
+            Instant::now(),
+            Some(("oc_1", "deadbeef")),
+        );
+        let text = serde_json::to_string(card.as_value()).unwrap();
+        assert!(text.contains("__bridge_cb"));
+        assert!(text.contains("deadbeef"));
+        assert!(text.contains("停止"));
+
+        let finished = build_card(&profile(), &view, "完成", Instant::now(), None);
+        let text = serde_json::to_string(finished.as_value()).unwrap();
+        assert!(!text.contains("__bridge_cb"));
     }
 
     #[test]
@@ -419,7 +515,7 @@ mod tests {
         view.apply(&AgentEvent::Text {
             delta: "x".repeat(MAX_CARD_CHARS + 100),
         });
-        let card = build_card(&profile(), &view, "完成", Instant::now());
+        let card = build_card(&profile(), &view, "完成", Instant::now(), None);
         let text = serde_json::to_string(card.as_value()).unwrap();
         assert!(text.contains("已截断"));
     }

@@ -5,6 +5,7 @@
 //! updates, and persist the session so the next message can resume.
 
 pub mod agent_runner;
+pub mod callback;
 pub mod policy;
 pub mod render;
 pub mod run;
