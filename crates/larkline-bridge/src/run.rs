@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -16,7 +16,8 @@ use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
 };
 use larkline_core::{AppPaths, MessageReplyMode, ProfileConfig, SessionStore};
-use larkline_lark::{CARD_SAFE_AGE, Channel, STREAMING_ELEMENT_ID, StreamingCard};
+use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
+use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -176,6 +177,12 @@ impl Bridge {
 
     async fn run_agent(self: Arc<Self>, message: NormalizedMessage) -> anyhow::Result<()> {
         let started = Instant::now();
+        // Decorate the triggering message with the "Typing" reaction for as
+        // long as the run is live. Failures are logged and never fail the run;
+        // the guard removes the reaction from `Drop`, which also covers
+        // `/stop` aborting this task.
+        let _working_reaction =
+            WorkingReaction::start(self.channel.rest().clone(), message.message_id.clone());
         let chat_id = message.chat_id.clone();
         let cwd = self.cwd.clone();
         let cwd_str = cwd.to_string_lossy().into_owned();
@@ -475,6 +482,173 @@ impl Bridge {
     }
 }
 
+/// Lifecycle of the "working" reaction on the triggering message.
+///
+/// The add request is asynchronous and the run can end before it completes —
+/// notably `/stop`, which aborts the run task and skips every remaining
+/// `await`. This state machine decides who deletes the reaction: the run's
+/// cleanup normally, or the add task itself when it observes that the run is
+/// already over.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ReactionState {
+    /// No reaction was requested yet.
+    #[default]
+    Idle,
+    /// The add request is in flight; no reaction id is known yet.
+    Adding,
+    /// The reaction exists and must be deleted on cleanup.
+    Active(String),
+    /// The run ended while the add was in flight; the add task deletes it.
+    Abandoned,
+    /// Cleanup finished (or is owned by the add task).
+    Done,
+}
+
+impl ReactionState {
+    fn begin_add(&mut self) {
+        *self = Self::Adding;
+    }
+
+    /// Record the id returned by the add call.
+    ///
+    /// Returns `true` when the run already ended while the request was in
+    /// flight, so the caller must delete the reaction itself.
+    fn added(&mut self, reaction_id: &str) -> bool {
+        match self {
+            Self::Adding => {
+                *self = Self::Active(reaction_id.to_string());
+                false
+            }
+            // Abandoned, or an unexpected state: never leave a live reaction
+            // behind, so let the caller delete it right away.
+            _ => {
+                *self = Self::Done;
+                true
+            }
+        }
+    }
+
+    fn add_failed(&mut self) {
+        *self = Self::Done;
+    }
+
+    /// End the run and return the reaction id to delete now, if known.
+    ///
+    /// When the add is still in flight the state becomes [`Abandoned`] and
+    /// the add task is responsible for the deletion once it lands.
+    ///
+    /// [`Abandoned`]: ReactionState::Abandoned
+    fn finish(&mut self) -> Option<String> {
+        match std::mem::replace(self, Self::Done) {
+            Self::Active(reaction_id) => Some(reaction_id),
+            Self::Adding => {
+                *self = Self::Abandoned;
+                None
+            }
+            Self::Abandoned | Self::Idle | Self::Done => None,
+        }
+    }
+}
+
+/// Owns the "Typing" reaction for one run.
+///
+/// [`WorkingReaction::start`] launches the add without delaying the run; the
+/// id is remembered in shared state. Dropping the guard ends the decoration,
+/// so every exit path of [`Bridge::run_agent`] — success, error, timeout and
+/// task abort — is covered. `Drop` cannot await, so the delete is detached:
+/// it is best-effort, and a process exit before it runs can leave the
+/// reaction behind.
+struct WorkingReaction {
+    rest: RestClient,
+    message_id: String,
+    state: Arc<StdMutex<ReactionState>>,
+}
+
+impl WorkingReaction {
+    fn start(rest: RestClient, message_id: String) -> Self {
+        let guard = Self {
+            rest,
+            message_id,
+            state: Arc::new(StdMutex::new(ReactionState::default())),
+        };
+        lock_state(&guard.state).begin_add();
+
+        let rest = guard.rest.clone();
+        let message_id = guard.message_id.clone();
+        let state = Arc::clone(&guard.state);
+        tokio::spawn(async move {
+            match add_reaction(&rest, &message_id, TYPING).await {
+                Ok(reaction_id) => {
+                    tracing::debug!(
+                        message_id = %message_id,
+                        reaction_id = %reaction_id,
+                        "added working reaction"
+                    );
+                    let remove_now = lock_state(&state).added(&reaction_id);
+                    if remove_now {
+                        // The run ended before the add landed; clean up here.
+                        if let Err(err) = remove_reaction(&rest, &message_id, &reaction_id).await {
+                            tracing::warn!(
+                                error = %err,
+                                message_id = %message_id,
+                                "cannot remove working reaction"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    lock_state(&state).add_failed();
+                    tracing::warn!(
+                        error = %err,
+                        message_id = %message_id,
+                        "cannot add working reaction"
+                    );
+                }
+            }
+        });
+        guard
+    }
+}
+
+impl Drop for WorkingReaction {
+    fn drop(&mut self) {
+        let Some(reaction_id) = lock_state(&self.state).finish() else {
+            return;
+        };
+        let rest = self.rest.clone();
+        let message_id = self.message_id.clone();
+        let removal = async move {
+            if let Err(err) = remove_reaction(&rest, &message_id, &reaction_id).await {
+                tracing::warn!(
+                    error = %err,
+                    message_id = %message_id,
+                    "cannot remove working reaction"
+                );
+            }
+        };
+        // `/stop` aborts the run task, so this detached task is the only
+        // cleanup path available there.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(removal);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    message_id = %self.message_id,
+                    "no tokio runtime to remove working reaction"
+                );
+            }
+        }
+    }
+}
+
+/// Lock the reaction state, recovering the guard if a panic poisoned it.
+fn lock_state(state: &StdMutex<ReactionState>) -> std::sync::MutexGuard<'_, ReactionState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Build the card for the current view.
 fn build_card(
     profile: &ProfileConfig,
@@ -584,6 +758,41 @@ mod tests {
             agent_kind: AgentKind::Claude,
             ..ProfileConfig::default()
         }
+    }
+
+    #[test]
+    fn reaction_lifecycle_removes_once_on_normal_cleanup() {
+        let mut state = ReactionState::default();
+        state.begin_add();
+        assert!(!state.added("re_1"));
+        assert_eq!(state.finish(), Some("re_1".to_string()));
+        // Dropping the guard a second time must not delete anything.
+        assert_eq!(state.finish(), None);
+    }
+
+    #[test]
+    fn reaction_lifecycle_hands_cleanup_to_the_add_task_after_abort() {
+        let mut state = ReactionState::default();
+        state.begin_add();
+        // The run ended (e.g. `/stop` aborted the task) before the add landed.
+        assert_eq!(state.finish(), None);
+        // The add task must delete the reaction itself.
+        assert!(state.added("re_2"));
+        assert_eq!(state.finish(), None);
+    }
+
+    #[test]
+    fn reaction_lifecycle_ignores_failed_adds() {
+        let mut state = ReactionState::default();
+        state.begin_add();
+        state.add_failed();
+        assert_eq!(state.finish(), None);
+    }
+
+    #[test]
+    fn reaction_lifecycle_without_an_add_needs_no_cleanup() {
+        let mut state = ReactionState::default();
+        assert_eq!(state.finish(), None);
     }
 
     #[test]
