@@ -108,7 +108,25 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
                                 tracing::info!(%status, "card action handled");
                             }
                         }
-                        ChannelEvent::Unknown { .. } => {}
+                        ChannelEvent::Unknown { raw, .. } => {
+                            // The SDK types only messages and card actions.
+                            // Cloud-doc comment @-mentions
+                            // (`drive.notice.comment_add_v1`) arrive here with
+                            // the whole platform payload; hand them to the
+                            // comment flow, which parses that payload itself.
+                            if larkline_bridge::comments::is_file_comment_event(&raw) {
+                                tracing::info!("inbound file-comment event");
+                                // Detached on purpose: a comment run can take
+                                // minutes, and the event loop must keep
+                                // acknowledging frames and heartbeats.
+                                let bridge = Arc::clone(&bridge);
+                                tokio::spawn(async move {
+                                    bridge.handle_comment_event(&raw).await;
+                                });
+                            } else {
+                                tracing::debug!("ignoring unhandled event type");
+                            }
+                        }
                     }
                     Ok(WebSocketEventAck::ok())
                 }

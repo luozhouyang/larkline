@@ -49,7 +49,7 @@ use crate::render::RunView;
 /// stream would otherwise produce dozens of updates per second.
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
 /// Hard cap for one agent run.
-const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Cards over this many characters are truncated (CardKit caps JSON size).
 const MAX_CARD_CHARS: usize = 8_000;
 /// Quiet window before a batch of messages starts a run. The TypeScript bridge
@@ -71,7 +71,9 @@ pub struct Bridge {
     pub bot_name: Option<String>,
     paths: AppPaths,
     tokens: CallbackTokens,
-    sessions: Mutex<SessionStore>,
+    /// Sessions are keyed by chat id *or* by document scope for comment
+    /// runs — see [`crate::comments`].
+    pub(crate) sessions: Mutex<SessionStore>,
     workspaces: Mutex<WorkspaceStore>,
     /// Live run per chat. A run keeps its chat's pending scope blocked.
     active: StdMutex<HashMap<String, ActiveRun>>,
@@ -174,6 +176,19 @@ impl Bridge {
         }
 
         self.enqueue(message);
+    }
+
+    /// Handle a cloud-doc file-comment event the SDK could not type.
+    ///
+    /// The event arrives as [`lark_channel::event::ChannelEvent::Unknown`] and
+    /// keeps its full platform payload; parsing, gating, the agent run and the
+    /// reply into the comment thread live in [`crate::comments`].
+    ///
+    /// Callers spawn this instead of awaiting it: an agent run may take up to
+    /// [`RUN_TIMEOUT`], and the event loop must stay free to acknowledge
+    /// frames and answer heartbeats.
+    pub async fn handle_comment_event(self: &Arc<Self>, raw: &Value) {
+        crate::comments::handle_comment_mention(self, raw).await;
     }
 
     /// Queue a message for its chat and make sure the debounce driver runs.
@@ -470,8 +485,9 @@ impl Bridge {
     ///
     /// A `/cd` target that cannot be created (deleted, permissions, replaced
     /// by a file) is reported and the profile default is used instead, so the
-    /// run still has a chance to start.
-    async fn workspace_cwd(&self, chat_id: &str) -> PathBuf {
+    /// run still has a chance to start. Comment runs pass their document
+    /// scope as the key, so the same rules apply per document.
+    pub(crate) async fn workspace_cwd(&self, chat_id: &str) -> PathBuf {
         let (cwd, default) = {
             let workspaces = self.workspaces.lock().await;
             (

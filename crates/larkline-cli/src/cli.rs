@@ -59,9 +59,7 @@ pub enum Commands {
     /// List running bridge processes on this machine.
     Ps,
     /// Kill a running bridge process by short id or list index.
-    Kill {
-        target: String,
-    },
+    Kill { target: String },
 }
 
 #[derive(Debug, Args)]

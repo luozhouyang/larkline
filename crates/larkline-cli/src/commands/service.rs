@@ -13,8 +13,7 @@ use crate::daemon;
 fn context_and_spec(cli: &Cli) -> anyhow::Result<(AppContext, daemon::ServiceSpec)> {
     let ctx = AppContext::load(cli)?;
     let program = std::env::current_exe()?;
-    let spec =
-        daemon::ServiceSpec::for_profile(ctx.profile_name(), program, ctx.root_dir.clone())?;
+    let spec = daemon::ServiceSpec::for_profile(ctx.profile_name(), program, ctx.root_dir.clone())?;
     Ok((ctx, spec))
 }
 
@@ -37,7 +36,10 @@ pub fn start(cli: &Cli) -> anyhow::Result<()> {
     if daemon::status(&spec)?.running {
         let stopped = daemon::stop(&spec)?;
         if !stopped.ok {
-            eprintln!("warning: stop before start failed: {}", stopped.stderr.trim());
+            eprintln!(
+                "warning: stop before start failed: {}",
+                stopped.stderr.trim()
+            );
         }
         // launchd bootout is asynchronous; give it a moment before starting.
         let deadline = Instant::now() + Duration::from_secs(5);

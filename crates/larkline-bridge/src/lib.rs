@@ -6,6 +6,7 @@
 
 pub mod agent_runner;
 pub mod callback;
+pub mod comments;
 pub mod keepalive;
 pub mod pending;
 pub mod policy;
