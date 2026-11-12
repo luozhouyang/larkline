@@ -388,4 +388,208 @@ mod tests {
             }
         ));
     }
+
+    /// TS `translateEvent` builds a fresh translator per call; many of the
+    /// ported cases only need that stateless view.
+    fn translate(raw: Value) -> Vec<AgentEvent> {
+        ClaudeStreamTranslator::new().translate(&raw)
+    }
+
+    #[test]
+    fn init_without_optional_fields_has_no_thread_id() {
+        // Port of `translates system init metadata` (the partial identity
+        // branch): a Claude session id never leaks into Codex's thread field.
+        let events = translate(json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sess-1"
+        }));
+        assert_eq!(
+            events,
+            vec![AgentEvent::System {
+                session_id: Some("sess-1".into()),
+                thread_id: None,
+                cwd: None,
+                model: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn assistant_blocks_keep_text_thinking_and_tool_order() {
+        let events = translate(json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "text", "text": "hello" },
+                    { "type": "thinking", "thinking": "checking" },
+                    { "type": "tool_use", "id": "tool-1", "name": "Bash", "input": { "command": "pwd" } }
+                ]
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Text {
+                    delta: "hello".into()
+                },
+                AgentEvent::Thinking {
+                    delta: "checking".into()
+                },
+                AgentEvent::ToolUse {
+                    id: "tool-1".into(),
+                    name: "Bash".into(),
+                    input: json!({ "command": "pwd" }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn user_tool_results_cover_structured_output_and_error_flags() {
+        let events = translate(json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tool-1", "content": "ok" },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-2",
+                        "content": [{ "type": "text", "text": "bad" }],
+                        "is_error": true
+                    }
+                ]
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ToolResult {
+                    id: "tool-1".into(),
+                    output: "ok".into(),
+                    is_error: false,
+                },
+                AgentEvent::ToolResult {
+                    id: "tool-2".into(),
+                    // Non-string content is re-serialized as JSON, exactly like
+                    // `JSON.stringify(block.content)` in the TypeScript port.
+                    output: r#"[{"type":"text","text":"bad"}]"#.into(),
+                    is_error: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn result_without_usage_only_emits_done() {
+        let events = translate(json!({ "type": "result", "session_id": "sess-2" }));
+        assert_eq!(
+            events,
+            vec![AgentEvent::Done {
+                session_id: Some("sess-2".into()),
+                thread_id: None,
+                termination_reason: TerminationReason::Normal,
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_thinking_streams_and_the_duplicate_assistant_block_is_skipped() {
+        let mut translator = ClaudeStreamTranslator::new();
+        let raw_events = [
+            json!({
+                "type": "stream_event",
+                "event": { "type": "message_start", "message": { "id": "msg-1" } }
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "thinking_delta", "thinking": "first " }
+                }
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "thinking_delta", "thinking": "second" }
+                }
+            }),
+            // Partial text deltas are ignored; the completed assistant message
+            // is still the single source of user-visible text.
+            json!({
+                "type": "stream_event",
+                "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "ignored" } }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg-1",
+                    "content": [
+                        { "type": "thinking", "thinking": "first second" },
+                        { "type": "text", "text": "answer" }
+                    ]
+                }
+            }),
+        ];
+
+        let mut out = Vec::new();
+        for raw in raw_events {
+            out.extend(translator.translate(&raw));
+        }
+        assert_eq!(
+            out,
+            vec![
+                AgentEvent::Thinking {
+                    delta: "first ".into()
+                },
+                AgentEvent::Thinking {
+                    delta: "second".into()
+                },
+                AgentEvent::Text {
+                    delta: "answer".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn assistant_thinking_is_emitted_without_a_partial_delta() {
+        let events = translate(json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-2",
+                "content": [{ "type": "thinking", "thinking": "whole block" }]
+            }
+        }));
+        assert_eq!(
+            events,
+            vec![AgentEvent::Thinking {
+                delta: "whole block".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_empty_and_incomplete_raw_events_are_ignored() {
+        assert!(translate(Value::Null).is_empty());
+        // Empty text blocks never produce a visible delta.
+        assert!(
+            translate(json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "text", "text": "" }] }
+            }))
+            .is_empty()
+        );
+        // tool_use without a name is incomplete and dropped.
+        assert!(
+            translate(json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "id": "t" }] }
+            }))
+            .is_empty()
+        );
+        // Only the `init` system subtype is a session announcement.
+        assert!(translate(json!({ "type": "system", "subtype": "other" })).is_empty());
+    }
 }

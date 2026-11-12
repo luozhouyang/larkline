@@ -200,4 +200,182 @@ mod tests {
         assert_eq!(view.best_answer(), "boom");
         assert!(view.finished);
     }
+
+    fn applied(events: &[AgentEvent]) -> RunView {
+        let mut view = RunView::default();
+        for event in events {
+            view.apply(event);
+        }
+        view
+    }
+
+    fn text(delta: &str) -> AgentEvent {
+        AgentEvent::Text {
+            delta: delta.into(),
+        }
+    }
+
+    fn thinking(delta: &str) -> AgentEvent {
+        AgentEvent::Thinking {
+            delta: delta.into(),
+        }
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    fn tool_result(id: &str, output: &str, is_error: bool) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: id.into(),
+            output: output.into(),
+            is_error,
+        }
+    }
+
+    fn done(reason: TerminationReason) -> AgentEvent {
+        AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: reason,
+        }
+    }
+
+    #[test]
+    fn initial_view_is_running_and_empty() {
+        let view = RunView::default();
+        assert_eq!(view.best_answer(), "");
+        assert!(view.reasoning.is_empty());
+        assert!(view.tools.is_empty());
+        assert_eq!(view.tool_errors, 0);
+        assert!(view.session_key().is_none());
+        assert!(view.error.is_none());
+        assert_eq!(view.termination, None);
+        assert!(!view.finished);
+        assert_eq!(view.footer(std::time::Duration::ZERO), "0.0s");
+    }
+
+    #[test]
+    fn folds_thinking_before_and_after_the_answer() {
+        let mut view = applied(&[thinking("checking options")]);
+        assert_eq!(view.reasoning, "checking options");
+        assert!(!view.finished);
+
+        view.apply(&text("final answer"));
+        view.apply(&done(TerminationReason::Normal));
+        assert_eq!(view.reasoning, "checking options");
+        assert_eq!(view.best_answer(), "final answer");
+        assert_eq!(view.termination, Some(TerminationReason::Normal));
+        assert!(view.finished);
+    }
+
+    #[test]
+    fn folds_tool_running_done_and_error_states() {
+        let running = applied(&[tool_use("tool-1", "Bash", json!({ "command": "pwd" }))]);
+        assert_eq!(running.tools, vec!["Bash: pwd"]);
+        assert_eq!(running.tool_errors, 0);
+        assert!(!running.finished);
+        assert!(
+            running
+                .footer(std::time::Duration::from_secs(1))
+                .contains("1 tool call(s)")
+        );
+
+        let completed = applied(&[
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_result("tool-1", "/repo", false),
+            done(TerminationReason::Normal),
+        ]);
+        assert_eq!(completed.tool_errors, 0);
+        assert_eq!(completed.termination, Some(TerminationReason::Normal));
+        assert!(completed.finished);
+
+        let failed = applied(&[
+            tool_use("tool-2", "Read", json!({ "file_path": "/missing.ts" })),
+            tool_result("tool-2", "ENOENT", true),
+            done(TerminationReason::Normal),
+        ]);
+        assert_eq!(failed.tool_errors, 1);
+        assert!(
+            failed
+                .footer(std::time::Duration::from_secs(1))
+                .contains("1 failed")
+        );
+        assert!(failed.finished);
+    }
+
+    #[test]
+    fn keeps_consecutive_tool_calls_in_order() {
+        let events = [
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_result("tool-1", "/repo", false),
+            tool_use("tool-2", "Read", json!({ "file_path": "/repo/a.ts" })),
+            tool_result("tool-2", "a", false),
+            tool_use("tool-3", "Edit", json!({ "file_path": "/repo/a.ts" })),
+        ];
+        let running = applied(&events);
+        assert_eq!(
+            running.tools,
+            vec!["Bash: pwd", "Read: /repo/a.ts", "Edit: /repo/a.ts"]
+        );
+        assert_eq!(running.tool_errors, 0);
+        assert!(!running.finished);
+
+        let mut with_result = events.to_vec();
+        with_result.push(tool_result("tool-3", "ok", false));
+        with_result.push(done(TerminationReason::Normal));
+        let completed = applied(&with_result);
+        assert_eq!(completed.tools.len(), 3);
+        assert_eq!(completed.tool_errors, 0);
+        assert!(completed.finished);
+    }
+
+    #[test]
+    fn records_done_error_interrupted_and_idle_timeout_terminals() {
+        let finished = applied(&[done(TerminationReason::Normal)]);
+        assert_eq!(finished.termination, Some(TerminationReason::Normal));
+        assert!(finished.finished);
+
+        let failed = applied(&[AgentEvent::Error {
+            message: "process failed".into(),
+            termination_reason: TerminationReason::Failed,
+        }]);
+        assert_eq!(failed.best_answer(), "process failed");
+        assert_eq!(failed.error.as_deref(), Some("process failed"));
+        assert_eq!(failed.termination, Some(TerminationReason::Failed));
+        assert!(failed.finished);
+
+        let interrupted = applied(&[text("partial"), done(TerminationReason::Interrupted)]);
+        assert_eq!(interrupted.best_answer(), "partial");
+        assert_eq!(
+            interrupted.termination,
+            Some(TerminationReason::Interrupted)
+        );
+        assert!(interrupted.finished);
+
+        let timed_out = applied(&[AgentEvent::Error {
+            message: "run timed out".into(),
+            termination_reason: TerminationReason::Timeout,
+        }]);
+        assert_eq!(timed_out.termination, Some(TerminationReason::Timeout));
+        assert!(timed_out.finished);
+    }
+
+    #[test]
+    fn keeps_local_paths_in_answers_and_tool_lines() {
+        let path = "/Users/example/private/customer/repo/secret.txt";
+        let view = applied(&[
+            text(&format!("I read {path}")),
+            tool_use("tool-1", "Read", json!({ "file_path": path })),
+            tool_result("tool-1", &format!("content from {path}"), false),
+            done(TerminationReason::Normal),
+        ]);
+
+        assert!(view.best_answer().contains(path));
+        assert_eq!(view.tools, vec![format!("Read: {path}")]);
+    }
 }

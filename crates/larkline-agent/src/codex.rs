@@ -369,6 +369,12 @@ impl CodexJsonlTranslator {
     }
 
     fn queue_agent_message(&mut self, message: String) -> Vec<AgentEvent> {
+        // The TypeScript translator gates on truthiness (`message ? … : []`),
+        // so an empty message is "absent": it must neither replace the pending
+        // final answer nor flush it as commentary.
+        if message.is_empty() {
+            return Vec::new();
+        }
         if self.pending_agent_message.as_deref() == Some(message.as_str()) {
             return Vec::new();
         }
@@ -496,6 +502,191 @@ mod tests {
     }
 
     #[test]
+    fn fresh_exec_argv_matches_the_typescript_contract() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::ReadOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_codex_args(&input).unwrap(),
+            vec![
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "shell_environment_policy.inherit=\"all\"",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_argv_matches_the_typescript_contract() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            thread_id: Some("thread-123".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_codex_args(&input).unwrap(),
+            vec![
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "shell_environment_policy.inherit=\"all\"",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
+                "resume",
+                "--json",
+                "thread-123",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn danger_full_access_is_allowed_for_claude_bridge_parity() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::DangerFullAccess,
+            ..Default::default()
+        };
+        assert!(
+            build_codex_args(&input)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "danger-full-access")
+        );
+    }
+
+    #[test]
+    fn fresh_exec_with_images_matches_the_typescript_contract() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            images: vec!["/tmp/image.png".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_codex_args(&input).unwrap(),
+            vec![
+                "exec",
+                "--json",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "shell_environment_policy.inherit=\"all\"",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
+                "--image",
+                "/tmp/image.png",
+                "--",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_with_images_matches_the_typescript_contract() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            thread_id: Some("thread-123".into()),
+            images: vec!["/tmp/image.png".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_codex_args(&input).unwrap(),
+            vec![
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "shell_environment_policy.inherit=\"all\"",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
+                "resume",
+                "--json",
+                "--image",
+                "/tmp/image.png",
+                "thread-123",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_is_a_global_flag_before_resume() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            thread_id: Some("thread-123".into()),
+            model: Some("gpt-5-codex".into()),
+            ..Default::default()
+        };
+        let args = build_codex_args(&input).unwrap();
+        let model = args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("--model is present");
+        assert_eq!(args[model + 1], "gpt-5-codex");
+        assert!(model < args.iter().position(|arg| arg == "resume").unwrap());
+    }
+
+    #[test]
+    fn model_is_omitted_when_not_selected() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::ReadOnly,
+            ..Default::default()
+        };
+        assert!(
+            !build_codex_args(&input)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--model")
+        );
+    }
+
+    #[test]
+    fn ignore_user_config_is_explicit_when_requested() {
+        let input = CodexArgsInput {
+            cwd: "/repo".into(),
+            sandbox: SandboxMode::ReadOnly,
+            ignore_user_config: true,
+            ..Default::default()
+        };
+        assert!(
+            build_codex_args(&input)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--ignore-user-config")
+        );
+    }
+
+    #[test]
     fn thread_started_reports_id() {
         let mut t = CodexJsonlTranslator::new();
         let events = t.translate(&json!({ "type": "thread.started", "thread_id": "th-1" }));
@@ -612,5 +803,586 @@ mod tests {
         assert!(t.translate(&json!({ "type": "future.event" })).is_empty());
         assert_eq!(t.unknown_events(), 1);
         assert!(!t.terminal_emitted());
+    }
+
+    #[test]
+    fn translates_thread_text_tool_usage_and_completion_events() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({ "type": "thread.started", "thread_id": "thread-1" })),
+            vec![AgentEvent::System {
+                session_id: None,
+                thread_id: Some("thread-1".into()),
+                cwd: None,
+                model: None,
+            }]
+        );
+        assert!(t.translate(&json!({ "type": "turn.started" })).is_empty());
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.started",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "command_execution",
+                    "command": "pwd"
+                }
+            })),
+            vec![AgentEvent::ToolUse {
+                id: "cmd-1".into(),
+                name: "command_execution".into(),
+                input: json!({ "command": "pwd" }),
+            }]
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "command_execution",
+                    "output": "/repo\n",
+                    "exit_code": 0
+                }
+            })),
+            vec![AgentEvent::ToolResult {
+                id: "cmd-1".into(),
+                output: "/repo\n".into(),
+                is_error: false,
+            }]
+        );
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "hello" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 34,
+                    "cached_input_tokens": 5,
+                    "reasoning_output_tokens": 7
+                }
+            })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "hello".into()
+                },
+                AgentEvent::Usage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(34),
+                    cached_input_tokens: Some(5),
+                    reasoning_output_tokens: Some(7),
+                    cost_usd: None,
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: Some("thread-1".into()),
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_events_never_carry_claude_session_ids() {
+        let mut t = CodexJsonlTranslator::new();
+        let system = t
+            .translate(&json!({ "type": "thread.started", "thread_id": "thread-1" }))
+            .remove(0);
+        let done = t
+            .translate(&json!({ "type": "turn.completed" }))
+            .pop()
+            .unwrap();
+
+        assert!(matches!(
+            system,
+            AgentEvent::System {
+                session_id: None,
+                thread_id: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            done,
+            AgentEvent::Done {
+                session_id: None,
+                thread_id: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_agent_message_items_become_the_final_text() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "msg-1",
+                    "type": "agent_message",
+                    "text": "hello from item"
+                }
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "hello from item".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: None,
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_agent_messages_are_ignored() {
+        // Parity check derived from the TS truthiness guards: an empty message
+        // is absent, so it neither becomes the final answer nor clobbers one.
+        let mut t = CodexJsonlTranslator::new();
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "empty-1", "type": "agent_message", "text": "" }
+            }))
+            .is_empty()
+        );
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "progress" }))
+                .is_empty()
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "empty-2", "type": "agent_message", "text": "" }
+            }))
+            .is_empty()
+        );
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "progress".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: None,
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_items_become_thinking_deltas() {
+        let mut t = CodexJsonlTranslator::new();
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "text": "checking the repository layout"
+                }
+            })),
+            vec![AgentEvent::Thinking {
+                delta: "checking the repository layout".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn reasoning_without_text_is_ignored() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-empty", "type": "reasoning", "text": "" }
+            }))
+            .is_empty()
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-missing", "type": "reasoning" }
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_same_reasoning_is_emitted_once_across_protocol_variants() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-dup", "type": "reasoning", "text": "same thought" }
+            })),
+            vec![AgentEvent::Thinking {
+                delta: "same thought".into()
+            }]
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-dup", "type": "reasoning_summary", "summary": "same thought" }
+            }))
+            .is_empty()
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "type": "reasoning", "text": "same thought" }
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn distinct_reasoning_ids_with_identical_text_are_not_deduped() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-a", "type": "reasoning", "text": "same thought" }
+            })),
+            vec![AgentEvent::Thinking {
+                delta: "same thought".into()
+            }]
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-b", "type": "reasoning", "text": "same thought" }
+            })),
+            vec![AgentEvent::Thinking {
+                delta: "same thought".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn reasoning_is_emitted_before_a_following_agent_message() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "reasoning-first", "type": "reasoning", "text": "thinking first" }
+            })),
+            vec![AgentEvent::Thinking {
+                delta: "thinking first".into()
+            }]
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "msg-after-reasoning", "type": "agent_message", "text": "answer" }
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "answer".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: None,
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_announced_twice_is_one_message() {
+        // Some builds emit the same text both as a raw event and as a completed
+        // item. Without this, copy #1 streams as commentary and copy #2 comes
+        // back as the final answer — the user reads the same reply twice.
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": { "id": "msg-1", "type": "agent_message", "text": "hello world" }
+            }))
+            .is_empty()
+        );
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "hello world" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "hello world".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: None,
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn earlier_agent_messages_stream_and_the_last_is_the_final_answer() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "progress one" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "agent_message", "message": "progress two" })),
+            vec![AgentEvent::Text {
+                delta: "progress one".into()
+            }]
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.started",
+                "item": { "id": "cmd-after-progress", "type": "command_execution", "command": "pwd" }
+            })),
+            vec![
+                AgentEvent::Text {
+                    delta: "progress two".into()
+                },
+                AgentEvent::ToolUse {
+                    id: "cmd-after-progress".into(),
+                    name: "command_execution".into(),
+                    input: json!({ "command": "pwd" }),
+                },
+            ]
+        );
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "final answer" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "final answer".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: None,
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_command_exit_code_is_a_successful_result() {
+        let mut t = CodexJsonlTranslator::new();
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-no-code",
+                    "type": "command_execution",
+                    "output": "done"
+                }
+            })),
+            vec![AgentEvent::ToolResult {
+                id: "cmd-no-code".into(),
+                output: "done".into(),
+                is_error: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_is_one_terminal_error() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({
+                "type": "turn.failed",
+                "error": { "message": "command denied" }
+            })),
+            vec![AgentEvent::Error {
+                message: "command denied".into(),
+                termination_reason: TerminationReason::Failed,
+            }]
+        );
+        assert!(
+            t.translate(&json!({ "type": "error", "message": "late raw error" }))
+                .is_empty()
+        );
+        assert!(t.finish(CodexFinishReason::Failed).is_empty());
+    }
+
+    #[test]
+    fn raw_error_events_are_non_terminal_so_retries_can_continue() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert_eq!(
+            t.translate(&json!({ "type": "thread.started", "thread_id": "thread-retry" })),
+            vec![AgentEvent::System {
+                session_id: None,
+                thread_id: Some("thread-retry".into()),
+                cwd: None,
+                model: None,
+            }]
+        );
+        assert!(
+            t.translate(&json!({
+                "type": "error",
+                "error": { "message": "Reconnecting... 2/5 (timeout waiting for child process to exit)" }
+            }))
+            .is_empty()
+        );
+        assert!(!t.terminal_emitted());
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "after retry" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({ "type": "turn.completed" })),
+            vec![
+                AgentEvent::FinalText {
+                    content: "after retry".into()
+                },
+                AgentEvent::Done {
+                    session_id: None,
+                    thread_id: Some("thread-retry".into()),
+                    termination_reason: TerminationReason::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_failed_stays_terminal_after_a_raw_error() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({ "type": "error", "message": "Reconnecting... 2/5" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "turn.failed",
+                "error": { "message": "model stopped" }
+            })),
+            vec![AgentEvent::Error {
+                message: "model stopped".into(),
+                termination_reason: TerminationReason::Failed,
+            }]
+        );
+        assert!(t.terminal_emitted());
+        assert!(
+            t.translate(&json!({ "type": "agent_message", "message": "too late" }))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn finish_preserves_the_latest_raw_error_detail() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({ "type": "error", "message": "transport failed" }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.finish(CodexFinishReason::Failed),
+            vec![AgentEvent::Error {
+                message: "codex stream ended before a terminal event: transport failed".into(),
+                termination_reason: TerminationReason::Failed,
+            }]
+        );
+    }
+
+    #[test]
+    fn protocol_drift_counts_unknown_and_anomalous_events() {
+        let mut t = CodexJsonlTranslator::new();
+
+        assert!(
+            t.translate(&json!({ "type": "unknown.future", "value": 1 }))
+                .is_empty()
+        );
+        assert_eq!(
+            t.translate(&json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-late",
+                    "type": "command_execution",
+                    "output": "late",
+                    "exit_code": 1
+                }
+            })),
+            vec![AgentEvent::ToolResult {
+                id: "cmd-late".into(),
+                output: "late".into(),
+                is_error: true,
+            }]
+        );
+        assert_eq!(t.unknown_events(), 1);
+        // The tool result arrived without a matching `item.started`.
+        assert_eq!(t.anomalies(), 1);
+    }
+
+    #[test]
+    fn eof_without_a_terminal_event_fails_once() {
+        let mut t = CodexJsonlTranslator::new();
+        let _ = t.translate(&json!({ "type": "thread.started", "thread_id": "thread-1" }));
+
+        assert_eq!(
+            t.finish(CodexFinishReason::Failed),
+            vec![AgentEvent::Error {
+                message: "codex stream ended before a terminal event".into(),
+                termination_reason: TerminationReason::Failed,
+            }]
+        );
+        assert!(t.finish(CodexFinishReason::Failed).is_empty());
+    }
+
+    #[test]
+    fn stop_and_timeout_override_the_eof_terminal_reason() {
+        let mut stopped = CodexJsonlTranslator::new();
+        let _ = stopped.translate(&json!({ "type": "thread.started", "thread_id": "thread-stop" }));
+        assert_eq!(
+            stopped.finish(CodexFinishReason::Interrupted),
+            vec![AgentEvent::Done {
+                session_id: None,
+                thread_id: Some("thread-stop".into()),
+                termination_reason: TerminationReason::Interrupted,
+            }]
+        );
+
+        let mut timed_out = CodexJsonlTranslator::new();
+        let _ = timed_out
+            .translate(&json!({ "type": "thread.started", "thread_id": "thread-timeout" }));
+        assert_eq!(
+            timed_out.finish(CodexFinishReason::Timeout),
+            vec![AgentEvent::Done {
+                session_id: None,
+                thread_id: Some("thread-timeout".into()),
+                termination_reason: TerminationReason::Timeout,
+            }]
+        );
     }
 }

@@ -140,4 +140,104 @@ mod tests {
         assert_eq!(truncate_chars("小助手", 2), "小助…");
         assert_eq!(truncate_chars("ok", 5), "ok");
     }
+
+    #[test]
+    fn system_and_done_carry_claude_session_and_codex_thread_ids() {
+        // Port of the TS type contract: both id flavors are optional and
+        // independent, so one event can carry either or both.
+        let system = AgentEvent::System {
+            session_id: Some("sess-1".into()),
+            thread_id: Some("thread-1".into()),
+            cwd: Some("/repo".into()),
+            model: Some("sonnet".into()),
+        };
+        match &system {
+            AgentEvent::System {
+                session_id,
+                thread_id,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(thread_id.as_deref(), Some("thread-1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let done = AgentEvent::Done {
+            session_id: Some("sess-1".into()),
+            thread_id: Some("thread-1".into()),
+            termination_reason: TerminationReason::Normal,
+        };
+        match &done {
+            AgentEvent::Done {
+                session_id,
+                thread_id,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(thread_id.as_deref(), Some("thread-1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Usage cost is optional, and missing counters are reported as zero.
+        let usage_with_cost = AgentEvent::Usage {
+            input_tokens: Some(12),
+            output_tokens: Some(34),
+            cached_input_tokens: Some(5),
+            reasoning_output_tokens: None,
+            cost_usd: Some(0.1234),
+        };
+        match &usage_with_cost {
+            AgentEvent::Usage {
+                cost_usd: Some(cost),
+                ..
+            } => assert!((cost - 0.1234).abs() < f64::EPSILON),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(usage_total_tokens(&usage_with_cost), Some(46));
+        assert_eq!(
+            usage_total_tokens(&AgentEvent::Usage {
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                reasoning_output_tokens: None,
+                cost_usd: None,
+            }),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn terminal_events_carry_a_termination_reason() {
+        // Port of the TS contract that `done`/`error` require a termination
+        // reason. Rust makes this structural: the field is not an Option, so
+        // every reason round-trips through both terminal variants.
+        for reason in [
+            TerminationReason::Normal,
+            TerminationReason::Failed,
+            TerminationReason::Interrupted,
+            TerminationReason::Timeout,
+        ] {
+            match (AgentEvent::Done {
+                session_id: None,
+                thread_id: None,
+                termination_reason: reason,
+            }) {
+                AgentEvent::Done {
+                    termination_reason, ..
+                } => assert_eq!(termination_reason, reason),
+                other => panic!("unexpected: {other:?}"),
+            }
+            match (AgentEvent::Error {
+                message: "boom".into(),
+                termination_reason: reason,
+            }) {
+                AgentEvent::Error {
+                    termination_reason, ..
+                } => assert_eq!(termination_reason, reason),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
 }
