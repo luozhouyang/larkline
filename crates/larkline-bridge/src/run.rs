@@ -27,12 +27,16 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use lark_channel::event::CardActionEvent;
-use lark_channel::message::{MessageChatType, MessageSenderType, NormalizedMessage, Recipient};
+use lark_channel::message::{
+    MessageChatType, MessageSenderInfo, MessageSenderType, NormalizedMessage, Recipient,
+};
 use larkline_agent::{
     AgentEvent, PromptContext, PromptMention, SandboxMode, TerminationReason, build_agent_prompt,
 };
 use larkline_core::{
-    AppPaths, MessageReplyMode, ProfileConfig, SessionStore, TenantBrand, WorkspaceStore,
+    AppPaths, CoreError, MessageReplyMode, Preferences, ProfileConfig, SessionStore, TenantBrand,
+    WorkspaceStore,
+    config::{ProfileMode, ReasoningDisplay},
 };
 use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
 use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
@@ -41,11 +45,12 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
-use crate::callback::CallbackTokens;
+use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
 use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
 use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
 use crate::render::RunView;
+use crate::text_render::{TextFormat, TextRenderOptions, render_text};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
@@ -65,6 +70,23 @@ const DEBOUNCE: Duration = Duration::from_millis(600);
 /// logged; [`QueueLimits::unbounded`] restores exact TS semantics.
 const MAX_PENDING_PER_SCOPE: usize = 100;
 
+/// Marker the bridge (and bridge-aware agents) put on callback button values.
+const BRIDGE_CALLBACK_MARKER: &str = crate::callback::BRIDGE_CALLBACK_MARKER;
+/// Token field of an agent-rendered callback button.
+const BRIDGE_TOKEN_FIELD: &str = crate::callback::BRIDGE_TOKEN_FIELD;
+/// Action bound into v1 tokens for agent-rendered callbacks.
+const AGENT_CALLBACK_ACTION: &str = crate::callback::AGENT_CALLBACK_ACTION;
+
+/// `/config` usage text (also returned for unknown keys/values).
+const CONFIG_USAGE: &str = "用法：\n\
+     /config 查看当前配置\n\
+     /config set messageReply <card|markdown|text>\n\
+     /config set showToolCalls <true|false>\n\
+     （修改需管理员；maxConcurrentRuns 当前只读）";
+
+/// Reply for a `/config set` from a sender outside the admin gate.
+const CONFIG_DENIED_REPLY: &str = "❌ 只有管理员可以修改配置。";
+
 pub struct Bridge {
     pub channel: Channel,
     pub profile: ProfileConfig,
@@ -73,6 +95,14 @@ pub struct Bridge {
     pub bot_name: Option<String>,
     paths: AppPaths,
     tokens: CallbackTokens,
+    /// Verifier for agent-rendered (lark-cli signed) card callbacks. `None`
+    /// when no callback key is configured: those clicks are then rejected.
+    callback_auth: Option<CallbackAuth>,
+    /// Live profile used by the run flow. `/config set` persists to
+    /// `config.json` and swaps this snapshot, so preference changes apply
+    /// without a restart. The public `profile` field stays the startup
+    /// snapshot for modules that only need the agent identity/kind.
+    live_profile: StdMutex<ProfileConfig>,
     /// Sessions are keyed by chat id *or* by document scope for comment
     /// runs — see [`crate::comments`].
     pub(crate) sessions: Mutex<SessionStore>,
@@ -144,6 +174,16 @@ impl Bridge {
         let workspaces = WorkspaceStore::load_with_default(&paths.workspaces_file, &default_dir)
             .with_context(|| format!("cannot load {}", paths.workspaces_file.display()))?;
 
+        let callback_auth = CallbackAuth::from_profile(&profile);
+        if callback_auth.is_none() {
+            tracing::info!(
+                "agent card callbacks are disabled: no callback key configured \
+                 (profile extra.callback.secret or {})",
+                crate::callback::CALLBACK_SECRET_ENV
+            );
+        }
+        let live_profile = profile.clone();
+
         Ok(Self {
             channel,
             profile,
@@ -152,6 +192,8 @@ impl Bridge {
             bot_name,
             paths,
             tokens: CallbackTokens::new(),
+            callback_auth,
+            live_profile: StdMutex::new(live_profile),
             sessions: Mutex::new(sessions),
             workspaces: Mutex::new(workspaces),
             active: StdMutex::new(HashMap::new()),
@@ -173,7 +215,8 @@ impl Bridge {
     /// already live (returns `true` then). The manager is stopped and its
     /// meetings are left by [`Bridge::stop_meeting`].
     pub fn start_meeting(self: &Arc<Self>) -> bool {
-        let config = meeting::config_from_profile(&self.profile);
+        let profile = self.live_profile();
+        let config = meeting::config_from_profile(&profile);
         if !config.enabled {
             return false;
         }
@@ -194,7 +237,7 @@ impl Bridge {
         // The CLI routes `vc.bot.*` frames off its long connection, so the push
         // lane is wired; `received` only moves once a frame actually arrives.
         let agent = AgentSettings {
-            kind: self.profile.agent_kind,
+            kind: profile.agent_kind,
             binary: self.agent_binary.clone(),
             bot_open_id: self
                 .bot_open_id
@@ -254,16 +297,13 @@ impl Bridge {
         message: &NormalizedMessage,
         args: &str,
     ) -> String {
-        let config = meeting::config_from_profile(&self.profile);
+        let profile = self.live_profile();
+        let config = meeting::config_from_profile(&profile);
         if !config.enabled {
             return meeting::MEETING_DISABLED_REPLY.to_string();
         }
-        let sender_id = if message.sender.open_id.is_empty() {
-            message.sender_id.as_str()
-        } else {
-            message.sender.open_id.as_str()
-        };
-        if !meeting::can_run_meeting_command(&self.profile, sender_id) {
+        let sender_id = message_sender_id(message);
+        if !meeting::can_run_meeting_command(&profile, sender_id) {
             tracing::info!(command = "/meeting", "admin-deny");
             return meeting::MEETING_DENIED_REPLY.to_string();
         }
@@ -282,8 +322,63 @@ impl Bridge {
         self.paths.sessions_file.as_path()
     }
 
+    /// Current profile snapshot: the startup profile, replaced by
+    /// [`Bridge::save_preference`] after `/config set` writes `config.json`.
+    fn live_profile(&self) -> ProfileConfig {
+        lock(&self.live_profile).clone()
+    }
+
+    /// Persist one `/config set` preference to the root config file and reload
+    /// the in-memory profile from it.
+    ///
+    /// The write goes through the shared config lock + atomic replace, so a
+    /// concurrently running TypeScript bridge (or another `larkline` process)
+    /// cannot interleave with it.
+    fn save_preference(&self, edit: PreferenceEdit) -> Result<(), String> {
+        let config_file = self.paths.config_file.clone();
+        let profile_name = self.paths.profile.clone();
+        larkline_core::store::with_config_lock(&config_file, |root| {
+            let profile = root.profiles.get_mut(&profile_name).ok_or_else(|| {
+                CoreError::Message(format!("unknown profile: {profile_name}"))
+            })?;
+            let preferences = profile.preferences.get_or_insert_with(Preferences::default);
+            match edit {
+                PreferenceEdit::MessageReply(mode) => {
+                    preferences.message_reply = Some(mode);
+                    // Without this flag `ProfileConfig::message_reply` keeps
+                    // coercing `text` back to `markdown` (pre-0.1.27 compat).
+                    preferences.message_reply_migrated = Some(true);
+                }
+                PreferenceEdit::ShowToolCalls(show) => preferences.show_tool_calls = Some(show),
+            }
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+        self.reload_profile()
+    }
+
+    /// Re-read this bridge's profile from the root config into the live
+    /// snapshot. Leaves the old snapshot untouched on any failure.
+    fn reload_profile(&self) -> Result<(), String> {
+        let root = larkline_core::store::load_root(&self.paths.config_file)
+            .map_err(|err| err.to_string())?;
+        let profile = root
+            .as_ref()
+            .and_then(|root| root.profile(&self.paths.profile))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} 中没有 profile {}",
+                    self.paths.config_file.display(),
+                    self.paths.profile
+                )
+            })?;
+        *lock(&self.live_profile) = profile;
+        Ok(())
+    }
+
     pub async fn handle_message(self: &Arc<Self>, message: NormalizedMessage) {
-        if !policy::allowed(&self.profile, &message, self.bot_open_id.as_deref()) {
+        if !policy::allowed(&self.live_profile(), &message, self.bot_open_id.as_deref()) {
             return;
         }
         let text = message.text.trim().to_string();
@@ -517,12 +612,14 @@ impl Bridge {
             "/pwd" => Some(self.handle_pwd(&message.chat_id).await),
             "/status" => Some(self.handle_status(&message.chat_id).await),
             "/meeting" => Some(self.handle_meeting_command(message, args).await),
+            "/config" => Some(self.handle_config(message, args).await),
             "/help" => Some(
                 "可用命令：\n\
                  /new 或 /reset 开启新会话\n\
                  /cd <绝对路径> 切换工作目录\n\
                  /pwd 显示当前工作目录\n\
                  /status 显示当前状态\n\
+                 /config 查看/修改回复偏好（修改需管理员）\n\
                  /stop 中断当前任务\n\
                  /meeting 会议智能体（入会/离会/纪要，需管理员）\n\
                  /help 显示帮助"
@@ -564,7 +661,8 @@ impl Bridge {
             sessions.resume_for(chat_id, &cwd_str).map(str::to_string)
         };
 
-        let app = self.profile.app();
+        let profile = self.live_profile();
+        let app = profile.app();
         let app_id = app.map(|app| app.id.as_str()).unwrap_or("(未配置)");
         let tenant = app
             .map(|app| tenant_label(app.tenant))
@@ -584,48 +682,199 @@ impl Bridge {
              reply mode: {}\n\
              session: {session}",
             self.paths.profile,
-            self.profile.agent_kind.display_name(),
+            profile.agent_kind.display_name(),
             cwd.display(),
-            reply_mode_label(self.profile.message_reply()),
+            reply_mode_label(profile.message_reply()),
         )
     }
 
-    /// Handle a click on a bridge-rendered button.
+    /// `/config` and `/config set <key> <value>`.
     ///
-    /// Returns a short user-facing status when the click was ours, `None` for
-    /// foreign callbacks (agent-sent cards) which are not forwarded yet.
-    pub async fn handle_card_action(&self, action: &CardActionEvent) -> Option<String> {
+    /// The TypeScript command opens a CardKit form with every preference; the
+    /// Rust bridge implements the text subset the run flow consumes. Reads are
+    /// open to any user the message policy already admitted. Writes reuse the
+    /// `/meeting` admin gate (`access.admins`, or `access.allowed_users` while
+    /// the admin list is empty — the Rust bridge has no runtime-owner
+    /// discovery), then persist to the root config and reload the live profile.
+    async fn handle_config(&self, message: &NormalizedMessage, args: &str) -> String {
+        let mut words = args.split_whitespace();
+        match words.next() {
+            None => self.render_config(),
+            Some("set") => {
+                let key = words.next().unwrap_or_default();
+                let value = words.next().unwrap_or_default();
+                if words.next().is_some() {
+                    return CONFIG_USAGE.to_string();
+                }
+                let edit = match parse_config_set(key, value) {
+                    Ok(edit) => edit,
+                    Err(reply) => return reply,
+                };
+                let sender_id = message_sender_id(message);
+                if !meeting::can_run_meeting_command(&self.live_profile(), sender_id) {
+                    tracing::info!(command = "/config set", key, "admin-deny");
+                    return CONFIG_DENIED_REPLY.to_string();
+                }
+                match self.save_preference(edit) {
+                    Ok(()) => format!("✓ 已保存 {key} = {value}（已立即生效）"),
+                    Err(err) => format!("保存配置失败：{err}"),
+                }
+            }
+            Some(_) => CONFIG_USAGE.to_string(),
+        }
+    }
+
+    /// `/config` reply body.
+    fn render_config(&self) -> String {
+        let profile = self.live_profile();
+        format!(
+            "⚙️ 当前配置（profile: {}）\n\
+             messageReply: {}\n\
+             showToolCalls: {}\n\
+             maxConcurrentRuns: {}\n\n\
+             {CONFIG_USAGE}",
+            self.paths.profile,
+            reply_mode_label(profile.message_reply()),
+            profile.show_tool_calls(),
+            profile.max_concurrent_runs(),
+        )
+    }
+
+    /// Handle a click on a card button.
+    ///
+    /// Two contracts are served:
+    ///
+    /// * **bridge-rendered buttons** (`action` + `scope` + process-local
+    ///   `token`), notably the stop button: the click aborts the run and drops
+    ///   the batch queued while it was live;
+    /// * **agent-rendered callbacks** (`__bridge_cb: true` + a v1
+    ///   `bridge_token`): after verification the markers are stripped and the
+    ///   rest of the value is queued as a `[card-click] {…}` message in the
+    ///   same chat scope, so the agent resumes its session with the click as a
+    ///   follow-up user message.
+    ///
+    /// Returns a short user-facing status when the bridge handled the click
+    /// itself; `None` for forwarded callbacks (the agent replies) and for
+    /// foreign clicks.
+    pub async fn handle_card_action(self: &Arc<Self>, action: &CardActionEvent) -> Option<String> {
         let value = action.action.value.as_object()?;
-        if value.get("__bridge_cb").and_then(|v| v.as_bool()) != Some(true) {
+        if value.get(BRIDGE_CALLBACK_MARKER).and_then(Value::as_bool) != Some(true) {
             return None;
         }
-        let action_name = value.get("action")?.as_str()?;
-        let scope = value
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let token = value
-            .get("token")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if !self.tokens.verify(scope, action_name, token) {
-            tracing::warn!(scope, action_name, "rejected card callback with bad token");
-            return Some("操作已失效，请重新发起。".to_string());
+
+        // Bridge-rendered button: signed with the process-local CallbackTokens
+        // key. These values always carry `action` + `scope`.
+        if let (Some(action_name), Some(scope)) = (
+            value.get("action").and_then(Value::as_str),
+            value.get("scope").and_then(Value::as_str),
+        ) {
+            let token = value
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !self.tokens.verify(scope, action_name, token) {
+                tracing::warn!(scope, action_name, "rejected card callback with bad token");
+                return Some("操作已失效，请重新发起。".to_string());
+            }
+            return match action_name {
+                "stop" => {
+                    // The stop button is the card equivalent of `/stop`: abort
+                    // the run and drop the batch queued while it was live.
+                    let (stopped, _dropped) = self.stop_scope(scope);
+                    Some(if stopped {
+                        "已停止当前任务。".to_string()
+                    } else {
+                        "当前没有正在运行的任务。".to_string()
+                    })
+                }
+                _ => None,
+            };
         }
 
-        match action_name {
-            "stop" => {
-                // The stop button is the card equivalent of `/stop`: abort the
-                // run and drop the batch queued while it was live.
-                let (stopped, _dropped) = self.stop_scope(scope);
-                Some(if stopped {
-                    "已停止当前任务。".to_string()
-                } else {
-                    "当前没有正在运行的任务。".to_string()
-                })
-            }
-            _ => None,
+        // Agent-rendered callback (`bridge_token`).
+        self.handle_agent_callback(action, value).await
+    }
+
+    /// Verify and forward an agent-rendered card callback.
+    ///
+    /// Fails closed: a missing callback key, missing chat/operator context, a
+    /// malformed/expired/replayed token, or a denied operator all drop the
+    /// click with a warning and never reach the agent.
+    async fn handle_agent_callback(
+        self: &Arc<Self>,
+        action: &CardActionEvent,
+        value: &serde_json::Map<String, Value>,
+    ) -> Option<String> {
+        let token = value
+            .get(BRIDGE_TOKEN_FIELD)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if token.is_empty() {
+            tracing::warn!("ignoring agent card callback without a bridge_token");
+            return None;
         }
+        let Some(auth) = self.callback_auth.as_ref() else {
+            tracing::warn!("rejected agent card callback: no callback key configured");
+            return None;
+        };
+        // The card action event carries the chat and message it was rendered
+        // on through `card_context`; without them the token cannot be bound to
+        // a scope and the click is dropped.
+        let chat_id = action
+            .card_context
+            .as_ref()
+            .and_then(|context| context.open_chat_id.as_deref())
+            .unwrap_or_default();
+        let operator = action.operator.open_id.as_deref().unwrap_or_default();
+        if chat_id.is_empty() || operator.is_empty() {
+            tracing::warn!("rejected agent card callback without chat/operator context");
+            return None;
+        }
+
+        let expected = CallbackExpected {
+            // The Rust bridge keeps no TypeScript run ids or policy
+            // fingerprints, so it cannot bind those; see the callback docs.
+            run_id: None,
+            scope: chat_id.to_string(),
+            chat_id: chat_id.to_string(),
+            operator_open_id: operator.to_string(),
+            action: AGENT_CALLBACK_ACTION.to_string(),
+            policy_fingerprint: None,
+        };
+        match auth.verify(token, &expected) {
+            Ok(payload) => tracing::info!(
+                scope = %payload.s,
+                operator = %operator,
+                run_id = %payload.r,
+                "verified agent card callback"
+            ),
+            Err(reason) => {
+                tracing::warn!(
+                    scope = chat_id,
+                    operator,
+                    reason = reason.as_str(),
+                    "rejected agent card callback"
+                );
+                return None;
+            }
+        }
+
+        if !card_click_allowed(&self.live_profile(), chat_id, operator) {
+            tracing::info!(scope = chat_id, operator, "card-click denied by access policy");
+            return None;
+        }
+
+        // Strip the bridge markers so the agent only sees the fields it set
+        // (plus CardKit form values, mirroring the TypeScript forwarder).
+        let payload = strip_callback_markers(value, action.action.form_value.as_ref());
+        let text = format!("[card-click] {payload}");
+        tracing::info!(
+            scope = chat_id,
+            chars = text.chars().count(),
+            "forwarding card click to the agent"
+        );
+        self.enqueue(card_click_message(action, chat_id, operator, text));
+        None
     }
 
     /// Effective cwd for a run, creating the directory when needed.
@@ -692,13 +941,15 @@ impl Bridge {
 
         let context = self.prompt_context(&batch);
         let prompt = build_agent_prompt(&context, &batch_user_input(&batch));
-        let use_card = self.profile.message_reply() != MessageReplyMode::Text;
+        let profile = self.live_profile();
+        let reply_mode = profile.message_reply();
+        let use_card = reply_mode != MessageReplyMode::Text;
 
         let mut view = RunView::default();
         let mut streaming: Option<StreamingCard> = None;
         let mut message_id: Option<String> = None;
         if use_card {
-            let card = build_card(&self.profile, &view, "启动中", started, None);
+            let card = build_card(&profile, &view, "启动中", started, None);
             // Prefer a CardKit 2.0 streaming entity: every later update is one
             // whole-card PUT with its own sequence. If either the entity or the
             // reference message cannot be created, the plain message path below
@@ -726,7 +977,7 @@ impl Bridge {
         }
 
         let spec = AgentSpec {
-            kind: self.profile.agent_kind,
+            kind: profile.agent_kind,
             binary: self.agent_binary.clone(),
             cwd,
             prompt,
@@ -750,7 +1001,7 @@ impl Bridge {
                     &mut streaming,
                     message_id.as_deref(),
                     &view,
-                    use_card,
+                    reply_mode,
                     started,
                 )
                 .await;
@@ -810,7 +1061,7 @@ impl Bridge {
             &mut streaming,
             message_id.as_deref(),
             &view,
-            use_card,
+            reply_mode,
             started,
         )
         .await;
@@ -823,9 +1074,10 @@ impl Bridge {
         streaming: &mut Option<StreamingCard>,
         message_id: Option<&str>,
         view: &RunView,
-        use_card: bool,
+        reply_mode: MessageReplyMode,
         started: Instant,
     ) {
+        let use_card = reply_mode != MessageReplyMode::Text;
         if use_card {
             if let Some(handle) = streaming.as_mut() {
                 // The final frame is a whole-card PUT with streaming mode off
@@ -856,11 +1108,20 @@ impl Bridge {
                 }
             }
         }
-        let answer = view.best_answer().trim();
-        let body = if answer.is_empty() {
-            "（没有输出）".to_string()
+        let body = if reply_mode == MessageReplyMode::Text {
+            // Text replies get the full TS renderer: final answer selection,
+            // reasoning/tool summaries according to the profile, terminal
+            // notices, email masking and the IM length guard.
+            text_final_body(&self.live_profile(), view)
         } else {
-            truncate_chars(answer, 4_000)
+            // Markdown still uses the card path above; this is only the
+            // message fallback when the card can no longer be updated.
+            let answer = view.best_answer().trim();
+            if answer.is_empty() {
+                "（没有输出）".to_string()
+            } else {
+                truncate_chars(answer, 4_000)
+            }
         };
         let _ = self.channel.send_text(chat_id, body).await;
     }
@@ -912,7 +1173,7 @@ impl Bridge {
             Some(self.tokens.sign(chat_id, "stop"))
         };
         build_card(
-            &self.profile,
+            &self.live_profile(),
             view,
             card_status(view),
             started,
@@ -922,7 +1183,7 @@ impl Bridge {
 
     /// Card for the last frame (streaming mode off, no stop button).
     fn final_card(&self, view: &RunView, started: Instant) -> lark_channel::Card {
-        build_card(&self.profile, view, card_status(view), started, None)
+        build_card(&self.live_profile(), view, card_status(view), started, None)
     }
 
     async fn update_card(
@@ -1394,6 +1655,38 @@ fn card_status(view: &RunView) -> &'static str {
     }
 }
 
+/// Map the profile's reply preferences onto text-renderer options.
+///
+/// Text replies are plain-text messages, so markdown markers added by the
+/// renderer would show up literally. Reasoning follows the TS text renderer:
+/// only `inline` is included; `auto` is card-only, `off` disables it, and
+/// `bubble` is streamed through the COT client instead.
+fn text_render_options(profile: &ProfileConfig) -> TextRenderOptions {
+    let reasoning = matches!(
+        profile
+            .preferences
+            .as_ref()
+            .and_then(|prefs| prefs.reasoning_display),
+        Some(ReasoningDisplay::Inline)
+    );
+    TextRenderOptions {
+        format: TextFormat::Plain,
+        show_tool_calls: profile.show_tool_calls(),
+        reasoning,
+        ..TextRenderOptions::default()
+    }
+}
+
+/// Final body for `MessageReplyMode::Text`.
+fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
+    let body = render_text(view, text_render_options(profile));
+    if body.trim().is_empty() {
+        "（没有输出）".to_string()
+    } else {
+        body
+    }
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -1476,10 +1769,138 @@ fn reply_mode_label(mode: MessageReplyMode) -> &'static str {
     }
 }
 
+/// One preference that `/config set` may persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferenceEdit {
+    MessageReply(MessageReplyMode),
+    ShowToolCalls(bool),
+}
+
+/// Validate a `/config set <key> <value>` pair.
+///
+/// Only the writable subset is accepted; everything else returns the usage
+/// text (or a read-only notice) so a typo never silently no-ops.
+fn parse_config_set(key: &str, value: &str) -> Result<PreferenceEdit, String> {
+    let value = value.trim();
+    match key {
+        "messageReply" => {
+            let mode = match value.to_ascii_lowercase().as_str() {
+                "card" => MessageReplyMode::Card,
+                "markdown" => MessageReplyMode::Markdown,
+                "text" => MessageReplyMode::Text,
+                _ => {
+                    return Err(format!(
+                        "messageReply 只接受 card|markdown|text，收到 `{value}`。\n\n{CONFIG_USAGE}"
+                    ));
+                }
+            };
+            Ok(PreferenceEdit::MessageReply(mode))
+        }
+        "showToolCalls" => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok(PreferenceEdit::ShowToolCalls(true)),
+            "false" => Ok(PreferenceEdit::ShowToolCalls(false)),
+            _ => Err(format!(
+                "showToolCalls 只接受 true|false，收到 `{value}`。\n\n{CONFIG_USAGE}"
+            )),
+        },
+        "maxConcurrentRuns" => Err(format!("maxConcurrentRuns 当前只读。\n\n{CONFIG_USAGE}")),
+        "" => Err(CONFIG_USAGE.to_string()),
+        other => Err(format!("未知配置项 `{other}`。\n\n{CONFIG_USAGE}")),
+    }
+}
+
+/// Access check for an agent-rendered card click.
+///
+/// Mirrors the TypeScript dispatcher's `canUseDm`/`canUseGroup` union: the card
+/// action event carries no chat mode, so the operator may pass through either
+/// the DM allowlist (`allowedUsers`) or the group allowlist (`allowedChats`).
+/// Team mode opens usage to everyone. Empty lists fail closed, like the
+/// TypeScript bridge (the Rust bridge has no runtime-owner discovery).
+fn card_click_allowed(profile: &ProfileConfig, chat_id: &str, operator: &str) -> bool {
+    if profile.mode == ProfileMode::Team {
+        return true;
+    }
+    let Some(access) = profile.access.as_ref() else {
+        return false;
+    };
+    access.admins.iter().any(|id| id == operator)
+        || access.allowed_users.iter().any(|id| id == operator)
+        || access.allowed_chats.iter().any(|id| id == chat_id)
+}
+
+/// Remove the bridge markers from a signed agent callback and merge CardKit
+/// form values, matching the TypeScript `forwardToAgent`.
+fn strip_callback_markers(
+    value: &serde_json::Map<String, Value>,
+    form_value: Option<&Value>,
+) -> Value {
+    let mut payload: serde_json::Map<String, Value> = value
+        .iter()
+        .filter(|(key, _)| key.as_str() != BRIDGE_CALLBACK_MARKER && key.as_str() != BRIDGE_TOKEN_FIELD)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(form_value) = form_value {
+        payload.insert("form_value".to_string(), form_value.clone());
+    }
+    Value::Object(payload)
+}
+
+/// Synthetic user message carrying a verified card click into the run flow.
+fn card_click_message(
+    action: &CardActionEvent,
+    chat_id: &str,
+    operator: &str,
+    text: String,
+) -> NormalizedMessage {
+    NormalizedMessage {
+        message_id: action
+            .card_context
+            .as_ref()
+            .and_then(|context| context.open_message_id.clone())
+            .unwrap_or_default(),
+        chat_id: chat_id.to_string(),
+        // Card action events carry no chat mode; the run prompt reports
+        // "unknown" rather than guessing p2p/group.
+        chat_type: MessageChatType::Unknown,
+        sender_id: operator.to_string(),
+        sender: MessageSenderInfo {
+            open_id: operator.to_string(),
+            user_id: action.operator.user_id.clone(),
+            union_id: action.operator.union_id.clone(),
+            sender_type: MessageSenderType::User,
+        },
+        message_type: "interactive".to_string(),
+        text,
+        raw_content: String::new(),
+        content: None,
+        root_id: None,
+        parent_id: None,
+        thread_id: None,
+        mentions: Vec::new(),
+        resources: Vec::new(),
+        raw: Value::Null,
+    }
+}
+
+/// Sender id used by commands: the open id when present, else `sender_id`.
+fn message_sender_id(message: &NormalizedMessage) -> &str {
+    if message.sender.open_id.is_empty() {
+        message.sender_id.as_str()
+    } else {
+        message.sender.open_id.as_str()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larkline_core::config::AgentKind;
+    use lark_channel::event::{
+        CardActionContext, CardActionOperator, CardActionPayload, EventContext,
+    };
+    use larkline_core::RootConfig;
+    use larkline_core::config::{Access, AgentKind};
+
+    use crate::callback::{CallbackKey, CallbackSignInput};
 
     fn profile() -> ProfileConfig {
         ProfileConfig {
@@ -1676,6 +2097,85 @@ mod tests {
     }
 
     #[test]
+    fn text_render_options_follow_profile_preferences() {
+        let options = text_render_options(&profile());
+        assert_eq!(options.format, TextFormat::Plain);
+        assert!(options.show_tool_calls);
+        assert!(!options.reasoning);
+
+        // Only `inline` shows reasoning in a text reply; `auto` is card-only,
+        // `off` disables it and `bubble` is the separate COT stream.
+        for (display, expected) in [
+            ("auto", false),
+            ("off", false),
+            ("inline", true),
+            ("bubble", false),
+        ] {
+            let profile: ProfileConfig = serde_json::from_value(json!({
+                "preferences": {
+                    "reasoningDisplay": display,
+                    "showToolCalls": false
+                }
+            }))
+            .expect("profile fixture");
+            let options = text_render_options(&profile);
+            assert_eq!(options.reasoning, expected, "reasoningDisplay={display}");
+            assert!(!options.show_tool_calls, "showToolCalls=false");
+        }
+    }
+
+    #[test]
+    fn text_final_body_uses_the_text_renderer() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "hello".into(),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "pwd" }),
+        });
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+
+        assert_eq!(text_final_body(&profile(), &view), "hello\n\n• Bash — pwd");
+
+        let mut hidden_tools = profile();
+        hidden_tools
+            .preferences
+            .as_mut()
+            .expect("default preferences")
+            .show_tool_calls = Some(false);
+        assert_eq!(text_final_body(&hidden_tools, &view), "hello");
+
+        // Emails are neutralized in the final text path too.
+        let mut email_view = RunView::default();
+        email_view.apply(&AgentEvent::Text {
+            delta: "mail team@example.org".into(),
+        });
+        email_view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        let body = text_final_body(&profile(), &email_view);
+        assert!(body.contains("team[at]example.org"));
+        assert!(!body.contains('@'));
+
+        // No answer at all keeps the bridge's historical placeholder.
+        let mut empty = RunView::default();
+        empty.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        assert_eq!(text_final_body(&profile(), &empty), "（没有输出）");
+    }
+
+    #[test]
     fn profile_default_workspace_reads_the_extra_map() {
         let mut profile = profile();
         assert_eq!(profile_default_workspace(&profile), None);
@@ -1829,4 +2329,370 @@ mod tests {
             PathBuf::from("/cli/default")
         );
     }
+
+    // ---- card callbacks -------------------------------------------------
+
+    fn test_bridge(root: &Path, profile: ProfileConfig) -> Arc<Bridge> {
+        let paths = AppPaths::resolve(root, "test").expect("app paths");
+        let channel = Channel::new("cli_test_app", "secret", TenantBrand::Feishu);
+        Arc::new(
+            Bridge::new(
+                channel,
+                profile,
+                PathBuf::from("/nonexistent/larkline-test-agent"),
+                root.join("workspace"),
+                None,
+                None,
+                paths,
+            )
+            .expect("bridge"),
+        )
+    }
+
+    fn callback_profile(secret: &str) -> ProfileConfig {
+        let mut profile = profile();
+        profile
+            .extra
+            .insert("callback".to_string(), json!({ "secret": secret }));
+        // Card-click access uses the TS union; allow the fixture clicker.
+        profile.access = Some(Access {
+            allowed_users: vec!["ou_1".into()],
+            ..Access::default()
+        });
+        profile
+    }
+
+    fn sign_callback(secret: &str, nonce: &str) -> String {
+        CallbackAuth::new(vec![CallbackKey {
+            version: 1,
+            secret: secret.to_string(),
+            retired: false,
+        }])
+        .expect("auth")
+        .sign(&CallbackSignInput {
+            run_id: "run_1".to_string(),
+            scope: "oc_1".to_string(),
+            chat_id: "oc_1".to_string(),
+            operator_open_id: "ou_1".to_string(),
+            action: AGENT_CALLBACK_ACTION.to_string(),
+            policy_fingerprint: "fp_1".to_string(),
+            ttl_ms: 60_000,
+            nonce: Some(nonce.to_string()),
+        })
+        .expect("token")
+    }
+
+    fn card_action_event(value: Value) -> CardActionEvent {
+        CardActionEvent {
+            context: EventContext {
+                event_id: "evt_1".to_string(),
+                tenant_key: None,
+                create_time: None,
+            },
+            operator: CardActionOperator {
+                tenant_key: None,
+                user_id: Some("on_1".to_string()),
+                open_id: Some("ou_1".to_string()),
+                union_id: None,
+            },
+            token: None,
+            action: CardActionPayload {
+                value,
+                tag: None,
+                timezone: None,
+                name: None,
+                form_value: None,
+                input_value: None,
+                option: None,
+                options: Vec::new(),
+                checked: None,
+                raw: Value::Null,
+            },
+            host: None,
+            delivery_type: None,
+            card_context: Some(CardActionContext {
+                url: None,
+                preview_token: None,
+                open_message_id: Some("om_card".to_string()),
+                open_chat_id: Some("oc_1".to_string()),
+                raw: Value::Null,
+            }),
+            raw: Value::Null,
+        }
+    }
+
+    /// Pull the debounced batch the click was queued into.
+    fn take_batch(bridge: &Bridge) -> Vec<NormalizedMessage> {
+        let now = Instant::now() + DEBOUNCE + Duration::from_millis(5);
+        lock(&bridge.pending)
+            .take_due(now)
+            .map(|(_, batch)| batch)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn callback_markers_and_form_values_are_stripped() {
+        let value = json!({
+            "__bridge_cb": true,
+            "bridge_token": "signed",
+            "choice": "a",
+            "ticket_id": 42
+        });
+        let stripped = strip_callback_markers(
+            value.as_object().unwrap(),
+            Some(&json!({ "input_1": "x" })),
+        );
+        assert_eq!(
+            serde_json::to_string(&stripped).unwrap(),
+            r#"{"choice":"a","ticket_id":42,"form_value":{"input_1":"x"}}"#
+        );
+
+        let without_form = strip_callback_markers(value.as_object().unwrap(), None);
+        assert_eq!(
+            serde_json::to_string(&without_form).unwrap(),
+            r#"{"choice":"a","ticket_id":42}"#
+        );
+    }
+
+    #[test]
+    fn card_click_access_mirrors_the_ts_union_and_fails_closed() {
+        let mut profile = profile();
+        profile.access = Some(Access::default());
+        assert!(!card_click_allowed(&profile, "oc_1", "ou_1"));
+
+        profile.access = Some(Access {
+            allowed_users: vec!["ou_dm".into()],
+            ..Access::default()
+        });
+        assert!(card_click_allowed(&profile, "oc_1", "ou_dm"));
+        assert!(!card_click_allowed(&profile, "oc_1", "ou_other"));
+
+        profile.access = Some(Access {
+            allowed_chats: vec!["oc_1".into()],
+            ..Access::default()
+        });
+        assert!(card_click_allowed(&profile, "oc_1", "ou_anyone"));
+        assert!(!card_click_allowed(&profile, "oc_2", "ou_anyone"));
+
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        assert!(card_click_allowed(&profile, "oc_2", "ou_admin"));
+
+        profile.mode = ProfileMode::Team;
+        profile.access = Some(Access::default());
+        assert!(card_click_allowed(&profile, "oc_1", "ou_anyone"));
+    }
+
+    #[test]
+    fn config_set_validates_keys_and_values() {
+        assert_eq!(
+            parse_config_set("messageReply", "card").unwrap(),
+            PreferenceEdit::MessageReply(MessageReplyMode::Card)
+        );
+        assert_eq!(
+            parse_config_set("messageReply", "MARKDOWN").unwrap(),
+            PreferenceEdit::MessageReply(MessageReplyMode::Markdown)
+        );
+        assert_eq!(
+            parse_config_set("showToolCalls", "false").unwrap(),
+            PreferenceEdit::ShowToolCalls(false)
+        );
+        assert_eq!(
+            parse_config_set("showToolCalls", "TRUE").unwrap(),
+            PreferenceEdit::ShowToolCalls(true)
+        );
+        for (key, value) in [
+            ("messageReply", "html"),
+            ("showToolCalls", "yes"),
+            ("maxConcurrentRuns", "5"),
+            ("unknown", "x"),
+            ("", ""),
+        ] {
+            let err = parse_config_set(key, value).unwrap_err();
+            assert!(
+                err.contains("用法") || err.contains("只读"),
+                "{key}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_callback_is_forwarded_to_the_agent_as_a_card_click() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        let token = sign_callback("s3cret", "nonce_forward");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": token,
+            "choice": "a",
+            "ticket_id": 42
+        }));
+
+        assert!(bridge.handle_card_action(&event).await.is_none());
+
+        let batch = take_batch(&bridge);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].chat_id, "oc_1");
+        assert_eq!(batch[0].sender_id, "ou_1");
+        assert_eq!(batch[0].message_id, "om_card");
+        assert_eq!(
+            batch[0].text,
+            r#"[card-click] {"choice":"a","ticket_id":42}"#
+        );
+        assert!(!batch[0].text.contains("__bridge_cb"));
+        assert!(!batch[0].text.contains("bridge_token"));
+    }
+
+    #[tokio::test]
+    async fn agent_callback_with_a_forged_token_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        let forged = sign_callback("attacker", "nonce_forged");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": forged,
+            "choice": "a"
+        }));
+
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_callback_without_a_configured_key_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let token = sign_callback("s3cret", "nonce_disabled");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": token
+        }));
+
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn bridge_rendered_stop_button_still_works() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let token = bridge.tokens.sign("oc_1", "stop");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "action": "stop",
+            "scope": "oc_1",
+            "token": token
+        }));
+        assert_eq!(
+            bridge.handle_card_action(&event).await.as_deref(),
+            Some("当前没有正在运行的任务。")
+        );
+
+        let forged = card_action_event(json!({
+            "__bridge_cb": true,
+            "action": "stop",
+            "scope": "oc_1",
+            "token": "0".repeat(64)
+        }));
+        assert_eq!(
+            bridge.handle_card_action(&forged).await.as_deref(),
+            Some("操作已失效，请重新发起。")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_shows_and_persists_the_writable_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let paths = AppPaths::resolve(root.path(), "test").unwrap();
+        let mut root_config = RootConfig::default();
+        root_config.active_profile = "test".into();
+        root_config
+            .profiles
+            .insert("test".into(), profile.clone());
+        larkline_core::store::save_root(&paths.config_file, &root_config).unwrap();
+        let bridge = test_bridge(root.path(), profile);
+        let admin = message("om_1", "ou_admin", "user", "");
+
+        let shown = bridge.handle_config(&admin, "").await;
+        assert!(shown.contains("messageReply: markdown"), "{shown}");
+        assert!(shown.contains("showToolCalls: true"), "{shown}");
+        assert!(shown.contains("maxConcurrentRuns: 10"), "{shown}");
+
+        let saved = bridge
+            .handle_config(&admin, "set messageReply card")
+            .await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(
+            bridge.live_profile().message_reply(),
+            MessageReplyMode::Card
+        );
+
+        let saved = bridge
+            .handle_config(&admin, "set showToolCalls false")
+            .await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert!(!bridge.live_profile().show_tool_calls());
+
+        let persisted = larkline_core::store::load_root(&paths.config_file)
+            .unwrap()
+            .expect("root config");
+        let prefs = persisted
+            .profile("test")
+            .expect("profile")
+            .preferences
+            .clone()
+            .expect("preferences");
+        assert_eq!(prefs.message_reply, Some(MessageReplyMode::Card));
+        assert_eq!(prefs.message_reply_migrated, Some(true));
+        assert_eq!(prefs.show_tool_calls, Some(false));
+    }
+
+    #[tokio::test]
+    async fn config_set_requires_an_admin_while_show_is_open() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            allowed_users: vec!["ou_user".into()],
+            ..Access::default()
+        });
+        let paths = AppPaths::resolve(root.path(), "test").unwrap();
+        let mut root_config = RootConfig::default();
+        root_config.active_profile = "test".into();
+        root_config
+            .profiles
+            .insert("test".into(), profile.clone());
+        larkline_core::store::save_root(&paths.config_file, &root_config).unwrap();
+        let bridge = test_bridge(root.path(), profile);
+        let user = message("om_1", "ou_user", "user", "");
+        let admin = message("om_1", "ou_admin", "user", "");
+
+        // Reads stay open to admitted users.
+        let shown = bridge.handle_config(&user, "").await;
+        assert!(shown.contains("messageReply"), "{shown}");
+
+        let denied = bridge
+            .handle_config(&user, "set messageReply card")
+            .await;
+        assert!(denied.contains("管理员"), "{denied}");
+        assert_eq!(
+            bridge.live_profile().message_reply(),
+            MessageReplyMode::Markdown
+        );
+
+        let unknown = bridge.handle_config(&admin, "set nope 1").await;
+        assert!(unknown.contains("用法"), "{unknown}");
+        let read_only = bridge
+            .handle_config(&admin, "set maxConcurrentRuns 5")
+            .await;
+        assert!(read_only.contains("只读"), "{read_only}");
+    }
+
 }
