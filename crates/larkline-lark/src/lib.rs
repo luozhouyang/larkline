@@ -7,7 +7,9 @@
 
 pub mod cards;
 pub mod client;
+pub mod comments;
 pub mod meeting;
+pub mod reactions;
 pub mod rest;
 
 pub use cards::{error_card, final_card, running_card};
