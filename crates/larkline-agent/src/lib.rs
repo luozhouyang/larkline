@@ -15,7 +15,7 @@ pub use claude::{ClaudeArgsInput, ClaudeStreamTranslator, build_claude_args};
 pub use codex::{CodexArgsInput, CodexFinishReason, CodexJsonlTranslator, build_codex_args};
 pub use detect::{ResolvedBinary, resolve_executable};
 pub use prompt::{
-    BridgePromptContext, PromptContext, PromptMention, build_agent_prompt,
-    build_bridge_system_prompt, prefix_bridge_system_prompt,
+    BridgePromptContext, PromptAttachment, PromptContext, PromptMention, build_agent_prompt,
+    build_agent_prompt_with_attachments, build_bridge_system_prompt, prefix_bridge_system_prompt,
 };
 pub use types::{AgentEvent, SandboxMode, TerminationReason, usage_total_tokens};

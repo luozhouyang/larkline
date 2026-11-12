@@ -2331,6 +2331,7 @@ impl MeetingManager {
             session_id: resume.clone(),
             model: None,
             permissions: self.agent.permissions,
+            images: Vec::new(),
             bot_open_id: self.agent.bot_open_id.clone(),
             bot_name: self.agent.bot_name.clone(),
         };

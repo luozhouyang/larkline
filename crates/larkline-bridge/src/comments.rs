@@ -1110,6 +1110,7 @@ async fn run_comment_agent_with_wait(
         session_id: resume.clone(),
         model: None,
         permissions: RunPermissions::from_profile(&bridge.live_profile()),
+        images: Vec::new(),
         bot_open_id: bridge.bot_open_id.clone(),
         bot_name: bridge.bot_name.clone(),
     };

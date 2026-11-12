@@ -6,7 +6,7 @@
 
 use lark_channel::lark_openapi::{OpenApiClient, ReqwestOpenApiTransport};
 use lark_channel::message::{MessageContent, MessageId, MessageSender, Recipient};
-use lark_channel::{Card, ChannelConfig, Domain};
+use lark_channel::{Card, ChannelConfig, Domain, MediaDownloader};
 
 use crate::rest::RestClient;
 
@@ -66,6 +66,16 @@ impl Channel {
 
     pub fn rest(&self) -> &RestClient {
         &self.rest
+    }
+
+    /// Downloader for inbound message resources (images, files, audio, video).
+    ///
+    /// It reuses this channel's authenticated OpenAPI client, so the tenant
+    /// token cache is shared with message sending. Sticker/folder descriptors
+    /// are rejected by the SDK before any request is made; callers treat that
+    /// as a skipped attachment rather than a run failure.
+    pub fn media_downloader(&self) -> MediaDownloader<ReqwestOpenApiTransport> {
+        MediaDownloader::new(self.openapi.clone())
     }
 
     pub async fn send_text(&self, chat_id: &str, text: impl Into<String>) -> LarkResult<MessageId> {

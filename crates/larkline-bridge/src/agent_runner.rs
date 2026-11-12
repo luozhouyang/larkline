@@ -31,6 +31,9 @@ pub struct AgentSpec {
     /// Profile-resolved access policy for this run. The adapters turn it into
     /// Codex's `--sandbox` and Claude's `--permission-mode`.
     pub permissions: RunPermissions,
+    /// Image paths for Codex's `--image`. Empty for Claude: the TS bridge
+    /// passes image paths to Claude in the prompt text instead.
+    pub images: Vec<String>,
     pub bot_open_id: Option<String>,
     pub bot_name: Option<String>,
 }
@@ -93,7 +96,7 @@ fn build_agent_args(
                 cwd: spec.cwd.to_string_lossy().into_owned(),
                 sandbox: spec.permissions.sandbox(),
                 thread_id: spec.session_id.clone(),
-                images: Vec::new(),
+                images: spec.images.clone(),
                 ignore_user_config: false,
                 ignore_rules: None,
                 model: spec.model.clone(),
@@ -285,6 +288,7 @@ mod tests {
             session_id: None,
             model: None,
             permissions,
+            images: Vec::new(),
             bot_open_id: None,
             bot_name: None,
         }
@@ -347,6 +351,57 @@ mod tests {
             // The Codex system prompt is prepended to stdin.
             assert!(stdin.contains("hello"));
         }
+    }
+
+    #[test]
+    fn codex_argv_carries_attachment_images_before_the_prompt() {
+        let mut spec = spec(
+            AgentKind::Codex,
+            permissions(AccessMode::Workspace, AccessMode::Workspace),
+        );
+        spec.images = vec!["/tmp/a.png".into(), "/tmp/b.jpg".into()];
+        let (args, _) = build_agent_args(&spec, Path::new("/tmp/system.md")).expect("codex args");
+
+        let images: Vec<_> = args
+            .windows(2)
+            .filter(|window| window[0] == "--image")
+            .map(|window| window[1].as_str())
+            .collect();
+        assert_eq!(images, ["/tmp/a.png", "/tmp/b.jpg"]);
+        // Images live before the `--` separator, which itself precedes stdin.
+        let first_image = args.iter().position(|arg| arg == "--image").unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert!(first_image < separator);
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn codex_resume_carries_attachment_images_before_the_thread_id() {
+        let mut spec = spec(
+            AgentKind::Codex,
+            permissions(AccessMode::Workspace, AccessMode::Workspace),
+        );
+        spec.session_id = Some("thread-1".into());
+        spec.images = vec!["/tmp/a.png".into()];
+        let (args, _) = build_agent_args(&spec, Path::new("/tmp/system.md")).expect("codex args");
+
+        let image = args.iter().position(|arg| arg == "--image").unwrap();
+        let thread = args.iter().position(|arg| arg == "thread-1").unwrap();
+        assert!(image < thread);
+        assert_eq!(args.get(image + 1).map(String::as_str), Some("/tmp/a.png"));
+    }
+
+    #[test]
+    fn claude_argv_never_receives_image_flags() {
+        let mut spec = spec(
+            AgentKind::Claude,
+            permissions(AccessMode::Workspace, AccessMode::Workspace),
+        );
+        // Even if the caller fills the field, Claude only gets paths in the
+        // prompt text (the TS bridge does the same).
+        spec.images = vec!["/tmp/a.png".into()];
+        let (args, _) = build_agent_args(&spec, Path::new("/tmp/system.md")).expect("claude args");
+        assert!(!args.iter().any(|arg| arg == "--image"));
     }
 
     #[test]

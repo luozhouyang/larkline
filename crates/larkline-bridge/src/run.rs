@@ -96,7 +96,8 @@ use lark_channel::message::{
     MessageChatType, MessageSenderInfo, MessageSenderType, NormalizedMessage, Recipient,
 };
 use larkline_agent::{
-    AgentEvent, PromptContext, PromptMention, TerminationReason, build_agent_prompt,
+    AgentEvent, PromptContext, PromptMention, TerminationReason,
+    build_agent_prompt_with_attachments,
 };
 use larkline_core::{
     AppPaths, CoreError, MessageReplyMode, Preferences, ProfileConfig, SessionStore, TenantBrand,
@@ -111,6 +112,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
+use crate::media::{
+    AttachmentDecision, AttachmentKind, MediaCache, MediaPolicy, NormalizedAttachment,
+    to_prompt_attachments,
+};
 use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
 use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
@@ -249,6 +254,9 @@ pub struct Bridge {
     /// [`scope_key`] and [`crate::comments`].
     pub(crate) sessions: Mutex<SessionStore>,
     workspaces: Mutex<WorkspaceStore>,
+    /// Inbound attachment downloader + bounded on-disk cache
+    /// (`<profile>/media/`). Downloads are best-effort and never fail a run.
+    media: MediaCache,
     /// Live run per scope. A run keeps its scope's pending queue blocked.
     active: StdMutex<HashMap<String, ActiveRun>>,
     /// Debounced per-scope message queue (pure structure; no timers inside).
@@ -678,6 +686,9 @@ impl Bridge {
         // The owner lookup reuses the bridge's tenant token cache. It stays
         // lazy: no request is made until an admin-gated command needs it.
         let owner = OwnerGate::new(Arc::new(RestOwnerSource::new(channel.rest().clone())));
+        // Attachments share the channel's authenticated OpenAPI transport and
+        // live under the profile's `media/` directory.
+        let media = MediaCache::for_channel(&paths, &channel);
 
         Ok(Self {
             channel,
@@ -693,6 +704,7 @@ impl Bridge {
             owner,
             sessions: Mutex::new(sessions),
             workspaces: Mutex::new(workspaces),
+            media,
             active: StdMutex::new(HashMap::new()),
             pending: StdMutex::new(PendingQueue::with_limits(
                 DEBOUNCE,
@@ -704,6 +716,18 @@ impl Bridge {
             run_generations: StdMutex::new(HashMap::new()),
             meeting: StdMutex::new(None),
         })
+    }
+
+    /// Replace the attachment downloader.
+    ///
+    /// Production uses the SDK-backed downloader created in [`Bridge::new`];
+    /// tests inject a fake so the attachment path never touches the network.
+    pub fn with_attachment_downloader(
+        mut self,
+        downloader: Arc<dyn crate::media::ResourceDownloader>,
+    ) -> Self {
+        self.media = self.media.with_downloader(downloader);
+        self
     }
 
     /// Start the in-meeting agent (VC bot) manager.
@@ -1995,10 +2019,13 @@ impl Bridge {
         let cwd = self.workspace_cwd(&scope).await;
         let cwd_str = cwd.to_string_lossy().into_owned();
         let resume = self.resume_scope_session(&scope, &cwd_str).await;
-
-        let context = self.prompt_context(&batch);
-        let prompt = build_agent_prompt(&context, &batch_user_input(&batch));
         let profile = self.live_profile();
+
+        // Resolve every resource on the batch before spawning: downloads are
+        // best-effort (a failed attachment is logged and skipped), and the
+        // policy decisions are reported in the prompt either way.
+        let attachments = self.resolve_attachments(&batch, &profile).await;
+        let prompt = self.build_batch_prompt(&batch, &attachments);
         let reply_mode = profile.message_reply();
         let card_format = CardFormat::for_reply_mode(reply_mode);
         // Idle watchdog for this run (TS `runIdleTimeoutMs`, `/timeout`
@@ -2059,6 +2086,7 @@ impl Bridge {
             session_id: resume,
             model: None,
             permissions: RunPermissions::from_profile(&profile),
+            images: accepted_image_paths(&attachments),
             bot_open_id: self.bot_open_id.clone(),
             bot_name: self.bot_name.clone(),
         };
@@ -2546,6 +2574,63 @@ impl Bridge {
         }
     }
 
+    /// Download every resource attached to the batch.
+    ///
+    /// Failure semantics follow the TS bridge: individual download errors are
+    /// logged and omitted by [`MediaCache::resolve`], and the run continues
+    /// with whatever resolved (possibly nothing). Policy rejections stay in
+    /// the result so the prompt can report them with their reason.
+    async fn resolve_attachments(
+        &self,
+        batch: &[NormalizedMessage],
+        profile: &ProfileConfig,
+    ) -> Vec<NormalizedAttachment> {
+        let mut resources = Vec::new();
+        for message in batch {
+            for resource in &message.resources {
+                let mut resource = resource.clone();
+                // The SDK normalizer stamps the message id already; keep the
+                // fallback for synthetic messages (card clicks, fixtures).
+                if resource.message_id.is_empty() {
+                    resource.message_id = message.message_id.clone();
+                }
+                resources.push(resource);
+            }
+        }
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        let policy = MediaPolicy::from_profile(profile);
+        let attachments = self.media.resolve(&resources, &policy).await;
+        for attachment in &attachments {
+            tracing::info!(
+                decision = attachment.decision.as_str(),
+                kind = attachment.kind.as_str(),
+                hash = %attachment.hash,
+                size = attachment.size,
+                source_message_id = %attachment.source_message_id,
+                reason = attachment.rejection_reason.as_deref().unwrap_or(""),
+                "attachment decision"
+            );
+        }
+        attachments
+    }
+
+    /// Prompt for one debounced batch, including its `<attachments>` section.
+    fn build_batch_prompt(
+        &self,
+        batch: &[NormalizedMessage],
+        attachments: &[NormalizedAttachment],
+    ) -> String {
+        let context = self.prompt_context(batch);
+        build_agent_prompt_with_attachments(
+            &context,
+            &batch_user_input(batch, !attachments.is_empty()),
+            &to_prompt_attachments(attachments),
+        )
+    }
+
     /// Prompt context for a debounced batch: identity from the first message,
     /// mentions merged across the batch, and every message id recorded.
     fn prompt_context(&self, batch: &[NormalizedMessage]) -> PromptContext {
@@ -2708,8 +2793,9 @@ fn is_meeting_command(text: &str) -> bool {
 /// Join a batch's text into the `<user_input>` body.
 /// Mirrors the TS `buildPrompt`: single-message batches stay verbatim; merged
 /// batches prefix each non-empty segment with `[sender]:` so the agent can tell
-/// who said what, and segments are separated by a blank line.
-fn batch_user_input(batch: &[NormalizedMessage]) -> String {
+/// who said what, and segments are separated by a blank line. A batch whose
+/// messages carry only attachments gets the TS "请看下面的附件。" fallback.
+fn batch_user_input(batch: &[NormalizedMessage], has_attachments: bool) -> String {
     let annotate = batch.len() > 1;
     let texts: Vec<String> = batch
         .iter()
@@ -2726,13 +2812,31 @@ fn batch_user_input(batch: &[NormalizedMessage]) -> String {
         })
         .collect();
 
-    if texts.is_empty() {
+    if !texts.is_empty() {
+        texts.join("\n\n")
+    } else if has_attachments {
+        "请看下面的附件。".to_string()
+    } else {
         // Also the TS fallback; the bridge drops empty-text messages at intake,
         // so this mainly keeps the helper total.
         "（对方发来一条没有正文的消息——通常是只 @ 了你的唤醒（ping）。请简短回应。）".to_string()
-    } else {
-        texts.join("\n\n")
     }
+}
+
+/// Image paths forwarded to Codex via `--image`.
+///
+/// TS (`run-flow.ts`) filters the policy attachments to accepted images and
+/// passes them only to Codex; Claude receives the paths in the prompt text
+/// instead. Skipped/rejected images never reach argv.
+fn accepted_image_paths(attachments: &[NormalizedAttachment]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter(|attachment| {
+            attachment.kind == AttachmentKind::Image
+                && attachment.decision == AttachmentDecision::Accepted
+        })
+        .map(|attachment| attachment.path.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// `[name (type)]:` prefix used when a batch merges several senders.
@@ -3546,7 +3650,7 @@ mod tests {
     #[test]
     fn single_message_batches_keep_the_text_verbatim() {
         let batch = vec![message("om_1", "ou_1", "user", "  hello  ")];
-        assert_eq!(batch_user_input(&batch), "hello");
+        assert_eq!(batch_user_input(&batch, false), "hello");
     }
 
     #[test]
@@ -3556,7 +3660,7 @@ mod tests {
             message("om_2", "ou_2", "bot", " second "),
         ];
         assert_eq!(
-            batch_user_input(&batch),
+            batch_user_input(&batch, false),
             "[ou_1 (user)]: first\n\n[ou_2 (bot)]: second"
         );
     }
@@ -3567,7 +3671,183 @@ mod tests {
             message("om_1", "ou_1", "user", "a"),
             message("om_2", "ou_2", "unknown", "b"),
         ];
-        assert_eq!(batch_user_input(&batch), "[ou_1 (user)]: a\n\n[ou_2]: b");
+        assert_eq!(
+            batch_user_input(&batch, false),
+            "[ou_1 (user)]: a\n\n[ou_2]: b"
+        );
+    }
+
+    #[test]
+    fn attachment_only_batches_use_the_ts_attachment_fallback() {
+        let batch = vec![message("om_1", "ou_1", "user", "  ")];
+        assert_eq!(batch_user_input(&batch, true), "请看下面的附件。");
+        assert!(batch_user_input(&batch, false).contains("没有正文"));
+    }
+
+    fn attachment(
+        path: &str,
+        kind: AttachmentKind,
+        decision: AttachmentDecision,
+        source_message_id: &str,
+    ) -> NormalizedAttachment {
+        NormalizedAttachment {
+            path: PathBuf::from(path),
+            kind,
+            size: 5,
+            mime: "image/png".to_string(),
+            hash: "hash".to_string(),
+            source_message_id: source_message_id.to_string(),
+            source_file_key: "file_key".to_string(),
+            original_name: None,
+            requiredness: crate::media::AttachmentRequiredness::Optional,
+            decision,
+            rejection_reason: None,
+        }
+    }
+
+    #[test]
+    fn accepted_image_paths_ignore_rejected_and_non_image_attachments() {
+        let attachments = vec![
+            attachment(
+                "/tmp/a.png",
+                AttachmentKind::Image,
+                AttachmentDecision::Accepted,
+                "om_1",
+            ),
+            attachment(
+                "/tmp/b.png",
+                AttachmentKind::Image,
+                AttachmentDecision::Rejected,
+                "om_2",
+            ),
+            attachment(
+                "/tmp/c.pdf",
+                AttachmentKind::File,
+                AttachmentDecision::Accepted,
+                "om_3",
+            ),
+            attachment(
+                "/tmp/d.png",
+                AttachmentKind::Image,
+                AttachmentDecision::Skipped,
+                "om_4",
+            ),
+        ];
+        assert_eq!(accepted_image_paths(&attachments), ["/tmp/a.png"]);
+    }
+
+    #[tokio::test]
+    async fn batch_prompt_reports_attachments_and_merges_the_batch() {
+        let root = tempfile::tempdir().expect("temp home");
+        let bridge = test_bridge(root.path(), profile());
+        let first = message("om_1", "ou_1", "user", "look");
+        let second = message("om_2", "ou_2", "user", "  ");
+        let attachments = vec![attachment(
+            "/tmp/media/abc.png",
+            AttachmentKind::Image,
+            AttachmentDecision::Accepted,
+            "om_1",
+        )];
+
+        let prompt = bridge.build_batch_prompt(&[first, second], &attachments);
+
+        let context_at = prompt.find("<bridge_context>").expect("context");
+        let attachments_at = prompt.find("<attachments>").expect("attachments");
+        let user_at = prompt.find("<user_input>").expect("user input");
+        assert!(context_at < attachments_at);
+        assert!(attachments_at < user_at);
+        assert!(prompt.contains("\"sourceMessageId\":\"om_1\""));
+        assert!(prompt.contains("\"path\":\"/tmp/media/abc.png\""));
+        assert!(prompt.contains("\"kind\":\"image\""));
+        assert!(prompt.contains("[ou_1 (user)]: look"));
+    }
+
+    struct FakeAttachmentDownloader;
+
+    #[async_trait]
+    impl crate::media::ResourceDownloader for FakeAttachmentDownloader {
+        async fn download(
+            &self,
+            resource: &lark_channel::media::ResourceDescriptor,
+        ) -> Result<lark_channel::media::DownloadedResource, crate::media::MediaError> {
+            let key = resource
+                .image_key
+                .clone()
+                .or_else(|| resource.file_key.clone())
+                .unwrap_or_default();
+            if key == "img_bad" {
+                return Err(crate::media::MediaError::Download("not found".into()));
+            }
+            Ok(lark_channel::media::DownloadedResource {
+                bytes: b"bytes".to_vec(),
+                content_type: Some("image/png".to_string()),
+                content_disposition: None,
+            })
+        }
+    }
+
+    fn resource(
+        message_id: &str,
+        resource_type: lark_channel::media::ResourceType,
+        key: &str,
+    ) -> lark_channel::media::ResourceDescriptor {
+        let (file_key, image_key) = match resource_type {
+            lark_channel::media::ResourceType::Image => (None, Some(key.to_string())),
+            _ => (Some(key.to_string()), None),
+        };
+        lark_channel::media::ResourceDescriptor {
+            message_id: message_id.to_string(),
+            resource_type,
+            file_key,
+            image_key,
+            file_name: None,
+            duration_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_downloads_batch_resources_and_tolerates_failures() {
+        let root = tempfile::tempdir().expect("temp home");
+        let paths = AppPaths::resolve(root.path(), "test").expect("app paths");
+        let bridge = Bridge::new(
+            Channel::new("cli_test_app", "secret", TenantBrand::Feishu),
+            profile(),
+            PathBuf::from("/nonexistent/larkline-test-agent"),
+            root.path().join("workspace"),
+            None,
+            None,
+            paths,
+            None,
+        )
+        .expect("bridge")
+        .with_attachment_downloader(Arc::new(FakeAttachmentDownloader));
+
+        let mut first = message("om_1", "ou_1", "user", "look");
+        first.resources = vec![resource(
+            "om_1",
+            lark_channel::media::ResourceType::Image,
+            "img_ok",
+        )];
+        let mut second = message("om_2", "ou_1", "user", "");
+        second.resources = vec![
+            resource("om_2", lark_channel::media::ResourceType::Image, "img_bad"),
+            resource("om_2", lark_channel::media::ResourceType::File, "file_ok"),
+        ];
+
+        let attachments = bridge
+            .resolve_attachments(&[first, second], &profile())
+            .await;
+        assert_eq!(attachments.len(), 2, "the failed image is omitted");
+        assert_eq!(attachments[0].kind, AttachmentKind::Image);
+        assert_eq!(attachments[0].source_message_id, "om_1");
+        assert_eq!(attachments[1].kind, AttachmentKind::File);
+        assert_eq!(attachments[1].source_message_id, "om_2");
+        assert!(attachments.iter().all(NormalizedAttachment::is_accepted));
+
+        let prompt =
+            bridge.build_batch_prompt(&[message("om_1", "ou_1", "user", "look")], &attachments);
+        assert!(prompt.contains("<attachments>"));
+        assert!(prompt.contains("\"sourceMessageId\":\"om_2\""));
     }
 
     #[test]

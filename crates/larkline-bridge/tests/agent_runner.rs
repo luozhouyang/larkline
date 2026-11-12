@@ -45,6 +45,7 @@ async fn streams_and_folds_a_fake_claude_run() {
             max_access: AccessMode::Workspace,
             claude_permission_mode: None,
         },
+        images: Vec::new(),
         bot_open_id: Some("ou_bot".into()),
         bot_name: None,
     })
@@ -83,6 +84,7 @@ async fn missing_binary_is_reported() {
         session_id: None,
         model: None,
         permissions: RunPermissions::default(),
+        images: Vec::new(),
         bot_open_id: None,
         bot_name: None,
     })

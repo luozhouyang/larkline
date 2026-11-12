@@ -10,6 +10,7 @@ pub mod callback_store;
 pub mod commands;
 pub mod comments;
 pub mod keepalive;
+pub mod media;
 pub mod meeting;
 pub mod owner;
 pub mod pending;
@@ -27,6 +28,11 @@ pub use callback::{
 };
 pub use callback_store::{CallbackNonceStore, NonceEntry, NonceState};
 pub use commands::{CommandEffect, CommandOutcome};
+pub use media::{
+    AttachmentCandidate, AttachmentDecision, AttachmentKind, AttachmentRequiredness, MediaCache,
+    MediaError, MediaPolicy, NormalizedAttachment, ResourceDownloader, SdkResourceDownloader,
+    normalize_attachments, safe_extension_for_mime, to_prompt_attachments,
+};
 pub use meeting::{
     ImReplyTarget, MeetingApi, MeetingConfig, MeetingHandle, MeetingHost, MeetingManager,
     MeetingPush, MeetingPushHealth, MeetingSessionStatus, RestMeetingApi, can_run_meeting_command,
