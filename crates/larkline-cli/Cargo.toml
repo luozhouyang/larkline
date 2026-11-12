@@ -1,0 +1,32 @@
+[package]
+name = "larkline-cli"
+description = "larkline command line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "larkline"
+path = "src/main.rs"
+
+[dependencies]
+larkline-core.workspace = true
+larkline-lark.workspace = true
+larkline-agent.workspace = true
+larkline-bridge.workspace = true
+lark-channel = { version = "0.6", features = ["websocket"] }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+rpassword = "7"
+
+[dev-dependencies]
+tempfile = "3"

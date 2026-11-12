@@ -1,0 +1,22 @@
+[package]
+name = "larkline-lark"
+description = "Feishu/Lark transport and card helpers for larkline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+larkline-core.workspace = true
+lark-channel = { version = "0.6", features = ["websocket"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

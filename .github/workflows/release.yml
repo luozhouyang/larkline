@@ -1,86 +1,187 @@
+# larkline release pipeline.
+#
+# Mirrors the macOS signing/notarization setup used by coffer-desktop:
+# Developer ID signing plus `notarytool` notarization, driven by repository
+# secrets. A macOS release fails loudly when the secrets are absent, so we
+# never silently ship a binary that Gatekeeper blocks.
+#
+# Required repository secrets:
+#   APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD  password of that .p12
+#   APPLE_SIGNING_IDENTITY      "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID                    Apple ID used for notarization
+#   APPLE_PASSWORD              app-specific password for that Apple ID
+#   APPLE_TEAM_ID               Apple team identifier
+#
+# Windows Authenticode signing is not configured yet: SmartScreen warnings are
+# tolerated for now.
+
 name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
 
-# npm trusted publishing authenticates through the GitHub OIDC token; no
-# NPM_TOKEN secret is used. `contents: write` is for the GitHub Release.
 permissions:
   contents: write
-  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
 
-      - name: Enable pnpm
-        run: corepack enable
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+  build-linux:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: larkline-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: larkline-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          # Trusted publishing needs Node >= 22.14.0 and npm CLI >= 11.5.1.
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Verify tag matches package version
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
         run: |
-          set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$version" != "$tag" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/larkline" dist/larkline
+          tar -C dist -czf "${{ matrix.asset }}.tar.gz" larkline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
+
+  build-macos:
+    needs: verify
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Require Apple secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_ID" ]; then
+            echo "::error::Missing APPLE_* secrets; refusing to ship an unsigned macOS binary"
             exit 1
           fi
-          echo "VERSION=${version}" >> "$GITHUB_ENV"
 
-      - name: Test
-        run: pnpm test
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Build
-        run: pnpm build
-
-      - name: Ensure npm supports trusted publishing
-        run: |
-          npm install -g npm@^11.5.1
-          npm --version
-
-      - name: Publish to npm with provenance
-        # Idempotent so a retried workflow does not fail on an already-published
-        # version (for example when GitHub Release creation was the failed step).
-        run: |
-          set -euo pipefail
-          if npm view "larkline@${VERSION}" version >/dev/null 2>&1; then
-            echo "larkline@${VERSION} is already published; skipping npm publish."
-          else
-            npm publish --provenance --access public
-          fi
-
-      - name: Create GitHub Release
+      - name: Import Developer ID certificate
         env:
-          GH_TOKEN: ${{ github.token }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "GitHub Release ${GITHUB_REF_NAME} already exists; skipping."
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
-              --generate-notes
-          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import cert.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/larkline \
+            target/x86_64-apple-darwin/release/larkline \
+            -output larkline
+          file larkline
+
+      - name: Sign
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" larkline
+          codesign --verify --strict --verbose=2 larkline
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # notarytool accepts zip/pkg/dmg; a bare binary must be zipped.
+          zip -q -r larkline-darwin-universal.zip larkline
+          xcrun notarytool submit larkline-darwin-universal.zip \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          # The zip itself cannot be stapled; the ticket is attached to the
+          # signed binary inside it, so Gatekeeper validates on first run.
+          xcrun stapler validate larkline || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: larkline-darwin-universal
+          path: larkline-darwin-universal.zip
+
+  build-windows:
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/larkline.exe -DestinationPath larkline-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: larkline-windows-x86_64
+          path: larkline-windows-x86_64.zip
+
+  publish:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

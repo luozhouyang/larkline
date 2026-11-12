@@ -22,3 +22,7 @@ web/dist/
 scripts/
 CHANGELOG.md
 tests-smoke/
+
+# Rust build artifacts / local cargo home used by sandboxed sessions
+/target
+.cargo-home/
