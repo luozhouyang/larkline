@@ -33,6 +33,11 @@ const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Cards over this many characters are truncated (CardKit caps JSON size).
 const MAX_CARD_CHARS: usize = 8_000;
+/// Feishu force-finalizes a CardKit streaming card about 10 minutes after it
+/// is created; every later update is silently discarded. Stop updating well
+/// before that and deliver the final answer as a separate message instead
+/// (the same mitigation the TypeScript bridge applies).
+const CARD_SAFE_AGE: Duration = Duration::from_secs(8 * 60 + 30);
 
 pub struct Bridge {
     pub channel: Channel,
@@ -254,6 +259,7 @@ impl Bridge {
                     if use_card
                         && message_id.is_some()
                         && last_update.elapsed() >= CARD_UPDATE_INTERVAL
+                        && within_card_window(started.elapsed())
                     {
                         self.update_card(&chat_id, message_id.as_deref(), &view, started)
                             .await;
@@ -283,7 +289,7 @@ impl Bridge {
         use_card: bool,
         started: Instant,
     ) {
-        if use_card {
+        if use_card && within_card_window(started.elapsed()) {
             if let Some(id) = message_id {
                 self.update_card(chat_id, Some(id), view, started).await;
                 return;
@@ -444,6 +450,11 @@ fn build_card(
     lark_channel::Card::from_value(value).expect("run card is valid")
 }
 
+/// True while the card is still safe to update (see `CARD_SAFE_AGE`).
+fn within_card_window(elapsed: Duration) -> bool {
+    elapsed < CARD_SAFE_AGE
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -487,6 +498,16 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(text.contains("Bash"));
         assert!(text.contains("完成"));
+    }
+
+    #[test]
+    fn card_window_stops_before_the_server_cutoff() {
+        assert!(within_card_window(Duration::from_secs(60)));
+        assert!(within_card_window(CARD_SAFE_AGE - Duration::from_secs(1)));
+        assert!(!within_card_window(CARD_SAFE_AGE));
+        assert!(!within_card_window(Duration::from_secs(11 * 60)));
+        // The guard must stay below the 10 minute server cutoff.
+        assert!(CARD_SAFE_AGE < Duration::from_secs(10 * 60));
     }
 
     #[test]
