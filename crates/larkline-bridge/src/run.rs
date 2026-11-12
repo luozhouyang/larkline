@@ -1,11 +1,14 @@
 //! Run flow: policy -> queue -> card -> agent -> card updates -> session.
 //!
-//! Working directories are per chat: `/cd` persists an override in the
-//! workspace store, and every run snapshots the effective cwd before spawning
-//! the agent. Changing the cwd mid-run therefore never moves an already
-//! running agent; the next message picks up the new directory.
+//! Working directories are per session scope: `/cd` persists an override in
+//! the workspace store, and every run snapshots the effective cwd before
+//! spawning the agent. Changing the cwd mid-run therefore never moves an
+//! already running agent; the next message picks up the new directory.
 //!
-//! Every chat is also a debounce scope (see [`crate::pending`], a port of
+//! A scope is the chat id for p2p / regular-group messages and
+//! `chatId:threadId` for topic-group messages (see [`scope_key`]); each topic
+//! thread therefore has its own session, cwd, pending queue and live run.
+//! Every scope is also a debounce scope (see [`crate::pending`], a port of
 //! `src/bot/pending-queue.ts`): a message opens a 600ms quiet window and
 //! messages arriving inside it merge into one agent run. While that run is
 //! live the scope is blocked, so later messages keep accumulating instead of
@@ -13,12 +16,14 @@
 //! next batch starts. `/stop` aborts the live run and drops the queued batch.
 //!
 //! A second, global limit caps how many agent runs may be live at once across
-//! every chat ([`crate::run_limit`], the port of `src/bot/process-pool.ts`).
+//! every scope ([`crate::run_limit`], the port of `src/bot/process-pool.ts`).
 //! The cap comes from the live profile's `preferences.maxConcurrentRuns` and is
 //! refreshed by `reload_profile` after `/config set maxConcurrentRuns`. A due
 //! batch that cannot get a slot stays in the pending queue — blocked only once
 //! it actually starts — and the queue driver retries when a run releases its
-//! slot. Per-chat serialization is unchanged: one run per scope, always.
+//! slot. Comment and meeting runs, which have no pending queue, take a permit
+//! with a bounded wait instead. Per-scope serialization is unchanged: one run
+//! per scope, always.
 //!
 //! `/config set` and `/meeting` use a shared admin gate
 //! ([`crate::owner::can_run_admin_command`]): configured admins (or the legacy
@@ -73,12 +78,20 @@ use crate::text_render::{TextFormat, TextRenderOptions, render_text};
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
 /// Hard cap for one agent run.
 pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a comment / meeting run waits for a global run slot before it
+/// gives up. Those runs have no pending queue, so waiting forever would leave
+/// the user without an answer; the queue-driven IM path still waits
+/// indefinitely because its messages stay queued.
+pub(crate) const RUN_SLOT_WAIT: Duration = Duration::from_secs(30);
+/// User-visible result when [`RUN_SLOT_WAIT`] expires.
+pub(crate) const RUN_SLOT_TIMEOUT_REPLY: &str =
+    "⏳ 当前并发任务已达上限，等待空闲运行槽超时，请稍后重试。";
 /// Cards over this many characters are truncated (CardKit caps JSON size).
 const MAX_CARD_CHARS: usize = 8_000;
 /// Quiet window before a batch of messages starts a run. The TypeScript bridge
 /// uses the same 600ms (`DEBOUNCE_MS` in `src/bot/channel.ts`).
 const DEBOUNCE: Duration = Duration::from_millis(600);
-/// Upper bound on messages queued per chat.
+/// Upper bound on messages queued per scope.
 ///
 /// The TypeScript queue is unbounded; this is a Rust-only memory guard for a
 /// bridge whose runs may last up to [`RUN_TIMEOUT`]. On overflow the oldest
@@ -104,6 +117,40 @@ const CONFIG_USAGE: &str = "用法：\n\
 /// Reply for a `/config set` from a sender outside the admin gate.
 const CONFIG_DENIED_REPLY: &str = "❌ 只有管理员可以修改配置。";
 
+/// Session / pending-queue / active-run scope for an inbound message.
+///
+/// Port of the TypeScript `scopeFor` (`src/bot/scope.ts`), minus the chat-mode
+/// API lookup: the Rust SDK already normalizes `thread_id` from the message
+/// event, and a present thread id is the authoritative topic signal there too.
+///
+/// * **p2p / regular group** (no thread id): the chat id, exactly the key
+///   `sessions.json` and `workspaces.json` have always used.
+/// * **topic group** (thread id present): `chatId:threadId`, so every topic
+///   thread gets its own session, cwd, pending queue and live run.
+///
+/// A topic-group message whose event dropped `thread_id` falls back to the
+/// chat id (the same fallback `scopeFor` applies; the TypeScript intake path
+/// additionally backfills the id through a message lookup, which the Rust
+/// bridge does not do). Pure: no I/O, no cache lookup.
+pub fn scope_key(message: &NormalizedMessage) -> String {
+    match message.thread_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(thread_id) => format!("{}:{thread_id}", message.chat_id),
+        None => message.chat_id.clone(),
+    }
+}
+
+/// Whether a run scope belongs to `chat_id` (the chat itself or a topic in it).
+///
+/// Card callbacks carry only the chat id, while a topic run's stop button is
+/// signed with the full `${chatId}:${threadId}` scope, so the click check has
+/// to accept both shapes without letting a different chat through.
+fn scope_belongs_to_chat(scope: &str, chat_id: &str) -> bool {
+    scope == chat_id
+        || scope
+            .strip_prefix(chat_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 pub struct Bridge {
     pub channel: Channel,
     pub profile: ProfileConfig,
@@ -125,13 +172,14 @@ pub struct Bridge {
     run_limit: Arc<RunLimiter>,
     /// Cached application-owner lookup used by the admin command gate.
     owner: OwnerGate,
-    /// Sessions are keyed by chat id *or* by document scope for comment
-    /// runs — see [`crate::comments`].
+    /// Sessions are keyed by scope — the chat id, `chatId:threadId` for topic
+    /// messages, or `doc:`/`comment:` scopes for comment runs. See
+    /// [`scope_key`] and [`crate::comments`].
     pub(crate) sessions: Mutex<SessionStore>,
     workspaces: Mutex<WorkspaceStore>,
-    /// Live run per chat. A run keeps its chat's pending scope blocked.
+    /// Live run per scope. A run keeps its scope's pending queue blocked.
     active: StdMutex<HashMap<String, ActiveRun>>,
-    /// Debounced per-chat message queue (pure structure; no timers inside).
+    /// Debounced per-scope message queue (pure structure; no timers inside).
     pending: StdMutex<PendingQueue<NormalizedMessage>>,
     /// Wakes the queue driver when a batch is armed, cancelled or unblocked.
     pending_wakeup: Notify,
@@ -310,7 +358,10 @@ impl Bridge {
                 .or_else(|| config.bot_open_id.clone()),
             bot_name: self.bot_name.clone().or_else(|| config.bot_name.clone()),
         };
-        let manager = Arc::new(MeetingManager::new(config, agent, api, host));
+        let manager = Arc::new(
+            MeetingManager::new(config, agent, api, host)
+                .with_run_limit(Arc::clone(&self.run_limit)),
+        );
         manager.set_push_hooked(true, None);
         let handle = manager.start();
         tracing::info!(
@@ -385,6 +436,12 @@ impl Bridge {
 
     pub fn sessions_path(&self) -> &std::path::Path {
         self.paths.sessions_file.as_path()
+    }
+
+    /// Shared global run limiter. Comment and meeting runs use this to take a
+    /// slot with [`RunLimiter::acquire_within`].
+    pub(crate) fn run_limiter(&self) -> &Arc<RunLimiter> {
+        &self.run_limit
     }
 
     /// Current profile snapshot: the startup profile, replaced by
@@ -508,13 +565,16 @@ impl Bridge {
         if text.is_empty() {
             return;
         }
+        // Resolve once for command side effects; `scope_key` is pure, so the
+        // command handlers can resolve the same scope from the same message.
+        let scope = scope_key(&message);
 
         // `/meeting ask|notes` can run the agent for up to `RUN_TIMEOUT`. The
         // CLI awaits this handler before it can answer a WebSocket heartbeat,
         // so meeting commands are detached and send their own reply — the same
         // reason file-comment runs are spawned by the event loop.
         if is_meeting_command(&text) {
-            self.discard_pending(&message.chat_id);
+            self.discard_pending(&scope);
             let bridge = Arc::clone(self);
             tokio::spawn(async move {
                 if let Some(reply) = bridge.handle_command(&message, &text).await {
@@ -528,8 +588,8 @@ impl Bridge {
 
         if let Some(reply) = self.handle_command(&message, &text).await {
             // Commands bypass the debounce queue and drop anything that was
-            // waiting for this chat (TS: `pending.cancel(scope)`).
-            self.discard_pending(&message.chat_id);
+            // waiting for this scope (TS: `pending.cancel(scope)`).
+            self.discard_pending(&scope);
             let _ = self.channel.send_text(&message.chat_id, reply).await;
             return;
         }
@@ -550,26 +610,24 @@ impl Bridge {
         crate::comments::handle_comment_mention(self, raw).await;
     }
 
-    /// Queue a message for its chat and make sure the debounce driver runs.
+    /// Queue a message for its scope and make sure the debounce driver runs.
     fn enqueue(self: &Arc<Self>, message: NormalizedMessage) {
-        // Scope = chat id: the Rust bridge has no per-topic session split yet.
-        // `PendingQueue` accepts any scope string, so a topic scope is a
-        // one-line change once sessions/active learn about threads (the TS
-        // bridge uses `chatId:threadId` for topic groups).
-        let scope = message.chat_id.clone();
+        // Topic groups key their queue by `chatId:threadId`, so each thread
+        // debounces and runs independently; everything else stays on chat id.
+        let scope = scope_key(&message);
         let outcome = {
             let mut pending = lock(&self.pending);
             pending.push(&scope, message, Instant::now())
         };
         if outcome.dropped > 0 {
             tracing::warn!(
-                chat = %scope,
+                scope = %scope,
                 queued = outcome.queued,
                 dropped = outcome.dropped,
                 "pending queue full; dropped the oldest queued message"
             );
         }
-        tracing::debug!(chat = %scope, queued = outcome.queued, "message queued");
+        tracing::debug!(scope = %scope, queued = outcome.queued, "message queued");
         self.ensure_pending_driver();
         self.pending_wakeup.notify_one();
     }
@@ -721,13 +779,13 @@ impl Bridge {
         BatchStart::Started
     }
 
-    /// Run finished (or was aborted): release its chat for the next batch.
+    /// Run finished (or was aborted): release its scope for the next batch.
     ///
-    /// Only the run that still owns the chat may unblock it, so a guard from
+    /// Only the run that still owns the scope may unblock it, so a guard from
     /// a delayed abort can never clear its successor's block. Every guard
     /// still wakes the driver, because it may just have released the global
     /// run slot (the permit is dropped before this call) even when a newer run
-    /// already owns the chat.
+    /// already owns the scope.
     fn finish_run(&self, scope: &str, id: u64) {
         let mut pending = lock(&self.pending);
         let owns = {
@@ -774,7 +832,7 @@ impl Bridge {
         (stopped, dropped)
     }
 
-    /// Drop the chat's queued batch (any handled command does this).
+    /// Drop the scope's queued batch (any handled command does this).
     fn discard_pending(&self, scope: &str) -> usize {
         let dropped = {
             let mut pending = lock(&self.pending);
@@ -791,22 +849,26 @@ impl Bridge {
     ) -> Option<String> {
         let command = text.split_whitespace().next().unwrap_or_default();
         let args = text.get(command.len()..).unwrap_or_default().trim();
+        // Commands must target exactly the scope the message belongs to: in a
+        // topic group `/stop` aborts that topic's run and `/new` clears that
+        // topic's session, never a sibling topic's.
+        let scope = scope_key(message);
         match command {
             "/stop" => {
-                let (stopped, _dropped) = self.stop_scope(&message.chat_id);
+                let (stopped, _dropped) = self.stop_scope(&scope);
                 Some(if stopped {
                     "已停止当前任务。".to_string()
                 } else {
                     "当前没有正在运行的任务。".to_string()
                 })
             }
-            "/new" | "/reset" => match self.sessions.lock().await.clear(&message.chat_id) {
+            "/new" | "/reset" => match self.sessions.lock().await.clear(&scope) {
                 Ok(()) => Some("已开启新会话。".to_string()),
                 Err(err) => Some(format!("重置失败：{err}")),
             },
-            "/cd" => Some(self.handle_cd(&message.chat_id, args).await),
-            "/pwd" => Some(self.handle_pwd(&message.chat_id).await),
-            "/status" => Some(self.handle_status(&message.chat_id).await),
+            "/cd" => Some(self.handle_cd(&scope, args).await),
+            "/pwd" => Some(self.handle_pwd(&scope).await),
+            "/status" => Some(self.handle_status(&scope).await),
             "/meeting" => Some(self.handle_meeting_command(message, args).await),
             "/config" => Some(self.handle_config(message, args).await),
             "/help" => Some(
@@ -825,36 +887,36 @@ impl Bridge {
         }
     }
 
-    /// `/cd <absolute path>`: canonicalize and persist a per-chat cwd.
-    async fn handle_cd(&self, chat_id: &str, args: &str) -> String {
+    /// `/cd <absolute path>`: canonicalize and persist a per-scope cwd.
+    async fn handle_cd(&self, scope: &str, args: &str) -> String {
         let path = match validate_cd_target(args) {
             Ok(path) => path,
             Err(reply) => return reply,
         };
         let mut workspaces = self.workspaces.lock().await;
-        match workspaces.set(chat_id, &path) {
+        match workspaces.set(scope, &path) {
             Ok(()) => format!("✓ 已切换 cwd 到 {}", path.display()),
             Err(err) => format!("保存工作目录失败：{err}"),
         }
     }
 
-    /// `/pwd`: the effective cwd for this chat.
-    async fn handle_pwd(&self, chat_id: &str) -> String {
+    /// `/pwd`: the effective cwd for this scope.
+    async fn handle_pwd(&self, scope: &str) -> String {
         let workspaces = self.workspaces.lock().await;
-        let cwd = effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir);
+        let cwd = effective_cwd(&workspaces, scope, &self.paths.default_workspace_dir);
         format!("当前 cwd：{}", cwd.display())
     }
 
     /// `/status`: profile/agent/app/cwd/reply-mode/resumable-session summary.
-    async fn handle_status(&self, chat_id: &str) -> String {
+    async fn handle_status(&self, scope: &str) -> String {
         let cwd = {
             let workspaces = self.workspaces.lock().await;
-            effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir)
+            effective_cwd(&workspaces, scope, &self.paths.default_workspace_dir)
         };
         let cwd_str = cwd.to_string_lossy().into_owned();
         let resume = {
             let sessions = self.sessions.lock().await;
-            sessions.resume_for(chat_id, &cwd_str).map(str::to_string)
+            sessions.resume_for(scope, &cwd_str).map(str::to_string)
         };
 
         let profile = self.live_profile();
@@ -977,13 +1039,16 @@ impl Bridge {
             // The token binds the scope, but a card can be forwarded to
             // another chat: refuse a click whose carrier message lives
             // elsewhere (the event carries the real chat id when available).
+            // A topic run's stop button carries `${chatId}:${threadId}`, so
+            // accept that shape for the click's chat while still rejecting a
+            // different chat.
             if let Some(clicked_chat) = action
                 .card_context
                 .as_ref()
                 .and_then(|context| context.open_chat_id.as_deref())
                 .filter(|chat| !chat.is_empty())
             {
-                if clicked_chat != scope {
+                if !scope_belongs_to_chat(scope, clicked_chat) {
                     tracing::warn!(
                         scope,
                         clicked_chat,
@@ -1109,12 +1174,13 @@ impl Bridge {
     /// A `/cd` target that cannot be created (deleted, permissions, replaced
     /// by a file) is reported and the profile default is used instead, so the
     /// run still has a chance to start. Comment runs pass their document
-    /// scope as the key, so the same rules apply per document.
-    pub(crate) async fn workspace_cwd(&self, chat_id: &str) -> PathBuf {
+    /// scope as the key, so the same rules apply per document; IM runs pass
+    /// the session scope (chat id or `chatId:threadId`).
+    pub(crate) async fn workspace_cwd(&self, scope: &str) -> PathBuf {
         let (cwd, default) = {
             let workspaces = self.workspaces.lock().await;
             (
-                effective_cwd(&workspaces, chat_id, &self.paths.default_workspace_dir),
+                effective_cwd(&workspaces, scope, &self.paths.default_workspace_dir),
                 default_cwd(&workspaces, &self.paths.default_workspace_dir),
             )
         };
@@ -1141,11 +1207,30 @@ impl Bridge {
         }
     }
 
+    /// Resumable session id for a run scope, if it was recorded in `cwd`.
+    async fn resume_scope_session(&self, scope: &str, cwd: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .resume_for(scope, cwd)
+            .map(str::to_string)
+    }
+
+    /// Persist the agent's session id under the run scope.
+    async fn save_scope_session(&self, scope: &str, session_key: &str, cwd: &str) {
+        if let Err(err) = self.sessions.lock().await.set(scope, session_key, cwd) {
+            tracing::warn!(error = %err, "cannot persist session");
+        }
+    }
+
     async fn run_batch(self: Arc<Self>, batch: Vec<NormalizedMessage>) -> anyhow::Result<()> {
         let Some(first) = batch.first() else {
             return Ok(());
         };
         let chat_id = first.chat_id.clone();
+        // Topic groups run under `chatId:threadId`; p2p/regular groups keep
+        // the plain chat id, preserving existing sessions.json keys.
+        let scope = scope_key(first);
         let last_message_id = batch
             .last()
             .map(|message| message.message_id.clone())
@@ -1158,13 +1243,11 @@ impl Bridge {
         let _working_reaction =
             WorkingReaction::start(self.channel.rest().clone(), last_message_id);
         // Snapshot the effective cwd for the whole run: session resume/record
-        // and the agent process must agree even if `/cd` lands mid-run.
-        let cwd = self.workspace_cwd(&chat_id).await;
+        // and the agent process must agree even if `/cd` lands mid-run. Topic
+        // scopes get their own cwd entry in the workspace store.
+        let cwd = self.workspace_cwd(&scope).await;
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let resume = {
-            let sessions = self.sessions.lock().await;
-            sessions.resume_for(&chat_id, &cwd_str).map(str::to_string)
-        };
+        let resume = self.resume_scope_session(&scope, &cwd_str).await;
 
         let context = self.prompt_context(&batch);
         let prompt = build_agent_prompt(&context, &batch_user_input(&batch));
@@ -1224,6 +1307,7 @@ impl Bridge {
                     termination_reason: TerminationReason::Failed,
                 });
                 self.finalize(
+                    &scope,
                     &chat_id,
                     &mut streaming,
                     message_id.as_deref(),
@@ -1263,7 +1347,7 @@ impl Bridge {
                     }
                     if use_card && last_update.elapsed() >= CARD_UPDATE_INTERVAL {
                         self.refresh_card(
-                            &chat_id,
+                            &scope,
                             &mut streaming,
                             message_id.as_deref(),
                             &view,
@@ -1277,13 +1361,11 @@ impl Bridge {
         }
 
         if let Some(key) = view.session_key().map(str::to_string) {
-            let mut sessions = self.sessions.lock().await;
-            if let Err(err) = sessions.set(&chat_id, &key, &cwd_str) {
-                tracing::warn!(error = %err, "cannot persist session");
-            }
+            self.save_scope_session(&scope, &key, &cwd_str).await;
         }
 
         self.finalize(
+            &scope,
             &chat_id,
             &mut streaming,
             message_id.as_deref(),
@@ -1295,8 +1377,12 @@ impl Bridge {
         Ok(())
     }
 
+    // `scope` (run/card-stop scope) and `chat_id` (reply target) differ for
+    // topic runs, so both stay explicit rather than being re-derived.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
+        scope: &str,
         chat_id: &str,
         streaming: &mut Option<StreamingCard>,
         message_id: Option<&str>,
@@ -1329,7 +1415,7 @@ impl Bridge {
                 }
             } else if started.elapsed() < CARD_SAFE_AGE {
                 if let Some(message_id) = message_id {
-                    self.update_card(chat_id, Some(message_id), view, started)
+                    self.update_card(scope, Some(message_id), view, started)
                         .await;
                     return;
                 }
@@ -1361,7 +1447,7 @@ impl Bridge {
     /// rest of the run (and only inside the safe window).
     async fn refresh_card(
         &self,
-        chat_id: &str,
+        scope: &str,
         streaming: &mut Option<StreamingCard>,
         message_id: Option<&str>,
         view: &RunView,
@@ -1369,7 +1455,7 @@ impl Bridge {
     ) {
         if let Some(handle) = streaming.as_mut() {
             if handle.is_live() {
-                let card = larkline_lark::enable_streaming(self.live_card(chat_id, view, started))
+                let card = larkline_lark::enable_streaming(self.live_card(scope, view, started))
                     .expect("builder-produced run card is valid");
                 match handle.set_card(&card).await {
                     Ok(true) => return,
@@ -1388,23 +1474,27 @@ impl Bridge {
             }
         }
         if started.elapsed() < CARD_SAFE_AGE {
-            self.update_card(chat_id, message_id, view, started).await;
+            self.update_card(scope, message_id, view, started).await;
         }
     }
 
     /// Card for a running frame (streaming mode stays on, signed stop button).
-    fn live_card(&self, chat_id: &str, view: &RunView, started: Instant) -> lark_channel::Card {
+    ///
+    /// The stop token is bound to the run scope, not just the chat, so the
+    /// button in a topic run aborts that topic's run and leaves sibling topics
+    /// alone.
+    fn live_card(&self, scope: &str, view: &RunView, started: Instant) -> lark_channel::Card {
         let token = if view.finished {
             None
         } else {
-            Some(self.tokens.sign(chat_id, "stop"))
+            Some(self.tokens.sign(scope, "stop"))
         };
         build_card(
             &self.live_profile(),
             view,
             card_status(view),
             started,
-            token.as_deref().map(|token| (chat_id, token)),
+            token.as_deref().map(|token| (scope, token)),
         )
     }
 
@@ -1415,7 +1505,7 @@ impl Bridge {
 
     async fn update_card(
         &self,
-        chat_id: &str,
+        scope: &str,
         message_id: Option<&str>,
         view: &RunView,
         started: Instant,
@@ -1423,7 +1513,7 @@ impl Bridge {
         let Some(message_id) = message_id else {
             return;
         };
-        let card = self.live_card(chat_id, view, started);
+        let card = self.live_card(scope, view, started);
         if let Err(err) = self.channel.update_card_message(message_id, &card).await {
             tracing::warn!(error = %err, "card update failed");
         }
@@ -1966,11 +2056,11 @@ fn validate_cd_target(input: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-/// Effective cwd for `chat_id`: explicit `/cd` override, else the profile
+/// Effective cwd for a scope: explicit `/cd` override, else the profile
 /// default, else `fallback` when the store was loaded without a default.
-fn effective_cwd(store: &WorkspaceStore, chat_id: &str, fallback: &Path) -> PathBuf {
+fn effective_cwd(store: &WorkspaceStore, scope: &str, fallback: &Path) -> PathBuf {
     store
-        .workspace_for(chat_id)
+        .workspace_for(scope)
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback.to_path_buf())
 }
@@ -2182,6 +2272,19 @@ mod tests {
     ) -> NormalizedMessage {
         let mut message = message(id, sender_id, sender_type, text);
         message.chat_id = chat_id.to_string();
+        message
+    }
+
+    /// Topic-group message: same chat, explicit `thread_id`.
+    fn topic_message(
+        chat_id: &str,
+        thread_id: &str,
+        id: &str,
+        sender_id: &str,
+        text: &str,
+    ) -> NormalizedMessage {
+        let mut message = message_in(chat_id, id, sender_id, "user", text);
+        message.thread_id = Some(thread_id.to_string());
         message
     }
 
@@ -3006,6 +3109,245 @@ mod tests {
             bridge.handle_card_action(&event).await.as_deref(),
             Some("操作已失效，请重新发起。")
         );
+    }
+
+    // ---- topic-scoped sessions, queues and runs -------------------------
+
+    #[test]
+    fn scope_key_is_chat_for_direct_and_group_messages_and_chat_thread_for_topics() {
+        let mut direct = message("om_1", "ou_1", "user", "hi");
+        direct.chat_type = MessageChatType::P2p;
+        assert_eq!(scope_key(&direct), "oc_1");
+
+        let group = message("om_1", "ou_1", "user", "hi");
+        assert_eq!(scope_key(&group), "oc_1");
+
+        let topic = topic_message("oc_1", "omt_1", "om_1", "ou_1", "hi");
+        assert_eq!(scope_key(&topic), "oc_1:omt_1");
+
+        // An empty thread id is the same as an absent one: the key must stay
+        // exactly the chat id so pre-topic sessions.json entries keep working.
+        let mut empty_thread = group.clone();
+        empty_thread.thread_id = Some(String::new());
+        assert_eq!(scope_key(&empty_thread), "oc_1");
+    }
+
+    #[tokio::test]
+    async fn topic_messages_queue_per_thread_while_plain_messages_stay_on_the_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+
+        bridge.enqueue(topic_message("oc_1", "omt_a", "om_a", "ou_1", "a"));
+        bridge.enqueue(topic_message("oc_1", "omt_b", "om_b", "ou_1", "b"));
+        bridge.enqueue(message_in("oc_1", "om_group", "ou_1", "user", "group"));
+
+        {
+            let pending = lock(&bridge.pending);
+            assert_eq!(pending.queued("oc_1:omt_a"), 1);
+            assert_eq!(pending.queued("oc_1:omt_b"), 1);
+            assert_eq!(pending.queued("oc_1"), 1);
+        }
+
+        bridge.discard_pending("oc_1:omt_a");
+        {
+            let pending = lock(&bridge.pending);
+            assert_eq!(pending.queued("oc_1:omt_a"), 0);
+            assert_eq!(pending.queued("oc_1:omt_b"), 1);
+            assert_eq!(pending.queued("oc_1"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_sessions_are_isolated_from_each_other_and_from_the_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope_a = scope_key(&topic_message("oc_1", "omt_a", "om_a", "ou_1", "a"));
+        let scope_b = scope_key(&topic_message("oc_1", "omt_b", "om_b", "ou_1", "b"));
+
+        bridge
+            .save_scope_session(&scope_a, "sess-a", "/work/topic-a")
+            .await;
+        bridge
+            .save_scope_session(&scope_b, "sess-b", "/work/topic-b")
+            .await;
+        bridge
+            .save_scope_session("oc_1", "sess-chat", "/work/chat")
+            .await;
+
+        assert_eq!(
+            bridge
+                .resume_scope_session(&scope_a, "/work/topic-a")
+                .await
+                .as_deref(),
+            Some("sess-a")
+        );
+        assert_eq!(
+            bridge
+                .resume_scope_session(&scope_b, "/work/topic-b")
+                .await
+                .as_deref(),
+            Some("sess-b")
+        );
+        assert_eq!(
+            bridge
+                .resume_scope_session("oc_1", "/work/chat")
+                .await
+                .as_deref(),
+            Some("sess-chat")
+        );
+        // A topic never resumes a sibling's session (or the chat-level one),
+        // and a stale cwd still invalidates the entry.
+        assert_eq!(
+            bridge.resume_scope_session(&scope_a, "/work/topic-b").await,
+            None
+        );
+        assert_eq!(
+            bridge.resume_scope_session(&scope_b, "/work/chat").await,
+            None
+        );
+        assert_eq!(
+            bridge.resume_scope_session("oc_1", "/work/topic-a").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn new_command_clears_only_the_topic_session() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope_a = scope_key(&topic_message("oc_1", "omt_a", "om_a", "ou_1", "a"));
+        let scope_b = scope_key(&topic_message("oc_1", "omt_b", "om_b", "ou_1", "b"));
+        bridge.save_scope_session(&scope_a, "sess-a", "/work").await;
+        bridge.save_scope_session(&scope_b, "sess-b", "/work").await;
+
+        let reply = bridge
+            .handle_command(
+                &topic_message("oc_1", "omt_a", "om_new", "ou_1", "/new"),
+                "/new",
+            )
+            .await
+            .expect("handled");
+        assert!(reply.contains("新会话"), "{reply}");
+
+        assert_eq!(bridge.resume_scope_session(&scope_a, "/work").await, None);
+        assert_eq!(
+            bridge
+                .resume_scope_session(&scope_b, "/work")
+                .await
+                .as_deref(),
+            Some("sess-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_command_aborts_only_the_topic_that_sent_it() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope_a = "oc_1:omt_a";
+        let scope_b = "oc_1:omt_b";
+        let handle_a = tokio::spawn(std::future::pending::<()>());
+        let handle_b = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                scope_a.to_string(),
+                ActiveRun {
+                    id: 1,
+                    handle: handle_a,
+                },
+            );
+            active.insert(
+                scope_b.to_string(),
+                ActiveRun {
+                    id: 2,
+                    handle: handle_b,
+                },
+            );
+        }
+        {
+            let mut pending = lock(&bridge.pending);
+            let now = Instant::now();
+            pending.block(scope_a);
+            pending.push(
+                scope_a,
+                topic_message("oc_1", "omt_a", "om_queued_a", "ou_1", "queued a"),
+                now,
+            );
+            pending.block(scope_b);
+            pending.push(
+                scope_b,
+                topic_message("oc_1", "omt_b", "om_queued_b", "ou_1", "queued b"),
+                now,
+            );
+        }
+
+        let reply = bridge
+            .handle_command(
+                &topic_message("oc_1", "omt_a", "om_stop", "ou_1", "/stop"),
+                "/stop",
+            )
+            .await
+            .expect("handled");
+        assert_eq!(reply, "已停止当前任务。");
+
+        {
+            let active = lock(&bridge.active);
+            assert!(!active.contains_key(scope_a), "topic A must be aborted");
+            assert!(active.contains_key(scope_b), "topic B must keep running");
+        }
+        {
+            let pending = lock(&bridge.pending);
+            assert_eq!(pending.queued(scope_a), 0);
+            assert!(!pending.is_blocked(scope_a));
+            assert_eq!(pending.queued(scope_b), 1);
+            assert!(pending.is_blocked(scope_b));
+        }
+
+        // Cleanup: abort the sibling topic's fake run.
+        assert!(bridge.stop_scope(scope_b).0);
+    }
+
+    #[tokio::test]
+    async fn topic_stop_button_is_bound_to_its_own_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope_a = "oc_1:omt_a";
+        let scope_b = "oc_1:omt_b";
+        let handle_b = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                scope_a.to_string(),
+                ActiveRun {
+                    id: 1,
+                    handle: tokio::spawn(std::future::pending::<()>()),
+                },
+            );
+            active.insert(
+                scope_b.to_string(),
+                ActiveRun {
+                    id: 2,
+                    handle: handle_b,
+                },
+            );
+        }
+
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "action": "stop",
+            "scope": scope_a,
+            "token": bridge.tokens.sign(scope_a, "stop"),
+        }));
+        assert_eq!(
+            bridge.handle_card_action(&event).await.as_deref(),
+            Some("已停止当前任务。")
+        );
+        {
+            let active = lock(&bridge.active);
+            assert!(!active.contains_key(scope_a));
+            assert!(active.contains_key(scope_b));
+        }
+        assert!(bridge.stop_scope(scope_b).0);
     }
 
     #[tokio::test]

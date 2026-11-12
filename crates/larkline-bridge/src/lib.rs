@@ -31,6 +31,17 @@ pub use owner::{
     can_run_admin_command, parse_owner_id,
 };
 pub use pending::{PendingQueue, PushOutcome, QueueLimits};
-pub use run::Bridge;
+pub use run::{Bridge, scope_key};
 pub use run_limit::{MAX_CONCURRENT_RUNS, RunLimiter, RunPermit};
 pub use text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};
+
+/// Serializes fake-agent script creation and spawning in unit tests.
+///
+/// Several tests write a `#!/bin/sh` fake agent and then spawn it. On Unix a
+/// concurrent `fork` can inherit the script's open-for-write fd and make a
+/// later `exec` of that script fail with `ETXTBSY` under parallel test
+/// execution. Taking this lock around write-then-spawn (and holding it until
+/// the child is running) keeps those test-only scripts reliable without
+/// affecting production code.
+#[cfg(test)]
+pub(crate) static TEST_FAKE_AGENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

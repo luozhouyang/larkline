@@ -8,6 +8,11 @@
 //! with the configured trigger, or `/meeting ask`/`notes` from IM), because
 //! acting on an offhand remark would be expensive and unsafe.
 //!
+//! Agent runs (answers, `/meeting ask|notes`, end-of-meeting summaries) share
+//! the bridge's global run limiter with IM and comment runs. A run waits up
+//! to a bounded budget for a slot and reports a user-visible timeout instead
+//! of spawning the agent over the cap.
+//!
 //! # Configuration
 //!
 //! The Rust profile schema is deliberately closed and keeps unknown keys in
@@ -81,7 +86,8 @@ use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::render::RunView;
-use crate::run::RUN_TIMEOUT;
+use crate::run::{RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT};
+use crate::run_limit::RunLimiter;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1674,6 +1680,9 @@ pub struct MeetingManager {
     agent: AgentSettings,
     api: Arc<dyn MeetingApi>,
     host: Arc<dyn MeetingHost>,
+    /// Global bridge run limiter. `None` in standalone/test managers, where
+    /// meeting runs are not capped.
+    run_limit: Option<Arc<RunLimiter>>,
     sessions: StdMutex<BTreeMap<String, MeetingSession>>,
     runs: StdMutex<HashMap<String, ActiveMeetingRun>>,
     next_run_id: AtomicU64,
@@ -1694,6 +1703,7 @@ impl MeetingManager {
             agent,
             api,
             host,
+            run_limit: None,
             sessions: StdMutex::new(BTreeMap::new()),
             runs: StdMutex::new(HashMap::new()),
             next_run_id: AtomicU64::new(1),
@@ -1701,6 +1711,16 @@ impl MeetingManager {
             shutdown: StdMutex::new(None),
             wake: Notify::new(),
         }
+    }
+
+    /// Attach the bridge's global run limiter.
+    ///
+    /// `Bridge::start_meeting` calls this; tests that are not exercising
+    /// concurrency leave it unset. The limiter is shared with IM, comment and
+    /// every other meeting run.
+    pub fn with_run_limit(mut self, limiter: Arc<RunLimiter>) -> Self {
+        self.run_limit = Some(limiter);
+        self
     }
 
     pub fn config(&self) -> &MeetingConfig {
@@ -2215,6 +2235,36 @@ impl MeetingManager {
 
     /// Submit one prompt to the profile's agent and drain it to a string.
     async fn run_agent(&self, scope: &str, prompt: String) -> String {
+        self.run_agent_with_wait(scope, prompt, RUN_SLOT_WAIT).await
+    }
+
+    /// [`Self::run_agent`] with an injectable slot-wait budget (tests use a
+    /// short one to exercise the timeout without sleeping for 30s).
+    ///
+    /// The global run permit is held for the whole agent run and dropped on
+    /// completion, spawn error, timeout or task abort. When no permit is free
+    /// within the budget the user gets [`RUN_SLOT_TIMEOUT_REPLY`] instead of
+    /// an over-cap spawn.
+    async fn run_agent_with_wait(
+        &self,
+        scope: &str,
+        prompt: String,
+        slot_wait: Duration,
+    ) -> String {
+        let _permit = match self.run_limit.as_ref() {
+            Some(limiter) => match limiter.acquire_within(slot_wait).await {
+                Some(permit) => Some(permit),
+                None => {
+                    tracing::warn!(
+                        scope,
+                        timeout_ms = slot_wait.as_millis(),
+                        "meeting run timed out waiting for a global run slot"
+                    );
+                    return RUN_SLOT_TIMEOUT_REPLY.to_string();
+                }
+            },
+            None => None,
+        };
         let cwd = self.host.workspace_cwd(scope).await;
         let cwd_str = cwd.to_string_lossy().into_owned();
         let resume = self.host.resume_session(scope, &cwd_str).await;
@@ -2819,19 +2869,102 @@ mod tests {
         api: Arc<FakeApi>,
         host: Arc<FakeHost>,
     ) -> Arc<MeetingManager> {
+        manager_with_binary(
+            config,
+            api,
+            host,
+            // A missing binary makes the run fail fast, which is exactly
+            // what the delivery-path tests need offline.
+            PathBuf::from("/nonexistent/larkline-test-agent"),
+        )
+    }
+
+    fn manager_with_binary(
+        config: MeetingConfig,
+        api: Arc<FakeApi>,
+        host: Arc<FakeHost>,
+        binary: PathBuf,
+    ) -> Arc<MeetingManager> {
         Arc::new(MeetingManager::new(
             config,
             AgentSettings {
                 kind: AgentKind::Claude,
-                // A missing binary makes the run fail fast, which is exactly
-                // what the delivery-path tests need offline.
-                binary: PathBuf::from("/nonexistent/larkline-test-agent"),
+                binary,
                 bot_open_id: None,
                 bot_name: None,
             },
             api,
             host,
         ))
+    }
+
+    /// Manager with a built-in limiter; returns both so the test can hold or
+    /// inspect slots.
+    fn manager_with_limiter(
+        config: MeetingConfig,
+        api: Arc<FakeApi>,
+        host: Arc<FakeHost>,
+        binary: PathBuf,
+        cap: u32,
+    ) -> (Arc<MeetingManager>, Arc<RunLimiter>) {
+        let limiter = Arc::new(RunLimiter::new(cap));
+        let manager = Arc::new(
+            MeetingManager::new(
+                config,
+                AgentSettings {
+                    kind: AgentKind::Claude,
+                    binary,
+                    bot_open_id: None,
+                    bot_name: None,
+                },
+                api,
+                host,
+            )
+            .with_run_limit(Arc::clone(&limiter)),
+        );
+        (manager, limiter)
+    }
+
+    /// Serialize fake-script write + spawn across the test binary; see
+    /// [`crate::TEST_FAKE_AGENT_LOCK`].
+    #[cfg(unix)]
+    async fn fake_agent_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::TEST_FAKE_AGENT_LOCK.lock().await
+    }
+
+    #[cfg(unix)]
+    fn fake_agent(dir: &std::path::Path, sleep_ms: u64) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-meeting-agent");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nsleep {}\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-meeting\",\"cwd\":\"/work\",\"model\":\"fake\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"text\",\"text\":\"meeting done\"}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"session_id\":\"sess-meeting\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            sleep_ms as f64 / 1000.0
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Fake agent that blocks until the test creates `release`, after writing
+    /// `started`; makes the permit-held assertion deterministic.
+    #[cfg(unix)]
+    fn blocking_fake_agent(
+        dir: &std::path::Path,
+        started: &std::path::Path,
+        release: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-meeting-agent-blocking");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-meeting\",\"cwd\":\"/work\",\"model\":\"fake\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"text\",\"text\":\"meeting done\"}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"session_id\":\"sess-meeting\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            started.display(),
+            release.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 
     fn activity(value: Value) -> MeetingActivityItem {
@@ -3892,5 +4025,112 @@ mod tests {
             format_summary("周会", "纪要"),
             "**会议纪要 · 周会**\n\n纪要"
         );
+    }
+
+    // ---- global run limiter ---------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn meeting_run_holds_a_global_slot_for_the_whole_fake_run() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("meeting-started");
+        let release = root.path().join("meeting-release");
+        let api = Arc::new(FakeApi::new());
+        let host = Arc::new(FakeHost::default());
+        let (manager, limiter) = manager_with_limiter(
+            MeetingConfig::default(),
+            api,
+            host,
+            blocking_fake_agent(root.path(), &started, &release),
+            1,
+        );
+        let scope = meeting_scope_id("70001");
+
+        let task = {
+            let manager = Arc::clone(&manager);
+            let scope = scope.clone();
+            tokio::spawn(async move { manager.run_agent(&scope, "hi".to_string()).await })
+        };
+
+        for _ in 0..400 {
+            if started.exists() || task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if task.is_finished() && !started.exists() {
+            let answer = task.await.expect("meeting task");
+            panic!("the meeting run ended before the fake agent started: {answer}");
+        }
+        assert!(started.exists(), "the fake agent must start");
+        assert_eq!(limiter.active(), 1);
+        assert!(
+            limiter.try_acquire().is_none(),
+            "a live meeting run must consume the global cap"
+        );
+
+        std::fs::write(&release, "go").unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("fake meeting run finished")
+            .expect("meeting task");
+        assert_eq!(answer, "meeting done");
+        assert_eq!(limiter.active(), 0);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn meeting_run_releases_its_slot_when_the_agent_cannot_start() {
+        let api = Arc::new(FakeApi::new());
+        let host = Arc::new(FakeHost::default());
+        let (manager, limiter) = manager_with_limiter(
+            MeetingConfig::default(),
+            api,
+            host,
+            PathBuf::from("/nonexistent/meeting-agent"),
+            1,
+        );
+        let answer = manager
+            .run_agent_with_wait(
+                &meeting_scope_id("70001"),
+                "hi".to_string(),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(answer.contains("无法启动 agent"), "{answer}");
+        assert_eq!(limiter.active(), 0);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn meeting_run_times_out_with_a_user_visible_slot_message() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let api = Arc::new(FakeApi::new());
+        let host = Arc::new(FakeHost::default());
+        let (manager, limiter) = manager_with_limiter(
+            MeetingConfig::default(),
+            api,
+            host,
+            fake_agent(root.path(), 0),
+            1,
+        );
+        let held = limiter.try_acquire().expect("only slot");
+
+        let answer = manager
+            .run_agent_with_wait(
+                &meeting_scope_id("70001"),
+                "hi".to_string(),
+                Duration::from_millis(25),
+            )
+            .await;
+        assert_eq!(answer, RUN_SLOT_TIMEOUT_REPLY);
+        assert_eq!(limiter.active(), 1, "the held slot is untouched");
+
+        drop(held);
+        assert_eq!(limiter.active(), 0);
     }
 }

@@ -56,8 +56,10 @@
 //! binds the click to the conversation:
 //!
 //! * `r` — its run/session id; opaque to the bridge (logged only);
-//! * `s` and `c` — the chat id the card is sent to (the Rust bridge has no
-//!   topic scopes, so both are the plain chat id);
+//! * `s` and `c` — the chat id the card is sent to. Agent-rendered callbacks
+//!   bind the plain chat id: a card action event carries no thread id, so the
+//!   bridge cannot verify a topic scope for them (the bridge's own stop
+//!   button, signed elsewhere, does use the run scope);
 //! * `o` — the open id of the user allowed to click, i.e. the sender of the
 //!   message that started the run (the `bridge_context.senderId` the agent
 //!   already sees);
@@ -78,8 +80,9 @@
 //! is rejected. The caller supplies what it can bind via
 //! [`CallbackExpected`]: scope, chat id, operator open id and action.
 //! `run_id` and `policy_fingerprint` are optional because the Rust bridge
-//! keeps neither TypeScript run ids nor policy fingerprints; it also has no
-//! per-topic scopes yet, so `s` must equal the chat id.
+//! keeps neither TypeScript run ids nor policy fingerprints. Agent callbacks
+//! also bind the plain chat id in `s` (their click event carries no thread
+//! id); the bridge's own stop button is signed with the full run scope.
 //!
 //! Replay protection is in-memory: a token replayed after a bridge restart is
 //! accepted until it expires. The TypeScript implementation persists used

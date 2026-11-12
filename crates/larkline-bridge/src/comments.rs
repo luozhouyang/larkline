@@ -69,8 +69,9 @@
 //! 3. `comments::fetch` pulls the thread and [`CommentMention`] keeps the
 //!    question (the reply that @-ed the bot), the quoted selection, whether it
 //!    is a whole-document comment, and the replies before it.
-//! 4. A `<comment_context>` prompt section plus the plain-text comment prompt
-//!    are handed to the shared agent runner.
+//! 4. The run takes a slot from the bridge's global run limiter (bounded wait)
+//!    and a `<comment_context>` prompt section plus the plain-text comment
+//!    prompt are handed to the shared agent runner.
 //! 5. The answer is replied into the same comment thread through
 //!    `larkline_lark::comments` (in-thread, or a fresh top-level comment for
 //!    whole-document comments) — never into IM.
@@ -93,6 +94,7 @@
 
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex as StdMutex};
+use std::time::Duration;
 
 use larkline_agent::{AgentEvent, PromptContext, SandboxMode, TerminationReason};
 use larkline_core::ProfileConfig;
@@ -105,7 +107,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::render::RunView;
-use crate::run::{Bridge, RUN_TIMEOUT};
+use crate::run::{Bridge, RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT};
 
 /// Platform event type of a cloud-doc comment @-mention.
 ///
@@ -950,6 +952,39 @@ async fn run_comment_agent(
     mention: &CommentMention,
     thread_scope: &str,
 ) -> RunView {
+    run_comment_agent_with_wait(bridge, event, mention, thread_scope, RUN_SLOT_WAIT).await
+}
+
+/// [`run_comment_agent`] with an injectable slot-wait budget (tests use a
+/// short one to exercise the timeout without sleeping for 30s).
+async fn run_comment_agent_with_wait(
+    bridge: &Bridge,
+    event: &RawCommentEvent,
+    mention: &CommentMention,
+    thread_scope: &str,
+    slot_wait: Duration,
+) -> RunView {
+    // Comment runs have no pending queue to park in, so they wait a bounded
+    // time for a global run slot instead of bypassing the cap. The permit is
+    // held until this function returns (normal completion, spawn error, or a
+    // dropped/aborted run); dropping it releases the slot for the queue
+    // driver and other bounded waiters.
+    let _permit = match bridge.run_limiter().acquire_within(slot_wait).await {
+        Some(permit) => permit,
+        None => {
+            tracing::warn!(
+                thread = %thread_scope,
+                timeout_ms = slot_wait.as_millis(),
+                "comment run timed out waiting for a global run slot"
+            );
+            let mut view = RunView::default();
+            view.apply(&AgentEvent::Error {
+                message: RUN_SLOT_TIMEOUT_REPLY.to_string(),
+                termination_reason: TerminationReason::Failed,
+            });
+            return view;
+        }
+    };
     let document_scope = comment_document_scope_id(&mention.file_token);
     let legacy_scope = legacy_comment_document_scope_id(&mention.file_token);
     // Same cwd rules as the IM path, keyed by the document scope so a
@@ -1087,7 +1122,11 @@ fn preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
     use larkline_core::config::{Access, AgentKind};
+    use larkline_core::{AppPaths, TenantBrand};
 
     fn profile() -> ProfileConfig {
         ProfileConfig {
@@ -1521,5 +1560,240 @@ mod tests {
         );
         drop(first);
         assert!(CommentRunGuard::acquire(scope).is_some());
+    }
+
+    // ---- global run limiter ---------------------------------------------
+
+    fn bridge_for(root: &Path, binary: PathBuf, cap: u32) -> Arc<Bridge> {
+        let mut profile = profile();
+        profile
+            .preferences
+            .get_or_insert_with(Default::default)
+            .max_concurrent_runs = Some(cap);
+        let paths = AppPaths::resolve(root, "test").expect("app paths");
+        let channel = larkline_lark::Channel::new("cli_test_app", "secret", TenantBrand::Feishu);
+        Arc::new(
+            Bridge::new(
+                channel,
+                profile,
+                binary,
+                root.join("workspace"),
+                None,
+                None,
+                paths,
+            )
+            .expect("bridge"),
+        )
+    }
+
+    /// Parse the standard fixture into the event + enriched mention a run
+    /// needs, without touching the network (the fetch step is skipped).
+    fn run_fixture() -> (RawCommentEvent, CommentMention) {
+        let CommentEventParse::Parsed(event) = event(flat_event_body()) else {
+            panic!("expected a parsed comment event");
+        };
+        let mention = mention(flat_event_body());
+        (event, mention)
+    }
+
+    /// Serialize fake-script write + spawn across the test binary; see
+    /// [`crate::TEST_FAKE_AGENT_LOCK`].
+    #[cfg(unix)]
+    async fn fake_agent_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::TEST_FAKE_AGENT_LOCK.lock().await
+    }
+
+    #[cfg(unix)]
+    fn fake_agent(dir: &Path, sleep_ms: u64) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-comment-agent");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nsleep {}\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-comment\",\"cwd\":\"/work\",\"model\":\"fake\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"text\",\"text\":\"comment done\"}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"session_id\":\"sess-comment\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            sleep_ms as f64 / 1000.0
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Fake agent that blocks until the test creates `release`, after writing
+    /// `started`. Makes "the permit is held for the whole run" deterministic
+    /// instead of relying on a sleep.
+    #[cfg(unix)]
+    fn blocking_fake_agent(dir: &Path, started: &Path, release: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-comment-agent-blocking");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-comment\",\"cwd\":\"/work\",\"model\":\"fake\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"text\",\"text\":\"comment done\"}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"session_id\":\"sess-comment\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            started.display(),
+            release.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comment_run_holds_a_global_slot_for_the_whole_fake_run() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("comment-started");
+        let release = root.path().join("comment-release");
+        let bridge = bridge_for(
+            root.path(),
+            blocking_fake_agent(root.path(), &started, &release),
+            1,
+        );
+        let (event, mention) = run_fixture();
+        let thread_scope = comment_scope_id(&event.file_token, &event.comment_id);
+
+        let task = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                run_comment_agent(&bridge, &event, &mention, &thread_scope).await
+            })
+        };
+
+        // The agent is blocked inside the fake binary: the permit is taken
+        // before the spawn and held until the run ends.
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the fake agent must start");
+        assert_eq!(bridge.run_limiter().active(), 1);
+        assert!(
+            bridge.run_limiter().try_acquire().is_none(),
+            "a live comment run must consume the global cap"
+        );
+
+        std::fs::write(&release, "go").unwrap();
+        let view = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("fake comment run finished")
+            .expect("comment task");
+        assert_eq!(view.best_answer(), "comment done");
+        assert_eq!(bridge.run_limiter().active(), 0);
+        assert!(bridge.run_limiter().try_acquire().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comment_run_releases_its_slot_when_the_agent_cannot_start() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = bridge_for(root.path(), PathBuf::from("/nonexistent/agent"), 1);
+        let (event, mention) = run_fixture();
+        let thread_scope = comment_scope_id(&event.file_token, &event.comment_id);
+
+        let view = run_comment_agent_with_wait(
+            &bridge,
+            &event,
+            &mention,
+            &thread_scope,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            comment_reply_text(&view, "Claude Code").contains("无法启动")
+                || comment_reply_text(&view, "Claude Code").contains("报错"),
+            "spawn failure should surface: {}",
+            comment_reply_text(&view, "Claude Code")
+        );
+        assert_eq!(bridge.run_limiter().active(), 0);
+        assert!(bridge.run_limiter().try_acquire().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comment_run_times_out_with_a_user_visible_slot_message() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let bridge = bridge_for(root.path(), fake_agent(root.path(), 0), 1);
+        let held = bridge.run_limiter().try_acquire().expect("only slot");
+        let (event, mention) = run_fixture();
+        let thread_scope = comment_scope_id(&event.file_token, &event.comment_id);
+
+        let view = run_comment_agent_with_wait(
+            &bridge,
+            &event,
+            &mention,
+            &thread_scope,
+            Duration::from_millis(25),
+        )
+        .await;
+        let reply = comment_reply_text(&view, "Claude Code");
+        assert!(reply.contains("并发任务"), "{reply}");
+        assert!(reply.contains("超时"), "{reply}");
+        assert_eq!(
+            bridge.run_limiter().active(),
+            1,
+            "the held slot is untouched"
+        );
+
+        drop(held);
+        assert_eq!(bridge.run_limiter().active(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comment_run_waits_for_the_slot_an_im_run_holds() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("comment-wait-started");
+        let release = root.path().join("comment-wait-release");
+        let bridge = bridge_for(
+            root.path(),
+            blocking_fake_agent(root.path(), &started, &release),
+            1,
+        );
+        let (event, mention) = run_fixture();
+        let thread_scope = comment_scope_id(&event.file_token, &event.comment_id);
+
+        // Stand in for a live IM run: the queue driver takes its permit with
+        // `try_acquire`, and this test holds exactly that.
+        let im_permit = bridge.run_limiter().try_acquire().expect("IM run slot");
+        let task = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                run_comment_agent_with_wait(
+                    &bridge,
+                    &event,
+                    &mention,
+                    &thread_scope,
+                    Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !started.exists(),
+            "the comment agent must not spawn while the IM run holds the cap"
+        );
+        assert_eq!(bridge.run_limiter().active(), 1);
+        assert!(!task.is_finished());
+
+        // Releasing the IM run's slot lets the waiting comment run start.
+        drop(im_permit);
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the comment run starts after the release");
+        std::fs::write(&release, "go").unwrap();
+        let view = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("comment run finishes after the slot is released")
+            .expect("comment task");
+        assert_eq!(view.best_answer(), "comment done");
+        assert_eq!(bridge.run_limiter().active(), 0);
     }
 }
