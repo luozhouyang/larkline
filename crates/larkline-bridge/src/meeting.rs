@@ -34,13 +34,16 @@
 //!   `None`, so without these the transcript self-echo filter and the
 //!   `@<botName>` trigger cannot work.
 //! * `summaryOwnerOpenId` — the owner DM target for `summaryTarget: "owner"`.
-//!   The Rust bridge does not resolve the bot owner (no API call yet); when it
-//!   is absent, `owner` falls back to `origin` exactly like the TypeScript
+//!   The runtime app owner resolved for `/meeting` command gating
+//!   ([`crate::owner`]) is not yet handed to the meeting manager, so the
+//!   summary target needs this explicit open id; when it is absent, `owner`
+//!   falls back to `origin` exactly like the TypeScript
 //!   `resolveSummaryTarget` fallback.
 //!
 //! The manager snapshots this config when it starts (`Bridge::start_meeting`).
-//! The Rust CLI has no `/config`, so a change takes effect after a restart;
-//! the TypeScript bridge re-reads the profile on every use instead.
+//! The bridge `/config set` only covers run preferences, so a meeting-config
+//! change takes effect after a restart; the TypeScript bridge re-reads the
+//! profile on every use instead.
 //!
 //! # Event sources
 //!
@@ -300,22 +303,19 @@ pub fn meeting_enabled(profile: &ProfileConfig) -> bool {
     config_from_profile(profile).enabled
 }
 
-/// Admin gate for `/meeting`, the TypeScript `canRunAdminCommand` subset.
+/// Static-list admin gate for `/meeting`, the TypeScript
+/// `canRunAdminCommand` subset *without* the runtime owner.
 ///
-/// The TypeScript bridge allows the runtime owner plus `access.admins`. The
-/// Rust bridge has no resolved owner yet, so the allowlist is the fallback
-/// trust set: a configured admin always passes; with an empty admin list a
-/// sender must be in `access.allowedUsers` (mirroring the personal-mode
-/// allowlist). With both lists empty the command fails closed, which is the
-/// safe default for a capability that exposes the bot to every participant.
+/// The bridge's command handlers call
+/// [`crate::owner::can_run_admin_command`] with the resolved owner, so they
+/// also accept the app owner. This helper keeps the pre-owner behaviour for
+/// callers/tests that only have a profile: a configured admin always passes;
+/// with an empty admin list a sender must be in `access.allowedUsers`
+/// (mirroring the personal-mode allowlist). With both lists empty the command
+/// fails closed, which is the safe default for a capability that exposes the
+/// bot to every participant.
 pub fn can_run_meeting_command(profile: &ProfileConfig, sender_id: &str) -> bool {
-    let Some(access) = profile.access.as_ref() else {
-        return false;
-    };
-    if access.admins.iter().any(|id| id == sender_id) {
-        return true;
-    }
-    access.admins.is_empty() && access.allowed_users.iter().any(|id| id == sender_id)
+    crate::owner::can_run_admin_command(profile, None, sender_id)
 }
 
 fn bool_field(object: &Map<String, Value>, key: &str) -> bool {

@@ -9,10 +9,12 @@ pub mod callback;
 pub mod comments;
 pub mod keepalive;
 pub mod meeting;
+pub mod owner;
 pub mod pending;
 pub mod policy;
 pub mod render;
 pub mod run;
+pub mod run_limit;
 pub mod text_render;
 
 pub use callback::{
@@ -24,6 +26,11 @@ pub use meeting::{
     MeetingPushHealth, MeetingSessionStatus, RestMeetingApi, can_run_meeting_command,
     config_from_profile, describe_meeting_error, meeting_enabled, parse_meeting_push,
 };
+pub use owner::{
+    OwnerGate, OwnerRefreshState, OwnerSnapshot, OwnerSource, RestOwnerSource,
+    can_run_admin_command, parse_owner_id,
+};
 pub use pending::{PendingQueue, PushOutcome, QueueLimits};
 pub use run::Bridge;
+pub use run_limit::{MAX_CONCURRENT_RUNS, RunLimiter, RunPermit};
 pub use text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};

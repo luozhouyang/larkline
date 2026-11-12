@@ -12,6 +12,20 @@
 //! spawning a competing agent; when the run ends the window re-arms and the
 //! next batch starts. `/stop` aborts the live run and drops the queued batch.
 //!
+//! A second, global limit caps how many agent runs may be live at once across
+//! every chat ([`crate::run_limit`], the port of `src/bot/process-pool.ts`).
+//! The cap comes from the live profile's `preferences.maxConcurrentRuns` and is
+//! refreshed by `reload_profile` after `/config set maxConcurrentRuns`. A due
+//! batch that cannot get a slot stays in the pending queue — blocked only once
+//! it actually starts — and the queue driver retries when a run releases its
+//! slot. Per-chat serialization is unchanged: one run per scope, always.
+//!
+//! `/config set` and `/meeting` use a shared admin gate
+//! ([`crate::owner::can_run_admin_command`]): configured admins (or the legacy
+//! allowed-users fallback) plus the runtime app owner resolved from
+//! `application/v6/applications/<app_id>`. The owner lookup fails closed for
+//! non-admins; see [`crate::owner`] for the cache/refresh semantics.
+//!
 //! The TypeScript keepalive watchdog is **not** started here: its decisions
 //! need a WebSocket connection status and a force-reconnect hook that
 //! `larkline-lark` does not expose yet. See
@@ -47,9 +61,11 @@ use tokio::task::JoinHandle;
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
 use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
+use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
 use crate::render::RunView;
+use crate::run_limit::{RunLimiter, RunPermit};
 use crate::text_render::{TextFormat, TextRenderOptions, render_text};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
@@ -82,7 +98,8 @@ const CONFIG_USAGE: &str = "用法：\n\
      /config 查看当前配置\n\
      /config set messageReply <card|markdown|text>\n\
      /config set showToolCalls <true|false>\n\
-     （修改需管理员；maxConcurrentRuns 当前只读）";
+     /config set maxConcurrentRuns <1-50>\n\
+     （修改需管理员）";
 
 /// Reply for a `/config set` from a sender outside the admin gate.
 const CONFIG_DENIED_REPLY: &str = "❌ 只有管理员可以修改配置。";
@@ -103,6 +120,11 @@ pub struct Bridge {
     /// without a restart. The public `profile` field stays the startup
     /// snapshot for modules that only need the agent identity/kind.
     live_profile: StdMutex<ProfileConfig>,
+    /// Global cap on concurrent bridge runs (port of `ProcessPool`). Sized
+    /// from the live profile and resized by `/config set maxConcurrentRuns`.
+    run_limit: Arc<RunLimiter>,
+    /// Cached application-owner lookup used by the admin command gate.
+    owner: OwnerGate,
     /// Sessions are keyed by chat id *or* by document scope for comment
     /// runs — see [`crate::comments`].
     pub(crate) sessions: Mutex<SessionStore>,
@@ -135,16 +157,48 @@ struct ActiveRun {
     handle: JoinHandle<()>,
 }
 
+/// A batch that owns a global run slot and may be spawned.
+///
+/// Held under the pending lock between `take_due` and registration in
+/// `active`, so `/stop` can never observe a half-started run.
+struct ClaimedBatch {
+    scope: String,
+    batch: Vec<NormalizedMessage>,
+    permit: RunPermit,
+}
+
+/// Result of asking the pending queue for the next runnable batch.
+enum BatchClaim {
+    /// A due batch (and a slot) is ready.
+    Claimed(ClaimedBatch),
+    /// Nothing has finished its quiet window yet.
+    NoDueBatch,
+    /// A batch is due, but every global run slot is in use. The batch stays
+    /// queued and the driver waits for a slot release.
+    AtCapacity,
+}
+
+/// Result of [`Bridge::start_due_batch`], consumed by the queue driver.
+enum BatchStart {
+    Started,
+    NoDueBatch,
+    AtCapacity,
+}
+
 /// Clears the queue block when a run ends, including an abort (`/stop`) that
-/// never reaches the end of the spawned future.
+/// never reaches the end of the spawned future. Also owns the global run slot:
+/// the permit is dropped *before* `finish_run` so a waking driver sees the
+/// freed capacity (declaration order alone would make that fragile).
 struct RunGuard {
     bridge: Arc<Bridge>,
     scope: String,
     id: u64,
+    permit: Option<RunPermit>,
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        drop(self.permit.take());
         self.bridge.finish_run(&self.scope, self.id);
     }
 }
@@ -187,6 +241,11 @@ impl Bridge {
             ),
         }
         let live_profile = profile.clone();
+        let run_limit = Arc::new(RunLimiter::new(profile.max_concurrent_runs()));
+        tracing::info!(cap = run_limit.cap(), "global agent run concurrency cap");
+        // The owner lookup reuses the bridge's tenant token cache. It stays
+        // lazy: no request is made until an admin-gated command needs it.
+        let owner = OwnerGate::new(Arc::new(RestOwnerSource::new(channel.rest().clone())));
 
         Ok(Self {
             channel,
@@ -198,6 +257,8 @@ impl Bridge {
             tokens: CallbackTokens::new(),
             callback_auth,
             live_profile: StdMutex::new(live_profile),
+            run_limit,
+            owner,
             sessions: Mutex::new(sessions),
             workspaces: Mutex::new(workspaces),
             active: StdMutex::new(HashMap::new()),
@@ -307,7 +368,7 @@ impl Bridge {
             return meeting::MEETING_DISABLED_REPLY.to_string();
         }
         let sender_id = message_sender_id(message);
-        if !meeting::can_run_meeting_command(&profile, sender_id) {
+        if !self.can_run_admin_command(sender_id).await {
             tracing::info!(command = "/meeting", "admin-deny");
             return meeting::MEETING_DENIED_REPLY.to_string();
         }
@@ -330,6 +391,49 @@ impl Bridge {
     /// [`Bridge::save_preference`] after `/config set` writes `config.json`.
     fn live_profile(&self) -> ProfileConfig {
         lock(&self.live_profile).clone()
+    }
+
+    /// Resolve the runtime owner id for the profile's app, with the 30-minute
+    /// cache from [`crate::owner`].
+    ///
+    /// Returns `None` when the profile has no app id or the lookup fails; the
+    /// caller must treat that as "no owner exemption" (fail closed).
+    async fn runtime_owner_id(&self, profile: &ProfileConfig) -> Option<String> {
+        let app_id = profile
+            .app()
+            .map(|app| app.id.trim())
+            .filter(|id| !id.is_empty());
+        let Some(app_id) = app_id else {
+            tracing::warn!(
+                "admin command denied: profile has no app id for runtime-owner resolution"
+            );
+            return None;
+        };
+        self.owner.owner_id(app_id).await
+    }
+
+    /// Shared admin gate for `/config set` and `/meeting`.
+    ///
+    /// Order matters: the configured lists are checked first (no network), and
+    /// the runtime owner is only consulted when they deny. An unknown/failed
+    /// owner resolution leaves non-admins denied — the fail-closed behaviour
+    /// the old static gate had.
+    async fn can_run_admin_command(&self, sender_id: &str) -> bool {
+        let profile = self.live_profile();
+        if owner::can_run_admin_command(&profile, None, sender_id) {
+            return true;
+        }
+        let owner_id = self.runtime_owner_id(&profile).await;
+        if owner::can_run_admin_command(&profile, owner_id.as_deref(), sender_id) {
+            tracing::info!(
+                sender = sender_id,
+                owner = owner_id.as_deref().unwrap_or("-"),
+                "admin command allowed for runtime owner"
+            );
+            return true;
+        }
+        tracing::info!(sender = sender_id, "admin-deny");
+        false
     }
 
     /// Persist one `/config set` preference to the root config file and reload
@@ -355,6 +459,9 @@ impl Bridge {
                     preferences.message_reply_migrated = Some(true);
                 }
                 PreferenceEdit::ShowToolCalls(show) => preferences.show_tool_calls = Some(show),
+                PreferenceEdit::MaxConcurrentRuns(cap) => {
+                    preferences.max_concurrent_runs = Some(cap);
+                }
             }
             Ok(())
         })
@@ -364,6 +471,10 @@ impl Bridge {
 
     /// Re-read this bridge's profile from the root config into the live
     /// snapshot. Leaves the old snapshot untouched on any failure.
+    ///
+    /// The live profile and the global run cap move together, so a
+    /// `/config set maxConcurrentRuns` update is visible to the next
+    /// queue-driver pass; the driver is woken when the cap changes.
     fn reload_profile(&self) -> Result<(), String> {
         let root = larkline_core::store::load_root(&self.paths.config_file)
             .map_err(|err| err.to_string())?;
@@ -378,7 +489,14 @@ impl Bridge {
                     self.paths.profile
                 )
             })?;
+        let cap = profile.max_concurrent_runs();
         *lock(&self.live_profile) = profile;
+        if self.run_limit.set_cap(cap) {
+            tracing::info!(cap, "global agent run concurrency cap updated");
+            // Wake the driver: a raised cap may make an already-due batch
+            // startable, and a lowered cap must re-check before the next run.
+            self.pending_wakeup.notify_one();
+        }
         Ok(())
     }
 
@@ -473,9 +591,32 @@ impl Bridge {
         }
     }
 
-    /// Sleep until the earliest quiet window ends, then start every due batch.
+    /// Wake for the earliest quiet window, then start every due batch that can
+    /// get a global slot.
+    ///
+    /// When the cap is reached the driver parks on `pending_wakeup` instead of
+    /// re-polling a deadline that is already in the past. The wake can come
+    /// from a [`RunGuard`] releasing its slot, from `/config` changing the cap,
+    /// or from a newly queued message (which is then re-checked harmlessly).
     async fn pending_driver(self: Arc<Self>) {
         loop {
+            loop {
+                match self.start_due_batch(Instant::now()) {
+                    BatchStart::Started => continue,
+                    BatchStart::NoDueBatch => break,
+                    BatchStart::AtCapacity => {
+                        // A slot release has its own signal in addition to the
+                        // pending wakeup, so a run future aborted before its
+                        // RunGuard exists still wakes us.
+                        tokio::select! {
+                            _ = self.pending_wakeup.notified() => {}
+                            _ = self.run_limit.slot_released() => {}
+                        }
+                        break;
+                    }
+                }
+            }
+
             let deadline = lock(&self.pending).next_deadline();
             match deadline {
                 Some(deadline) => {
@@ -486,10 +627,51 @@ impl Bridge {
                 }
                 None => self.pending_wakeup.notified().await,
             }
-
-            let now = Instant::now();
-            while self.start_due_batch(now) {}
         }
+    }
+
+    /// Claim the next due batch *and* a global run slot, without spawning.
+    ///
+    /// The caller must hold the pending lock: `take_due` marks the scope
+    /// blocked, and the claim has to stay atomic with `/stop` and with the
+    /// registration in `active` that `start_due_batch` performs.
+    ///
+    /// A due batch with no free slot is **not** removed from the queue, so its
+    /// messages are never dropped and the scope stays unblocked until a real
+    /// run takes it.
+    fn claim_due_batch_locked(
+        &self,
+        pending: &mut PendingQueue<NormalizedMessage>,
+        now: Instant,
+    ) -> BatchClaim {
+        let due = pending
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now);
+        if !due {
+            return BatchClaim::NoDueBatch;
+        }
+
+        let Some(permit) = self.run_limit.try_acquire() else {
+            tracing::debug!(
+                active = self.run_limit.active(),
+                cap = self.run_limit.cap(),
+                "global run cap reached; leaving due batch queued"
+            );
+            return BatchClaim::AtCapacity;
+        };
+
+        let Some((scope, batch)) = pending.take_due(now) else {
+            // The deadline disappeared between the check and take_due (only
+            // possible if another caller violates the pending-lock contract).
+            drop(permit);
+            return BatchClaim::NoDueBatch;
+        };
+
+        BatchClaim::Claimed(ClaimedBatch {
+            scope,
+            batch,
+            permit,
+        })
     }
 
     /// Take the next due batch and spawn its run, atomically with respect to
@@ -497,12 +679,18 @@ impl Bridge {
     ///
     /// The pending lock is held until the run is registered in `active`, so a
     /// concurrent stop either sees no run at all (and the batch stays queued)
-    /// or sees the registered run and aborts it. `take_due` marks the scope
-    /// blocked while it is still under the same lock.
-    fn start_due_batch(self: &Arc<Self>, now: Instant) -> bool {
+    /// or sees the registered run and aborts it. The global slot is moved into
+    /// [`RunGuard`], which releases it on normal completion *and* on abort.
+    fn start_due_batch(self: &Arc<Self>, now: Instant) -> BatchStart {
         let mut pending = lock(&self.pending);
-        let Some((scope, batch)) = pending.take_due(now) else {
-            return false;
+        let ClaimedBatch {
+            scope,
+            batch,
+            permit,
+        } = match self.claim_due_batch_locked(&mut pending, now) {
+            BatchClaim::Claimed(claimed) => claimed,
+            BatchClaim::NoDueBatch => return BatchStart::NoDueBatch,
+            BatchClaim::AtCapacity => return BatchStart::AtCapacity,
         };
 
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
@@ -517,6 +705,7 @@ impl Bridge {
                 bridge: Arc::clone(&bridge),
                 scope: task_scope,
                 id,
+                permit: Some(permit),
             };
             if let Err(err) = bridge.run_batch(batch).await {
                 tracing::error!(error = %err, "agent run failed");
@@ -529,13 +718,16 @@ impl Bridge {
         drop(active);
         drop(pending);
         let _ = start.send(());
-        true
+        BatchStart::Started
     }
 
     /// Run finished (or was aborted): release its chat for the next batch.
     ///
     /// Only the run that still owns the chat may unblock it, so a guard from
-    /// a delayed abort can never clear its successor's block.
+    /// a delayed abort can never clear its successor's block. Every guard
+    /// still wakes the driver, because it may just have released the global
+    /// run slot (the permit is dropped before this call) even when a newer run
+    /// already owns the chat.
     fn finish_run(&self, scope: &str, id: u64) {
         let mut pending = lock(&self.pending);
         let owns = {
@@ -548,10 +740,9 @@ impl Bridge {
                 _ => false,
             }
         };
-        if !owns {
-            return;
+        if owns {
+            pending.unblock(scope, Instant::now());
         }
-        pending.unblock(scope, Instant::now());
         drop(pending);
         self.pending_wakeup.notify_one();
     }
@@ -698,9 +889,11 @@ impl Bridge {
     /// The TypeScript command opens a CardKit form with every preference; the
     /// Rust bridge implements the text subset the run flow consumes. Reads are
     /// open to any user the message policy already admitted. Writes reuse the
-    /// `/meeting` admin gate (`access.admins`, or `access.allowed_users` while
-    /// the admin list is empty — the Rust bridge has no runtime-owner
-    /// discovery), then persist to the root config and reload the live profile.
+    /// `/meeting` admin gate: `access.admins`, the legacy `access.allowed_users`
+    /// fallback while the admin list is empty, or the runtime app owner
+    /// resolved by [`crate::owner`]. A denied gate never writes; an allowed one
+    /// persists to the root config and reloads the live profile (including the
+    /// run limiter when `maxConcurrentRuns` changed).
     async fn handle_config(&self, message: &NormalizedMessage, args: &str) -> String {
         let mut words = args.split_whitespace();
         match words.next() {
@@ -716,7 +909,7 @@ impl Bridge {
                     Err(reply) => return reply,
                 };
                 let sender_id = message_sender_id(message);
-                if !meeting::can_run_meeting_command(&self.live_profile(), sender_id) {
+                if !self.can_run_admin_command(sender_id).await {
                     tracing::info!(command = "/config set", key, "admin-deny");
                     return CONFIG_DENIED_REPLY.to_string();
                 }
@@ -1810,12 +2003,13 @@ fn reply_mode_label(mode: MessageReplyMode) -> &'static str {
 enum PreferenceEdit {
     MessageReply(MessageReplyMode),
     ShowToolCalls(bool),
+    MaxConcurrentRuns(u32),
 }
 
 /// Validate a `/config set <key> <value>` pair.
 ///
 /// Only the writable subset is accepted; everything else returns the usage
-/// text (or a read-only notice) so a typo never silently no-ops.
+/// text or a value-specific error so a typo never silently no-ops.
 fn parse_config_set(key: &str, value: &str) -> Result<PreferenceEdit, String> {
     let value = value.trim();
     match key {
@@ -1839,7 +2033,21 @@ fn parse_config_set(key: &str, value: &str) -> Result<PreferenceEdit, String> {
                 "showToolCalls 只接受 true|false，收到 `{value}`。\n\n{CONFIG_USAGE}"
             )),
         },
-        "maxConcurrentRuns" => Err(format!("maxConcurrentRuns 当前只读。\n\n{CONFIG_USAGE}")),
+        "maxConcurrentRuns" => {
+            // Match the TypeScript config card: numbers are floored and
+            // clamped to 1..=50. A non-number is a typo, not a clamp target.
+            let parsed = value.parse::<f64>().map_err(|_| {
+                format!("maxConcurrentRuns 只接受 1-50 的整数，收到 `{value}`。\n\n{CONFIG_USAGE}")
+            })?;
+            if !parsed.is_finite() || parsed < 1.0 {
+                return Err(format!(
+                    "maxConcurrentRuns 只接受 1-50 的整数，收到 `{value}`。\n\n{CONFIG_USAGE}"
+                ));
+            }
+            Ok(PreferenceEdit::MaxConcurrentRuns(
+                (parsed.floor() as u64).clamp(1, 50) as u32,
+            ))
+        }
         "" => Err(CONFIG_USAGE.to_string()),
         other => Err(format!("未知配置项 `{other}`。\n\n{CONFIG_USAGE}")),
     }
@@ -1850,8 +2058,9 @@ fn parse_config_set(key: &str, value: &str) -> Result<PreferenceEdit, String> {
 /// Mirrors the TypeScript dispatcher's `canUseDm`/`canUseGroup` union: the card
 /// action event carries no chat mode, so the operator may pass through either
 /// the DM allowlist (`allowedUsers`) or the group allowlist (`allowedChats`).
-/// Team mode opens usage to everyone. Empty lists fail closed, like the
-/// TypeScript bridge (the Rust bridge has no runtime-owner discovery).
+/// Team mode opens usage to everyone. Empty lists fail closed. The runtime app
+/// owner is not wired into card-click checks yet ([`crate::owner`] currently
+/// gates admin commands only), so this stays a static-list check.
 fn card_click_allowed(profile: &ProfileConfig, chat_id: &str, operator: &str) -> bool {
     if profile.mode == ProfileMode::Team {
         return true;
@@ -1931,7 +2140,10 @@ fn message_sender_id(message: &NormalizedMessage) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+    use async_trait::async_trait;
     use lark_channel::event::{
         CardActionContext, CardActionOperator, CardActionPayload, EventContext,
     };
@@ -1939,6 +2151,7 @@ mod tests {
     use larkline_core::config::{Access, AgentKind};
 
     use crate::callback::{CallbackKey, CallbackSignInput};
+    use crate::owner::OwnerSource;
 
     fn profile() -> ProfileConfig {
         ProfileConfig {
@@ -1958,6 +2171,62 @@ mod tests {
             "text": text,
         }))
         .expect("normalized message fixture")
+    }
+
+    fn message_in(
+        chat_id: &str,
+        id: &str,
+        sender_id: &str,
+        sender_type: &str,
+        text: &str,
+    ) -> NormalizedMessage {
+        let mut message = message(id, sender_id, sender_type, text);
+        message.chat_id = chat_id.to_string();
+        message
+    }
+
+    /// Profile with an app id, so runtime-owner resolution has an endpoint.
+    fn profile_with_app() -> ProfileConfig {
+        ProfileConfig::new(
+            AgentKind::Claude,
+            "cli_test_app",
+            larkline_core::SecretInput::Plain("secret".into()),
+            TenantBrand::Feishu,
+        )
+    }
+
+    /// Deterministic owner source; no network and no timing dependency.
+    struct FakeOwnerSource {
+        result: std::sync::Mutex<Result<Option<String>, String>>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeOwnerSource {
+        fn owner(id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                result: std::sync::Mutex::new(Ok(Some(id.to_string()))),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn failure(message: &str) -> Arc<Self> {
+            Arc::new(Self {
+                result: std::sync::Mutex::new(Err(message.to_string())),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OwnerSource for FakeOwnerSource {
+        async fn fetch_owner(&self, _app_id: &str) -> Result<Option<String>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.lock().expect("fake owner result").clone()
+        }
     }
 
     #[test]
@@ -2397,20 +2666,31 @@ mod tests {
     // ---- card callbacks -------------------------------------------------
 
     fn test_bridge(root: &Path, profile: ProfileConfig) -> Arc<Bridge> {
+        // Never hit the owner API from a unit test: the real source would try
+        // to reach Feishu. Tests that exercise owner gating install their own
+        // FakeOwnerSource with `test_bridge_with_owner`.
+        test_bridge_with_owner(root, profile, FakeOwnerSource::failure("offline test"))
+    }
+
+    fn test_bridge_with_owner(
+        root: &Path,
+        profile: ProfileConfig,
+        owner_source: Arc<dyn OwnerSource>,
+    ) -> Arc<Bridge> {
         let paths = AppPaths::resolve(root, "test").expect("app paths");
         let channel = Channel::new("cli_test_app", "secret", TenantBrand::Feishu);
-        Arc::new(
-            Bridge::new(
-                channel,
-                profile,
-                PathBuf::from("/nonexistent/larkline-test-agent"),
-                root.join("workspace"),
-                None,
-                None,
-                paths,
-            )
-            .expect("bridge"),
+        let mut bridge = Bridge::new(
+            channel,
+            profile,
+            PathBuf::from("/nonexistent/larkline-test-agent"),
+            root.join("workspace"),
+            None,
+            None,
+            paths,
         )
+        .expect("bridge");
+        bridge.owner = OwnerGate::new(owner_source);
+        Arc::new(bridge)
     }
 
     fn callback_profile(secret: &str) -> ProfileConfig {
@@ -2569,15 +2849,32 @@ mod tests {
             parse_config_set("showToolCalls", "TRUE").unwrap(),
             PreferenceEdit::ShowToolCalls(true)
         );
+        assert_eq!(
+            parse_config_set("maxConcurrentRuns", "5").unwrap(),
+            PreferenceEdit::MaxConcurrentRuns(5)
+        );
+        // Same normalisation as the TypeScript config card: floor then clamp.
+        assert_eq!(
+            parse_config_set("maxConcurrentRuns", "2.9").unwrap(),
+            PreferenceEdit::MaxConcurrentRuns(2)
+        );
+        assert_eq!(
+            parse_config_set("maxConcurrentRuns", "99").unwrap(),
+            PreferenceEdit::MaxConcurrentRuns(50)
+        );
         for (key, value) in [
             ("messageReply", "html"),
             ("showToolCalls", "yes"),
-            ("maxConcurrentRuns", "5"),
+            ("maxConcurrentRuns", "abc"),
+            ("maxConcurrentRuns", "0"),
             ("unknown", "x"),
             ("", ""),
         ] {
             let err = parse_config_set(key, value).unwrap_err();
-            assert!(err.contains("用法") || err.contains("只读"), "{key}: {err}");
+            assert!(
+                err.contains("用法") || err.contains("1-50"),
+                "{key}={value}: {err}"
+            );
         }
     }
 
@@ -2745,6 +3042,13 @@ mod tests {
         assert!(saved.starts_with('✓'), "{saved}");
         assert!(!bridge.live_profile().show_tool_calls());
 
+        let saved = bridge
+            .handle_config(&admin, "set maxConcurrentRuns 3")
+            .await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(bridge.live_profile().max_concurrent_runs(), 3);
+        assert_eq!(bridge.run_limit.cap(), 3);
+
         let persisted = larkline_core::store::load_root(&paths.config_file)
             .unwrap()
             .expect("root config");
@@ -2757,6 +3061,7 @@ mod tests {
         assert_eq!(prefs.message_reply, Some(MessageReplyMode::Card));
         assert_eq!(prefs.message_reply_migrated, Some(true));
         assert_eq!(prefs.show_tool_calls, Some(false));
+        assert_eq!(prefs.max_concurrent_runs, Some(3));
     }
 
     #[tokio::test]
@@ -2790,9 +3095,256 @@ mod tests {
 
         let unknown = bridge.handle_config(&admin, "set nope 1").await;
         assert!(unknown.contains("用法"), "{unknown}");
-        let read_only = bridge
+
+        // maxConcurrentRuns is writable now; the cap change is live.
+        let saved = bridge
             .handle_config(&admin, "set maxConcurrentRuns 5")
             .await;
-        assert!(read_only.contains("只读"), "{read_only}");
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(bridge.run_limit.cap(), 5);
+    }
+
+    #[tokio::test]
+    async fn config_change_resizes_the_live_run_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let paths = AppPaths::resolve(root.path(), "test").unwrap();
+        let mut root_config = RootConfig::default();
+        root_config.active_profile = "test".into();
+        root_config.profiles.insert("test".into(), profile.clone());
+        larkline_core::store::save_root(&paths.config_file, &root_config).unwrap();
+        let bridge = test_bridge(root.path(), profile);
+        let admin = message("om_1", "ou_admin", "user", "");
+
+        // One run holds a slot at the old cap (10).
+        let held = bridge.run_limit.try_acquire().expect("initial slot");
+        let saved = bridge
+            .handle_config(&admin, "set maxConcurrentRuns 1")
+            .await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(bridge.run_limit.cap(), 1);
+        // Lowering below the number of live runs throttles new starts instead
+        // of killing the live run, exactly like ProcessPool.release().
+        assert!(bridge.run_limit.try_acquire().is_none());
+
+        drop(held);
+        let replacement = bridge.run_limit.try_acquire().expect("slot after run");
+        assert!(bridge.run_limit.try_acquire().is_none());
+        drop(replacement);
+    }
+
+    // ---- global run limiter / queue interaction -------------------------
+
+    fn seed_due(bridge: &Bridge, chat_id: &str, message_id: &str, text: &str, age: Duration) {
+        let message = message_in(chat_id, message_id, "ou_1", "user", text);
+        let mut pending = lock(&bridge.pending);
+        pending.push(chat_id, message, Instant::now() - age);
+    }
+
+    fn claim_due(bridge: &Bridge) -> BatchClaim {
+        let mut pending = lock(&bridge.pending);
+        bridge.claim_due_batch_locked(&mut pending, Instant::now())
+    }
+
+    #[tokio::test]
+    async fn global_cap_leaves_due_batches_queued_until_a_slot_is_released() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile
+            .preferences
+            .get_or_insert_with(Preferences::default)
+            .max_concurrent_runs = Some(1);
+        let bridge = test_bridge(root.path(), profile);
+
+        // Both quiet windows elapsed; `oc_a` is due first.
+        seed_due(&bridge, "oc_a", "om_a", "first", Duration::from_secs(2));
+        seed_due(&bridge, "oc_b", "om_b", "second", Duration::from_secs(1));
+
+        let first = match claim_due(&bridge) {
+            BatchClaim::Claimed(claimed) => claimed,
+            _ => panic!("first batch should be startable"),
+        };
+        assert_eq!(first.scope, "oc_a");
+        assert_eq!(first.batch.len(), 1);
+        assert_eq!(bridge.run_limit.active(), 1);
+
+        // The second batch is due but there is no slot: it must stay queued
+        // and unblocked rather than be dropped or started.
+        assert!(matches!(claim_due(&bridge), BatchClaim::AtCapacity));
+        {
+            let pending = lock(&bridge.pending);
+            assert_eq!(pending.queued("oc_b"), 1);
+            assert!(!pending.is_blocked("oc_b"));
+            assert_eq!(pending.queued("oc_a"), 0);
+            assert!(pending.is_blocked("oc_a"));
+        }
+
+        // Simulate the run ending: RunGuard drops the permit then unblocks the
+        // scope (no task is spawned by this test, so unblock explicitly).
+        drop(first);
+        assert_eq!(bridge.run_limit.active(), 0);
+        lock(&bridge.pending).unblock("oc_a", Instant::now());
+
+        let second = match claim_due(&bridge) {
+            BatchClaim::Claimed(claimed) => claimed,
+            _ => panic!("queued batch should start after the slot is released"),
+        };
+        assert_eq!(second.scope, "oc_b");
+        assert_eq!(second.batch[0].text, "second");
+        drop(second);
+    }
+
+    /// Test-only wrapper that releases the global slot before signalling, so
+    /// the test never observes the notification before the semaphore count.
+    struct PermitSignal {
+        permit: Option<RunPermit>,
+        signal: Arc<Notify>,
+    }
+
+    impl Drop for PermitSignal {
+        fn drop(&mut self) {
+            drop(self.permit.take());
+            self.signal.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_a_run_releases_its_global_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile
+            .preferences
+            .get_or_insert_with(Preferences::default)
+            .max_concurrent_runs = Some(1);
+        let bridge = test_bridge(root.path(), profile);
+
+        let permit = bridge.run_limit.try_acquire().expect("only slot");
+        let signal = Arc::new(Notify::new());
+        let guard = PermitSignal {
+            permit: Some(permit),
+            signal: Arc::clone(&signal),
+        };
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let scope = "oc_1";
+        lock(&bridge.pending).block(scope);
+        lock(&bridge.active).insert(scope.to_string(), ActiveRun { id: 7, handle });
+
+        let (stopped, dropped) = bridge.stop_scope(scope);
+        assert!(stopped);
+        assert_eq!(dropped, 0);
+        tokio::time::timeout(Duration::from_secs(2), signal.notified())
+            .await
+            .expect("aborted run dropped its future");
+        assert_eq!(bridge.run_limit.active(), 0);
+        assert!(bridge.run_limit.try_acquire().is_some());
+    }
+
+    // ---- runtime owner gating -------------------------------------------
+
+    fn owner_bridge(
+        root: &Path,
+        profile: ProfileConfig,
+        source: Arc<FakeOwnerSource>,
+    ) -> Arc<Bridge> {
+        let paths = AppPaths::resolve(root, "test").unwrap();
+        let mut root_config = RootConfig::default();
+        root_config.active_profile = "test".into();
+        root_config.profiles.insert("test".into(), profile.clone());
+        larkline_core::store::save_root(&paths.config_file, &root_config).unwrap();
+        test_bridge_with_owner(root, profile, source)
+    }
+
+    #[tokio::test]
+    async fn runtime_owner_can_write_config_without_being_in_the_allowlists() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = profile_with_app();
+        let source = FakeOwnerSource::owner("ou_owner");
+        let bridge = owner_bridge(root.path(), profile, Arc::clone(&source));
+        let owner = message("om_1", "ou_owner", "user", "");
+        let stranger = message("om_2", "ou_stranger", "user", "");
+
+        let saved = bridge.handle_config(&owner, "set messageReply card").await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(
+            bridge.live_profile().message_reply(),
+            MessageReplyMode::Card
+        );
+        assert_eq!(source.calls(), 1);
+
+        let denied = bridge
+            .handle_config(&stranger, "set messageReply markdown")
+            .await;
+        assert!(denied.contains("管理员"), "{denied}");
+        // The owner lookup is cached: a denial does not re-hit the API.
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_lookup_failure_fails_closed_for_non_admins() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile_with_app();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let source = FakeOwnerSource::failure("permission denied");
+        let bridge = owner_bridge(root.path(), profile, Arc::clone(&source));
+
+        // Admins never trigger the owner lookup.
+        assert!(bridge.can_run_admin_command("ou_admin").await);
+        assert_eq!(source.calls(), 0);
+
+        // A non-admin is denied, and the failed lookup is cached (no retry
+        // storm). This is the fail-closed path for missing API scopes.
+        assert!(!bridge.can_run_admin_command("ou_user").await);
+        assert!(!bridge.can_run_admin_command("ou_other").await);
+        assert_eq!(source.calls(), 1);
+
+        let denied = bridge
+            .handle_config(
+                &message("om_1", "ou_user", "user", ""),
+                "set messageReply card",
+            )
+            .await;
+        assert!(denied.contains("管理员"), "{denied}");
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_app_id_keeps_admin_gating_fail_closed_without_an_api_call() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let source = FakeOwnerSource::owner("ou_owner");
+        let bridge = owner_bridge(root.path(), profile, Arc::clone(&source));
+
+        assert!(bridge.can_run_admin_command("ou_admin").await);
+        assert!(!bridge.can_run_admin_command("ou_owner").await);
+        assert_eq!(source.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_allowed_users_gate_still_works_without_an_owner_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile_with_app();
+        profile.access = Some(Access {
+            allowed_users: vec!["ou_user".into()],
+            ..Access::default()
+        });
+        let source = FakeOwnerSource::owner("ou_owner");
+        let bridge = owner_bridge(root.path(), profile, Arc::clone(&source));
+
+        assert!(bridge.can_run_admin_command("ou_user").await);
+        assert_eq!(source.calls(), 0);
     }
 }
