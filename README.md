@@ -10,11 +10,12 @@ larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com
 
 - Forwards Feishu / Lark messages to a local Claude Code or Codex CLI. DM the bot directly, or `@`-mention it in a group.
 - **Streaming card**: the answer and a tool summary update on one Lark card while the agent works. Running cards carry a stop button.
-- **Session continuity**: each chat resumes its own agent session. A session is only resumed from the working directory it was created in.
+- **Session continuity**: each chat or topic thread resumes its own agent session. A session is only resumed from the working directory it was created in.
 - **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. `/stop` aborts the current run and drops its queued batch.
-- **Per-chat working directory**: use `/cd` to switch the directory for the current chat, and `/pwd` to inspect it.
-- **Cloud-doc comments**: `@`-mention the bot in a supported document comment (`doc`, `docx`, `sheet` or `file`) and it replies in the same thread. The app must subscribe to `drive.notice.comment_add_v1`.
-- **In-meeting agent (opt-in)**: join a Feishu meeting, answer in-meeting or over IM, and produce notes from the live transcript.
+- **Global concurrency cap**: at most `preferences.maxConcurrentRuns` agent runs (default 10) are live at once; excess messages stay queued.
+- **Per-chat/topic working directory**: use `/cd` to switch the directory for the current chat or topic, and `/pwd` to inspect it.
+- **Cloud-doc comments**: `@`-mention the bot in a supported document comment (`doc`, `docx`, `sheet` or `file`) and it replies in the same thread. Comment runs are abortable by an admin with `/stop comment:<hash>`. The app must subscribe to `drive.notice.comment_add_v1`.
+- **In-meeting agent (opt-in)**: join a Feishu meeting, answer in-meeting or over IM, and produce notes from the live transcript. Meeting runs are abortable by an admin with `/stop meeting:<id>`.
 - **Long-running tasks**: Feishu stops accepting updates for a streaming card after about 10 minutes. larkline stops updating at 8.5 minutes and sends the final answer as a separate message, so a long run never ends silently.
 - **OS-managed service**: run in the foreground for debugging, then install a per-profile launchd, systemd or Task Scheduler service.
 - **Multiple profiles**: keep separate PersonalAgent apps, agents, sessions and workspaces on one machine.
@@ -68,7 +69,7 @@ The installer downloads the matching asset and verifies it against the release's
 
 | Platform | Release asset | Notes |
 |---|---|---|
-| macOS (Apple Silicon + Intel) | `larkline-darwin-universal.zip` | Universal binary, Developer ID-signed and notarized by Apple |
+| macOS (Apple Silicon + Intel) | `larkline-darwin-universal.zip` | Universal binary; the release job signs and notarizes it when the Apple secrets are configured (currently pending) |
 | Linux x86_64 | `larkline-linux-x86_64.tar.gz` | Statically linked (musl), no glibc dependency |
 | Linux aarch64 | `larkline-linux-aarch64.tar.gz` | Statically linked (musl), built on Ubuntu 24.04 ARM |
 | Windows x86_64 | `larkline-windows-x86_64.zip` | Unsigned; SmartScreen may warn on first run |
@@ -81,6 +82,8 @@ On Windows, extract `larkline.exe` from the release zip and put it on `PATH`. Th
 larkline upgrade --check   # report the latest release
 larkline upgrade           # print the exact installer command for it
 ```
+
+Both forms query the GitHub releases endpoint, so they need network access to GitHub. `--target-version <v>` still performs that lookup before printing the pinned installer command; it is not an offline mode.
 
 `larkline upgrade` never replaces the binary underneath a running daemon. It reports the available version and the installer command; you decide when to run it and restart the service. On Windows, replace `larkline.exe` from the release zip instead.
 
@@ -162,7 +165,7 @@ Daemon stdout/stderr logs are under `~/.larkline/profiles/<profile>/logs/daemon/
 | `larkline onboard [--name <name>] [--agent claude\|codex] [--tenant feishu\|lark] [--no-use]` | Create a profile by scanning a QR code (app registration device flow). |
 | `larkline profile list\|create\|use\|remove\|show` | Manage profiles. `create` needs `--app-id`; it also accepts `--app-secret`, `--agent`, `--tenant` and `--no-use`. `remove` takes `--yes` and `--purge-secret`. `show` prints one profile as JSON. |
 | `larkline secrets get\|set\|list\|remove` | Manage the encrypted keystore. `get` speaks the exec-provider JSON protocol on stdin/stdout; `list` prints ids, never values. |
-| `larkline upgrade [--check]` | Report the latest release and print the installer command. It never replaces the binary automatically. |
+| `larkline upgrade [--check] [--target-version <v>]` | Report the latest release and print the installer command. It never replaces the binary automatically; it needs network access. |
 | `larkline start` | Install (if needed) and start the OS-managed daemon. |
 | `larkline stop` | Stop the daemon and disable autostart. |
 | `larkline restart` | Restart an installed daemon. |
@@ -173,19 +176,20 @@ Daemon stdout/stderr logs are under `~/.larkline/profiles/<profile>/logs/daemon/
 
 Global options: `--home <path>` (defaults to `$LARKLINE_HOME` or `~/.larkline`), `--profile <name>` (defaults to `$LARKLINE_PROFILE` or the active profile), and `-v`/`-vv` for more logging.
 
-`ps` and `kill` read `~/.larkline/registry/processes.json`. `larkline run` registers its process at startup and removes it on normal exit and on ctrl-c/SIGTERM, so Rust and TypeScript processes share one list. `botName` is only filled in by the TypeScript bridge; the Rust SDK has no bot-identity accessor, so Rust entries show the app id instead.
+`ps` and `kill` read `~/.larkline/registry/processes.json`. `larkline run` registers its process at startup and removes it on normal exit and on ctrl-c/SIGTERM, so Rust and TypeScript processes share one list. Rust entries carry no `botName` (`lark-channel` 0.6 has no bot-identity accessor); `larkline ps` shows the profile, agent, pid and start time.
 
 ## Commands inside Feishu / Lark
 
 | Command | Effect |
 |---|---|
-| `/new`, `/reset` | Clear the current session for this chat. |
-| `/cd <absolute path>` | Switch this chat's working directory. The path must exist and be absolute; it is canonicalized. |
+| `/new`, `/reset` | Clear the current session for this chat/topic. |
+| `/cd <absolute path>` | Switch this chat/topic's working directory. The path must exist and be absolute; it is canonicalized. |
 | `/pwd` | Show the effective working directory. |
-| `/status` | Show profile, agent, app id, tenant, cwd, reply mode and whether a session is resumable. |
-| `/config` | Show the current reply preferences. |
+| `/status` | Show profile, agent, app id, tenant, cwd, reply mode, whether a session is resumable and the live run scopes. |
+| `/config` | Show the current reply preferences and concurrency cap. |
 | `/config set messageReply <card\|markdown\|text>` | Set the reply mode (admin only). |
 | `/config set showToolCalls <true\|false>` | Show or hide tool summaries (admin only). |
+| `/config set maxConcurrentRuns <1-50>` | Set the global agent concurrency cap (admin only). |
 | `/meeting` | Show the in-meeting agent status. Requires `meeting.enabled`. |
 | `/meeting join <9-digit number>` | Join a meeting by its 9-digit meeting number. |
 | `/meeting leave [meeting number]` | Leave the selected meeting. |
@@ -193,15 +197,18 @@ Global options: `--home <path>` (defaults to `$LARKLINE_HOME` or `~/.larkline`),
 | `/meeting ask <question>` | Ask a question with the meeting transcript as context. |
 | `/meeting transcript [meeting number]` | Show the transcript context the agent actually receives. |
 | `/meeting stop [meeting number]` | Interrupt the meeting's current agent run. |
-| `/stop` | Abort the current run, including the card's stop button. |
+| `/stop` | Abort the run in this chat/topic, including the card's stop button. |
+| `/stop <scope>` | Abort a specific live run by scope, such as `comment:<hash>` or `meeting:<id>` (admin only). |
 | `/help` | Show the list of available commands. |
 
 Notes:
 
 - DMs do not need an `@` mention. Groups require one by default; set `access.requireMentionInGroup` to `false` to relax that.
-- `/config set` and `/meeting` are admin commands. They accept a sender in `access.admins`; while the admin list is empty, a sender in `access.allowedUsers` is accepted instead. With both lists empty they fail closed.
+- `/config set`, `/meeting` and `/stop <scope>` are admin commands. They accept a sender in `access.admins`; while the admin list is empty, a sender in `access.allowedUsers` is accepted instead. The runtime app owner is also accepted. If the owner lookup fails, non-admins are denied.
 - `/config` reads are open to any sender the message policy already admitted.
-- Commands bypass the debounce queue and drop anything already waiting for that chat.
+- Commands bypass the debounce queue and drop anything already waiting for that scope (chat or topic).
+- `/stop <scope>` aborts a run that has no chat scope of its own. `/status` lists the live scopes.
+- `maxConcurrentRuns` caps concurrent agent runs across IM, comment and meeting runs. When the cap is reached, IM batches stay queued; comment and meeting runs wait briefly for a slot and then reply with a timeout notice.
 - `/meeting` additionally requires the profile's `meeting.enabled` to be `true`, and the app must have the VC bot scopes.
 - Commands are replied to as text, not as interactive cards.
 
@@ -216,6 +223,10 @@ Notes:
 `showToolCalls` controls whether the tool summary appears in the final card or text reply. It does not change what the agent does.
 
 Feishu force-finalizes a streaming card about 10 minutes after creation and drops later updates. larkline keeps updating until 8.5 minutes, then stops and delivers the final answer as a new message. This is a server-side limit, so it applies to desktop and mobile clients alike.
+
+### Concurrency
+
+`preferences.maxConcurrentRuns` (default 10, clamped to 1–50) caps how many agent runs are live at once across IM, comment and meeting scopes. `/config set maxConcurrentRuns <1-50>` writes it to the active profile and applies it immediately. Lowering the cap below the number of live runs lets those runs finish and holds new starts until a slot frees up.
 
 ## Configuration
 
@@ -241,7 +252,8 @@ A profile fragment looks like this. Do not replace the whole `config.json` with 
   },
   "preferences": {
     "messageReply": "card",
-    "showToolCalls": true
+    "showToolCalls": true,
+    "maxConcurrentRuns": 10
   },
   "access": {
     "allowedUsers": ["ou_xxx"],
@@ -292,10 +304,10 @@ The Rust bridge implements a subset of the TypeScript access model:
 
 - `access.allowedUsers` restricts who can trigger the bot in DMs, groups and comment threads. When the list is empty, no user allowlist is applied.
 - Group messages require an `@` mention by default. `access.requireMentionInGroup` can turn that off for a profile.
-- `access.admins` gates `/config set` and `/meeting`; while `admins` is empty, `access.allowedUsers` acts as the admin set.
+- `access.admins` gates `/config set`, `/meeting` and `/stop <scope>`; while `admins` is empty, `access.allowedUsers` acts as the admin set. The runtime app owner is also accepted, resolved from the Applications API and cached for 30 minutes.
 - `access.allowedChats` is not applied to ordinary messages yet. It is only consulted when verifying card-button clicks.
 
-Runtime app-owner discovery, `/invite`, `/remove` and the TypeScript owner-bypass rules are not ported yet. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
+The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` and `/remove` are not ported yet. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
 
 ### Meetings
 
@@ -316,8 +328,8 @@ The app needs the VC bot scopes, and the tenant must support the VC bot capabili
 | Path | Content |
 |---|---|
 | `~/.larkline/config.json` | Root config: `activeProfile` and `profiles` |
-| `~/.larkline/profiles/<profile>/sessions.json` | Resumable session per chat |
-| `~/.larkline/profiles/<profile>/workspaces.json` | Per-chat working directory overrides |
+| `~/.larkline/profiles/<profile>/sessions.json` | Resumable session per chat/topic scope |
+| `~/.larkline/profiles/<profile>/workspaces.json` | Per-scope working directory overrides |
 | `~/.larkline/profiles/<profile>/secrets.enc` | Encrypted App Secret and other secrets |
 | `~/.larkline/profiles/<profile>/.keystore.salt` | Per-profile keystore salt |
 | `~/.larkline/profiles/<profile>/logs/daemon/` | Daemon stdout/stderr logs |
@@ -344,13 +356,15 @@ If both `~/.lark-channel` and `~/.larkline` exist, nothing is renamed; the exist
 
 The Rust bridge does not yet implement these TypeScript features:
 
-- Runtime app-owner discovery, `/invite` / `/remove`, and `allowedChats` for ordinary messages.
+- The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` / `/remove`, and `allowedChats` for ordinary messages. (The runtime app owner is resolved for admin commands only.)
 - `/ws` named workspaces, `/resume`, `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`.
 - The full `/config` card form and the remaining presentation settings (COT process messages, reasoning bubble/panel, access and lark-cli policy).
 - Agent permission modes (`permissions.defaultAccess` / `maxAccess`); runs currently use full access.
 - Inbound image and file download. Agent runs receive text prompts only.
-- Topic/thread-scoped sessions; sessions are keyed by chat id.
+- Wiki comment targets; `doc`, `docx`, `sheet` and `file` are supported.
+- End-of-meeting summary threading: summaries go to the configured origin chat or owner DM as top-level messages.
 - The keepalive watchdog and bot-name enrichment for Rust-owned registry entries (`lark-channel` 0.6 exposes no bot identity).
+- The remaining TypeScript test suite; the Rust workspace ports the implemented behaviour, while the TypeScript sources and vitest specs stay in the tree as reference.
 
 See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reasons behind each gap.
 
@@ -364,7 +378,7 @@ See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reason
 
 **How do I change the App Secret?** Run `larkline secrets set app-<app_id>`, then restart the bridge or service. The config reference stays the same.
 
-**Windows shows a SmartScreen warning.** The Windows binary is not code-signed yet. The macOS build is signed and notarized; the Linux builds are unsigned but checksummed.
+**Windows shows a SmartScreen warning.** The Windows binary is not code-signed yet. macOS release artifacts are Developer ID-signed and notarized when the Apple secrets are configured (currently pending); the Linux builds are unsigned but checksummed.
 
 **`larkline ps` shows stale entries.** A process that was killed with SIGKILL (or crashed) cannot unregister itself. The next `larkline run` prunes dead pids; until then `ps` marks those entries `(stale)` and `kill` refuses to signal them.
 
@@ -382,7 +396,7 @@ cargo test --workspace
 ./target/release/larkline doctor
 ```
 
-Rust 1.85 or newer is required. CI runs the test suite on macOS, Ubuntu and Windows; formatting and clippy run on Linux. Releases are tag-driven: pushing a `v*` tag runs the release workflow, which formats and tests the workspace, builds statically linked (musl) Linux x86_64/aarch64, a signed and notarized macOS universal binary, and Windows x86_64, then publishes the assets with `SHA256SUMS` and a GitHub Release.
+Rust 1.85 or newer is required. CI runs the test suite on macOS, Ubuntu and Windows; formatting and clippy run on Linux. Releases are tag-driven: pushing a `v*` tag runs the release workflow, which formats and tests the workspace, builds statically linked (musl) Linux x86_64/aarch64, a macOS universal binary (Developer ID signed/notarized; the job fails without the Apple secrets, which are still pending), and Windows x86_64, then publishes the assets with `SHA256SUMS` and a GitHub Release.
 
 ## License
 

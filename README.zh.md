@@ -10,11 +10,12 @@ larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zar
 
 - 把飞书 / Lark 消息转发给本机 Claude Code 或 Codex CLI。可以私聊 bot，也可以在群里 `@bot`。
 - **流式卡片**：agent 工作期间，答案和工具摘要持续更新在同一张飞书卡片上；运行中的卡片带停止按钮。
-- **会话延续**：每个聊天恢复自己的 agent 会话；只有会话创建时使用的工作目录一致，才会恢复。
+- **会话延续**：每个聊天或话题线程恢复自己的 agent 会话；只有会话创建时使用的工作目录一致，才会恢复。
 - **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮；`/stop` 会中断当前任务并丢弃排队消息。
-- **按聊天切换工作目录**：用 `/cd` 切换当前聊天的工作目录，用 `/pwd` 查看。
-- **云文档评论**：在支持的文档评论（`doc`、`docx`、`sheet` 或 `file`）里 `@bot`，bridge 会在同一个评论线程里回复。应用需要订阅 `drive.notice.comment_add_v1` 事件。
-- **会议智能体（可选）**：让 bot 入会，在会中或通过私聊回答问题，并基于实时字幕生成纪要。
+- **全局并发上限**：同一时间最多运行 `preferences.maxConcurrentRuns` 个 agent 任务（默认 10），超出的消息继续排队。
+- **按聊天/话题切换工作目录**：用 `/cd` 切换当前聊天或话题的工作目录，用 `/pwd` 查看。
+- **云文档评论**：在支持的文档评论（`doc`、`docx`、`sheet` 或 `file`）里 `@bot`，bridge 会在同一个评论线程里回复。评论任务可以由管理员用 `/stop comment:<hash>` 中断。应用需要订阅 `drive.notice.comment_add_v1` 事件。
+- **会议智能体（可选）**：让 bot 入会，在会中或通过私聊回答问题，并基于实时字幕生成纪要。会议任务可以由管理员用 `/stop meeting:<id>` 中断。
 - **长任务保护**：飞书会在流式卡片创建约 10 分钟后停止接受更新。larkline 在约 8.5 分钟时停止更新卡片，等任务结束后把最终答案作为一条新消息单独发送，避免长任务静默丢失结果。
 - **系统服务**：可以前台调试，也可以安装按 profile 隔离的 launchd、systemd 或 Task Scheduler 服务。
 - **多 profile**：同一台机器上可以维护多套 PersonalAgent 应用、agent、会话和工作目录。
@@ -68,7 +69,7 @@ sh /tmp/larkline-install.sh --dir "$HOME/bin"
 
 | 平台 | 发布产物 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon + Intel） | `larkline-darwin-universal.zip` | Universal 二进制，Developer ID 签名并由 Apple notarize |
+| macOS（Apple Silicon + Intel） | `larkline-darwin-universal.zip` | Universal 二进制；配置好 Apple secrets 后由发布流水线签名并 notarize（目前仍待配置） |
 | Linux x86_64 | `larkline-linux-x86_64.tar.gz` | 静态链接（musl），不依赖 glibc |
 | Linux aarch64 | `larkline-linux-aarch64.tar.gz` | 静态链接（musl），在 Ubuntu 24.04 ARM 上构建 |
 | Windows x86_64 | `larkline-windows-x86_64.zip` | 未签名；首次运行可能触发 SmartScreen 警告 |
@@ -81,6 +82,8 @@ Windows 上请从 release zip 解压 `larkline.exe` 并放进 `PATH`。安装脚
 larkline upgrade --check   # 只检查最新版本
 larkline upgrade           # 打印对应的安装命令
 ```
+
+两种形式都会请求 GitHub 的 releases 地址，因此需要能访问 GitHub。`--target-version <v>` 也会先做这次查询，再打印指定版本的安装命令，并不是离线模式。
 
 `larkline upgrade` 不会在 daemon 运行时偷偷替换二进制。它只报告可用版本和安装命令，由你决定什么时候执行并重启服务。Windows 上用 release zip 替换 `larkline.exe`。
 
@@ -162,7 +165,7 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 | `larkline onboard [--name <name>] [--agent claude\|codex] [--tenant feishu\|lark] [--no-use]` | 扫码创建 profile（应用注册设备流）。 |
 | `larkline profile list\|create\|use\|remove\|show` | 管理 profile。`create` 必须传 `--app-id`，还支持 `--app-secret`、`--agent`、`--tenant` 和 `--no-use`；`remove` 支持 `--yes` 和 `--purge-secret`；`show` 以 JSON 打印一个 profile。 |
 | `larkline secrets get\|set\|list\|remove` | 管理加密 keystore。`get` 在 stdin/stdout 上使用 exec-provider JSON 协议；`list` 只打印 id，不打印值。 |
-| `larkline upgrade [--check]` | 报告最新版本并打印安装命令；不会自动替换二进制。 |
+| `larkline upgrade [--check] [--target-version <v>]` | 报告最新版本并打印安装命令；不会自动替换二进制；需要网络访问。 |
 | `larkline start` | 安装（如有需要）并启动系统服务。 |
 | `larkline stop` | 停止 daemon 并关闭开机自启。 |
 | `larkline restart` | 重启已安装的 daemon。 |
@@ -173,19 +176,20 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 
 全局选项：`--home <path>`（默认 `$LARKLINE_HOME` 或 `~/.larkline`）、`--profile <name>`（默认 `$LARKLINE_PROFILE` 或当前 profile）、`-v` / `-vv` 提高日志级别。
 
-`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。`larkline run` 启动时会注册自己的进程，正常退出和 ctrl-c/SIGTERM 时移除条目，因此 Rust 和 TypeScript 进程共用同一份列表。`botName` 只有 TypeScript bridge 会填写：Rust SDK 没有读取 bot 身份的接口，所以 Rust 条目回退显示 app id。
+`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。`larkline run` 启动时会注册自己的进程，正常退出和 ctrl-c/SIGTERM 时移除条目，因此 Rust 和 TypeScript 进程共用同一份列表。Rust 条目没有 `botName`（`lark-channel` 0.6 没有读取 bot 身份的接口）；`larkline ps` 显示 profile、agent、pid 和启动时间。
 
 ## 飞书内命令
 
 | 命令 | 作用 |
 |---|---|
-| `/new`, `/reset` | 清空当前聊天的会话。 |
-| `/cd <绝对路径>` | 切换当前聊天的工作目录。路径必须存在且为绝对路径，会被 canonicalize。 |
+| `/new`, `/reset` | 清空当前聊天/话题的会话。 |
+| `/cd <绝对路径>` | 切换当前聊天/话题的工作目录。路径必须存在且为绝对路径，会被 canonicalize。 |
 | `/pwd` | 显示当前生效的工作目录。 |
-| `/status` | 显示 profile、agent、app id、tenant、cwd、回复模式和会话是否可恢复。 |
-| `/config` | 显示当前回复偏好。 |
+| `/status` | 显示 profile、agent、app id、tenant、cwd、回复模式、会话是否可恢复和正在运行的 scope。 |
+| `/config` | 显示当前回复偏好和并发上限。 |
 | `/config set messageReply <card\|markdown\|text>` | 设置回复模式（仅管理员）。 |
 | `/config set showToolCalls <true\|false>` | 显示或隐藏工具摘要（仅管理员）。 |
+| `/config set maxConcurrentRuns <1-50>` | 设置全局 agent 并发上限（仅管理员）。 |
 | `/meeting` | 显示会议智能体状态。需要 `meeting.enabled`。 |
 | `/meeting join <9 位会议号>` | 按 9 位会议号入会。 |
 | `/meeting leave [会议号]` | 离开指定会议。 |
@@ -193,15 +197,18 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 | `/meeting ask <问题>` | 带上会议字幕上下文提问。 |
 | `/meeting transcript [会议号]` | 查看 agent 实际拿到的字幕上下文。 |
 | `/meeting stop [会议号]` | 中断该会议当前的 agent 任务。 |
-| `/stop` | 中断当前任务，效果等同于卡片上的停止按钮。 |
+| `/stop` | 中断当前聊天/话题中的任务，效果等同于卡片上的停止按钮。 |
+| `/stop <scope>` | 按 scope 中断指定运行，例如 `comment:<hash>` 或 `meeting:<id>`（仅管理员）。 |
 | `/help` | 显示可用命令列表。 |
 
 说明：
 
 - 私聊不需要 `@`；群聊默认需要。可以把 `access.requireMentionInGroup` 设为 `false` 放宽。
-- `/config set` 和 `/meeting` 是管理员命令。发送者在 `access.admins` 中可以通过；`admins` 为空时，`access.allowedUsers` 作为管理员名单；两个名单都为空时一律拒绝。
+- `/config set`、`/meeting` 和 `/stop <scope>` 是管理员命令。发送者在 `access.admins` 中可以通过；`admins` 为空时，`access.allowedUsers` 作为管理员名单；运行时应用 owner 也可以通过。owner 查询失败时，非管理员一律拒绝。
 - `/config` 的读取对所有已经通过消息策略的发送者开放。
-- 命令会绕过防抖队列，并丢弃该聊天中已经排队的消息。
+- 命令会绕过防抖队列，并丢弃该 scope（聊天或话题）中已经排队的消息。
+- `/stop <scope>` 用于中断没有聊天 scope 的任务；`/status` 会列出当前正在运行的 scope。
+- `maxConcurrentRuns` 限制 IM、评论和会议任务的总并发。达到上限时，IM 消息继续排队；评论和会议任务会短暂等待运行槽，超时后回复提示。
 - `/meeting` 还要求 profile 的 `meeting.enabled` 为 `true`，并且应用具备 VC bot 相关 scope。
 - 命令回复都是文本消息，不是交互卡片。
 
@@ -216,6 +223,10 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 `showToolCalls` 控制最终卡片或文本回复里是否展示工具摘要，不影响 agent 实际执行的操作。
 
 飞书会在流式卡片创建约 10 分钟后强制结束卡片并丢弃后续更新。larkline 会更新到约 8.5 分钟，然后停止更新，并在任务结束后把最终答案作为一条新消息发送。这是服务端限制，桌面端和手机端都一样。
+
+### 并发
+
+`preferences.maxConcurrentRuns`（默认 10，限制在 1–50）限制 IM、评论和会议 scope 同时运行的 agent 任务数。`/config set maxConcurrentRuns <1-50>` 会写入当前 profile 并立即生效。把上限降到低于当前运行数时，已有任务会继续跑完，新任务等到有空槽后再启动。
 
 ## 配置
 
@@ -241,7 +252,8 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
   },
   "preferences": {
     "messageReply": "card",
-    "showToolCalls": true
+    "showToolCalls": true,
+    "maxConcurrentRuns": 10
   },
   "access": {
     "allowedUsers": ["ou_xxx"],
@@ -292,10 +304,10 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 
 - `access.allowedUsers` 限制谁能在私聊、群聊和评论线程中触发 bot。名单为空时，不启用用户白名单。
 - 群消息默认要求 `@` mention；`access.requireMentionInGroup` 可以按 profile 关闭这个要求。
-- `access.admins` 控制 `/config set` 和 `/meeting`；`admins` 为空时，`access.allowedUsers` 作为管理员集合。
+- `access.admins` 控制 `/config set`、`/meeting` 和 `/stop <scope>`；`admins` 为空时，`access.allowedUsers` 作为管理员集合。运行时应用 owner 也可以通过；owner 从 Applications API 解析并缓存 30 分钟。
 - `access.allowedChats` 暂不作用于普通消息，只在校验卡片按钮点击时使用。
 
-运行时应用 owner 识别、`/invite`、`/remove` 以及 TypeScript 版本的 owner 绕过规则尚未移植。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
+普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` 和 `/remove` 尚未移植。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
 
 ### 会议
 
@@ -316,8 +328,8 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 | 路径 | 内容 |
 |---|---|
 | `~/.larkline/config.json` | root config：`activeProfile` 和 `profiles` |
-| `~/.larkline/profiles/<profile>/sessions.json` | 每个聊天的可恢复会话 |
-| `~/.larkline/profiles/<profile>/workspaces.json` | 按聊天保存的工作目录覆盖 |
+| `~/.larkline/profiles/<profile>/sessions.json` | 每个聊天/话题 scope 的可恢复会话 |
+| `~/.larkline/profiles/<profile>/workspaces.json` | 按 scope 保存的工作目录覆盖 |
 | `~/.larkline/profiles/<profile>/secrets.enc` | 加密的 App Secret 和其他 secret |
 | `~/.larkline/profiles/<profile>/.keystore.salt` | 每个 profile 的 keystore salt |
 | `~/.larkline/profiles/<profile>/logs/daemon/` | daemon 的 stdout / stderr 日志 |
@@ -344,13 +356,15 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 
 Rust bridge 暂未实现以下 TypeScript 功能：
 
-- 运行时应用 owner 识别、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。
+- 普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。（运行时应用 owner 只用于管理员命令。）
 - `/ws` 命名工作空间、`/resume`、`/timeout`、飞书内 `/ps`、`/exit`、`/reconnect`、`/doctor`。
 - 完整的 `/config` 卡片表单，以及其余展示设置（COT 过程消息、思考内容气泡 / 面板、访问控制和 lark-cli 策略）。
 - Agent 权限模式（`permissions.defaultAccess` / `maxAccess`）；当前 run 使用完整权限。
 - 入站图片和文件下载。agent 目前只收到文本 prompt。
-- 按话题 / thread 拆分的会话；会话目前按 chat id 存储。
+- Wiki 评论目标；目前支持 `doc`、`docx`、`sheet` 和 `file`。
+- 会议纪要的 thread 归属：纪要会作为顶层消息发到配置的来源聊天或 owner 私聊。
 - Keepalive watchdog，以及 Rust 注册条目的 bot 名称补全（`lark-channel` 0.6 没有读取 bot 身份的接口）。
+- 完整的 TypeScript 测试套件；Rust workspace 只覆盖已实现的行为，TypeScript 源码和 vitest 用例仍作为参考留在仓库里。
 
 每项缺口的原因和当前状态见 [Rust 移植说明](./docs/RUST-PORT.md)。
 
@@ -364,7 +378,7 @@ Rust bridge 暂未实现以下 TypeScript 功能：
 
 **怎么更换 App Secret？** 运行 `larkline secrets set app-<app_id>`，然后重启 bridge 或服务。配置里的引用不需要改。
 
-**Windows 提示 SmartScreen 警告。** Windows 二进制目前没有代码签名。macOS 版本已签名并 notarize；Linux 版本未签名，但提供校验和。
+**Windows 提示 SmartScreen 警告。** Windows 二进制目前没有代码签名。配置好 Apple secrets 后，macOS 产物会做 Developer ID 签名并 notarize（目前仍待配置）；Linux 版本未签名，但提供校验和。
 
 **`larkline ps` 里有 stale 条目。** 被 SIGKILL 杀掉或崩溃的进程没法自己注销。下一次 `larkline run` 会清理死 pid；在那之前 `ps` 会把它们标成 `(stale)`，`kill` 不会向它们发信号。
 
@@ -382,7 +396,7 @@ cargo test --workspace
 ./target/release/larkline doctor
 ```
 
-需要 Rust 1.85 或更新版本。CI 在 macOS、Ubuntu 和 Windows 上跑测试；格式检查和 clippy 只在 Linux 上跑。发布由 tag 触发：推送 `v*` tag 后会运行发布流水线，执行格式检查和测试，构建静态链接（musl）的 Linux x86_64/aarch64、macOS Universal（签名并 notarize）和 Windows x86_64，然后上传产物、`SHA256SUMS` 并创建 GitHub Release。
+需要 Rust 1.85 或更新版本。CI 在 macOS、Ubuntu 和 Windows 上跑测试；格式检查和 clippy 只在 Linux 上跑。发布由 tag 触发：推送 `v*` tag 后会运行发布流水线，执行格式检查和测试，构建静态链接（musl）的 Linux x86_64/aarch64、macOS Universal（Developer ID 签名并 notarize；缺少 Apple secrets 时流水线会失败，目前仍待配置）和 Windows x86_64，然后上传产物、`SHA256SUMS` 并创建 GitHub Release。
 
 ## 许可
 
