@@ -201,6 +201,22 @@ impl<T> PendingQueue<T> {
             .map_or(0, |entry| entry.messages.len())
     }
 
+    /// Every scope with queued messages, sorted, with its batch size.
+    ///
+    /// Includes scopes whose quiet window is armed but whose run has not
+    /// started yet, so `/ps` can show queued work that is not in the active
+    /// run map. Empty scopes are omitted.
+    pub fn queued_scopes(&self) -> Vec<(String, usize)> {
+        let mut scopes: Vec<(String, usize)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.messages.is_empty())
+            .map(|(scope, entry)| (scope.clone(), entry.messages.len()))
+            .collect();
+        scopes.sort_by(|a, b| a.0.cmp(&b.0));
+        scopes
+    }
+
     /// Total messages queued across all scopes.
     pub fn len(&self) -> usize {
         self.entries
@@ -300,6 +316,34 @@ mod tests {
             queue.take_due(at(t0, 700)).expect("second scope is due").1,
             vec!["b"]
         );
+    }
+
+    #[test]
+    fn queued_scopes_lists_every_non_empty_batch_in_order() {
+        let t0 = Instant::now();
+        let mut queue = queue();
+        queue.push("oc_b", "b1", t0);
+        queue.push("oc_a", "a1", t0);
+        queue.push("oc_a", "a2", t0);
+        queue.push("oc_c", "c1", t0);
+        // A scope with an armed quiet window is still reported by `/ps`.
+        assert_eq!(
+            queue.queued_scopes(),
+            vec![
+                ("oc_a".to_string(), 2),
+                ("oc_b".to_string(), 1),
+                ("oc_c".to_string(), 1),
+            ]
+        );
+
+        // Cancelling a batch drops it from the list.
+        queue.cancel("oc_b");
+        assert_eq!(
+            queue.queued_scopes(),
+            vec![("oc_a".to_string(), 2), ("oc_c".to_string(), 1)]
+        );
+        queue.cancel("oc_a");
+        assert_eq!(queue.queued_scopes(), vec![("oc_c".to_string(), 1)]);
     }
 
     #[test]

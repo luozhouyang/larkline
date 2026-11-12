@@ -110,6 +110,58 @@ impl SessionStore {
         self.save()
     }
 
+    /// Per-scope idle-timeout override in minutes.
+    ///
+    /// `None` means "follow the global preference"; `Some(0)` means the
+    /// watchdog is explicitly disabled for this scope. Port of
+    /// `SessionStore.getIdleTimeoutMinutes` in `src/session/store.ts`.
+    pub fn idle_timeout_minutes(&self, chat_id: &str) -> Option<u64> {
+        self.data
+            .get(chat_id)
+            .and_then(|entry| entry.idle_timeout_minutes)
+    }
+
+    /// Set the per-scope idle-timeout override, keeping any resumable session.
+    ///
+    /// Values are clamped to `0..=120` like the TypeScript
+    /// `setIdleTimeoutMinutes`; `0` disables the watchdog for this scope.
+    pub fn set_idle_timeout_minutes(&mut self, chat_id: &str, minutes: u64) -> Result<()> {
+        let minutes = minutes.min(120);
+        let entry = self
+            .data
+            .entry(chat_id.to_string())
+            .or_insert_with(|| SessionEntry {
+                session_id: None,
+                cwd: None,
+                updated_at: now_ms(),
+                idle_timeout_minutes: None,
+            });
+        entry.idle_timeout_minutes = Some(minutes);
+        entry.updated_at = now_ms();
+        self.save()
+    }
+
+    /// Remove the per-scope idle-timeout override.
+    ///
+    /// Returns whether an override existed. An entry left with neither a
+    /// session nor a timeout is dropped so `sessions.json` does not accumulate
+    /// empty shells (the TypeScript store keeps the shell; it is dropped on
+    /// the next load there too).
+    pub fn clear_idle_timeout_override(&mut self, chat_id: &str) -> Result<bool> {
+        let Some(entry) = self.data.get_mut(chat_id) else {
+            return Ok(false);
+        };
+        if entry.idle_timeout_minutes.take().is_none() {
+            return Ok(false);
+        }
+        entry.updated_at = now_ms();
+        if !entry.is_resumable() {
+            self.data.remove(chat_id);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
     /// Forget the resumable session but keep the timeout preference.
     pub fn clear(&mut self, chat_id: &str) -> Result<()> {
         match self.data.get(chat_id) {
@@ -189,5 +241,54 @@ mod tests {
         let store = SessionStore::load(&path).unwrap();
         assert!(store.raw("a").is_none());
         assert!(store.raw("b").is_some());
+    }
+
+    #[test]
+    fn idle_timeout_override_survives_a_session_write_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::load(&path).unwrap();
+
+        store.set("oc_1", "sess-1", "/work").unwrap();
+        store.set_idle_timeout_minutes("oc_1", 15).unwrap();
+        assert_eq!(store.idle_timeout_minutes("oc_1"), Some(15));
+        // The resumable session is untouched.
+        assert_eq!(store.resume_for("oc_1", "/work"), Some("sess-1"));
+
+        // `/new` keeps the override.
+        store.clear("oc_1").unwrap();
+        assert_eq!(store.idle_timeout_minutes("oc_1"), Some(15));
+
+        // Values are clamped, `0` means "off".
+        store.set_idle_timeout_minutes("oc_1", 999).unwrap();
+        assert_eq!(store.idle_timeout_minutes("oc_1"), Some(120));
+        store.set_idle_timeout_minutes("oc_1", 0).unwrap();
+        assert_eq!(store.idle_timeout_minutes("oc_1"), Some(0));
+
+        let reloaded = SessionStore::load(&path).unwrap();
+        assert_eq!(reloaded.idle_timeout_minutes("oc_1"), Some(0));
+    }
+
+    #[test]
+    fn clearing_the_override_removes_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::load(&path).unwrap();
+
+        // A timeout-only entry is kept while set, removed when cleared.
+        store.set_idle_timeout_minutes("oc_1", 5).unwrap();
+        assert!(store.raw("oc_1").is_some());
+        assert!(store.clear_idle_timeout_override("oc_1").unwrap());
+        assert!(store.raw("oc_1").is_none());
+
+        // Clearing when nothing is set reports false and does not write.
+        assert!(!store.clear_idle_timeout_override("oc_1").unwrap());
+
+        // A resumable session survives the clear.
+        store.set("oc_2", "sess-2", "/work").unwrap();
+        store.set_idle_timeout_minutes("oc_2", 5).unwrap();
+        assert!(store.clear_idle_timeout_override("oc_2").unwrap());
+        assert_eq!(store.idle_timeout_minutes("oc_2"), None);
+        assert_eq!(store.resume_for("oc_2", "/work"), Some("sess-2"));
     }
 }

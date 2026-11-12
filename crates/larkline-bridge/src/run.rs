@@ -498,6 +498,45 @@ impl Bridge {
         self.paths.sessions_file.as_path()
     }
 
+    /// Resolved application paths (config/profile files) for command handlers.
+    pub(crate) fn app_paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    /// Live workspace store. Commands mutate it through the store API so the
+    /// change is persisted immediately; runs read the same store.
+    pub(crate) fn workspace_store(&self) -> &Mutex<WorkspaceStore> {
+        &self.workspaces
+    }
+
+    /// Scopes with a live run, sorted. Used by `/ps` and `/status`.
+    pub(crate) fn active_scope_list(&self) -> Vec<String> {
+        let mut scopes: Vec<String> = lock(&self.active)
+            .iter()
+            .filter(|(_, run)| !run.abort.is_finished())
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        scopes.sort();
+        scopes
+    }
+
+    /// Scopes with a queued (not yet running) batch, sorted, with counts.
+    pub(crate) fn queued_scope_list(&self) -> Vec<(String, usize)> {
+        lock(&self.pending).queued_scopes()
+    }
+
+    /// Abort the run registered under `scope`, without touching its pending
+    /// queue. `/resume` uses this: the next message should start in the
+    /// resumed session, but messages already queued in this scope stay.
+    pub(crate) fn interrupt_scope(&self, scope: &str) -> bool {
+        self.abort_run(scope)
+    }
+
+    /// Last-known runtime-owner cache state, without triggering a lookup.
+    pub(crate) async fn owner_state(&self) -> owner::OwnerSnapshot {
+        self.owner.snapshot().await
+    }
+
     /// Shared global run limiter. Comment and meeting runs use this to take a
     /// slot with [`RunLimiter::acquire_within`].
     pub(crate) fn run_limiter(&self) -> &Arc<RunLimiter> {
@@ -506,7 +545,7 @@ impl Bridge {
 
     /// Current profile snapshot: the startup profile, replaced by
     /// [`Bridge::save_preference`] after `/config set` writes `config.json`.
-    fn live_profile(&self) -> ProfileConfig {
+    pub(crate) fn live_profile(&self) -> ProfileConfig {
         lock(&self.live_profile).clone()
     }
 
@@ -535,7 +574,7 @@ impl Bridge {
     /// the runtime owner is only consulted when they deny. An unknown/failed
     /// owner resolution leaves non-admins denied — the fail-closed behaviour
     /// the old static gate had.
-    async fn can_run_admin_command(&self, sender_id: &str) -> bool {
+    pub(crate) async fn can_run_admin_command(&self, sender_id: &str) -> bool {
         let profile = self.live_profile();
         if owner::can_run_admin_command(&profile, None, sender_id) {
             return true;
@@ -592,7 +631,7 @@ impl Bridge {
     /// The live profile and the global run cap move together, so a
     /// `/config set maxConcurrentRuns` update is visible to the next
     /// queue-driver pass; the driver is woken when the cap changes.
-    fn reload_profile(&self) -> Result<(), String> {
+    pub(crate) fn reload_profile(&self) -> Result<(), String> {
         let root = larkline_core::store::load_root(&self.paths.config_file)
             .map_err(|err| err.to_string())?;
         let profile = root
@@ -692,7 +731,7 @@ impl Bridge {
     }
 
     /// Queue a message for its scope and make sure the debounce driver runs.
-    fn enqueue(self: &Arc<Self>, message: NormalizedMessage) {
+    pub(crate) fn enqueue(self: &Arc<Self>, message: NormalizedMessage) {
         // Topic groups key their queue by `chatId:threadId`, so each thread
         // debounces and runs independently; everything else stays on chat id.
         let scope = scope_key(&message);
@@ -711,6 +750,19 @@ impl Bridge {
         tracing::debug!(scope = %scope, queued = outcome.queued, "message queued");
         self.ensure_pending_driver();
         self.pending_wakeup.notify_one();
+    }
+
+    /// Queue a message and block its scope so no run starts.
+    ///
+    /// Test-only fixture for `/ps`: a blocked batch is exactly the state a
+    /// message reaches while another run owns the scope, and unlike a plain
+    /// [`Bridge::enqueue`] it cannot race the 600ms driver timer.
+    #[cfg(test)]
+    pub(crate) fn queue_blocked_for_test(self: &Arc<Self>, message: NormalizedMessage) {
+        let scope = scope_key(&message);
+        let mut pending = lock(&self.pending);
+        pending.block(&scope);
+        pending.push(&scope, message, Instant::now());
     }
 
     /// Start the one queue driver task on first use.
@@ -1018,6 +1070,22 @@ impl Bridge {
         // topic group `/stop` aborts that topic's run and `/new` clears that
         // topic's session, never a sibling topic's.
         let scope = scope_key(message);
+
+        // Commands ported later live in `commands.rs`; it returns `None` for
+        // everything still handled inline below (and for unknown slash text,
+        // which keeps falling through to the agent).
+        if let Some(outcome) = crate::commands::handle(self, message, command, args).await {
+            if outcome.effect != crate::commands::CommandEffect::None {
+                // Debug level: an access-list effect contains open ids.
+                tracing::debug!(
+                    command,
+                    effect = ?outcome.effect,
+                    "command changed bridge state"
+                );
+            }
+            return Some(outcome.into_reply());
+        }
+
         match command {
             "/stop" => {
                 let target = args.trim();
@@ -1063,8 +1131,19 @@ impl Bridge {
                  /new 或 /reset 开启新会话\n\
                  /cd <绝对路径> 切换工作目录\n\
                  /pwd 显示当前工作目录\n\
+                 /ws [list|save <name>|use <name>|remove <name>] 命名工作目录别名（/work 同义，需管理员）\n\
+                 /resume [use <session-id>] 查看/恢复会话\n\
+                 /timeout [<1-120>|off|default] 当前 session 探活（指定 comment scope 需管理员）\n\
                  /status 显示当前状态\n\
                  /config 查看/修改回复偏好（修改需管理员）\n\
+                 /doctor 自检（需管理员）\n\
+                 /account 当前应用（需管理员）\n\
+                 /ps 运行/队列状态（需管理员）\n\
+                 /exit 关闭 bot 的 CLI 指引（需管理员）\n\
+                 /reconnect 重连指引（需管理员）\n\
+                 /doc 云文档评论说明\n\
+                 /invite user|admin|group 维护访问名单（需管理员）\n\
+                 /remove user|admin|group 维护访问名单（需管理员）\n\
                  /stop 中断当前任务\n\
                  /stop <scope> 中断指定运行（如 comment:… / meeting:…，需管理员）\n\
                  /meeting 会议智能体（入会/离会/纪要，需管理员）\n\
@@ -1120,15 +1199,7 @@ impl Bridge {
         // Expose every live run scope, including the comment / meeting scopes
         // that `/stop <scope>` can target. Without this, those ids would be
         // impossible to discover from IM.
-        let mut active_scopes: Vec<String> = {
-            let active = lock(&self.active);
-            active
-                .iter()
-                .filter(|(_, run)| !run.abort.is_finished())
-                .map(|(scope, _)| scope.clone())
-                .collect()
-        };
-        active_scopes.sort();
+        let active_scopes = self.active_scope_list();
         let active_run = self.is_scope_active(scope);
         let active_scopes = if active_scopes.is_empty() {
             "(无)".to_string()
@@ -2296,7 +2367,7 @@ fn truncate_chars(value: &str, max: usize) -> String {
 ///
 /// The profile schema keeps untyped fields in `extra`; empty/blank values are
 /// ignored, matching the TypeScript normalizer.
-fn profile_default_workspace(profile: &ProfileConfig) -> Option<PathBuf> {
+pub(crate) fn profile_default_workspace(profile: &ProfileConfig) -> Option<PathBuf> {
     profile
         .extra
         .get("workspaces")
@@ -2313,7 +2384,7 @@ fn profile_default_workspace(profile: &ProfileConfig) -> Option<PathBuf> {
 /// Only absolute paths are accepted; the path must exist and be a directory.
 /// Returns the canonical path (symlinks and `..` resolved) on success, or a
 /// user-facing message on failure.
-fn validate_cd_target(input: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_cd_target(input: &str) -> Result<PathBuf, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("用法：`/cd <绝对路径>`".to_string());
@@ -2496,7 +2567,7 @@ fn card_click_message(
 }
 
 /// Sender id used by commands: the open id when present, else `sender_id`.
-fn message_sender_id(message: &NormalizedMessage) -> &str {
+pub(crate) fn message_sender_id(message: &NormalizedMessage) -> &str {
     if message.sender.open_id.is_empty() {
         message.sender_id.as_str()
     } else {
@@ -4427,25 +4498,29 @@ mod tests {
             .expect("handled");
 
         for command in [
-            "/new", "/reset", "/cd", "/pwd", "/status", "/config", "/stop", "/meeting", "/help",
-        ] {
-            assert!(reply.contains(command), "{command} missing: {reply}");
-        }
-        for command in [
+            "/new",
+            "/reset",
+            "/cd",
+            "/pwd",
             "/ws",
+            "/work",
             "/resume",
             "/timeout",
+            "/status",
+            "/config",
+            "/doctor",
+            "/account",
             "/ps",
             "/exit",
-            "/doctor",
             "/reconnect",
+            "/doc",
             "/invite",
             "/remove",
+            "/stop",
+            "/meeting",
+            "/help",
         ] {
-            assert!(
-                !reply.contains(command),
-                "{command} is not implemented but is advertised: {reply}"
-            );
+            assert!(reply.contains(command), "{command} missing: {reply}");
         }
     }
 
@@ -4454,7 +4529,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bridge = test_bridge(root.path(), profile());
 
-        for text in ["/nope", "/ws", "hello"] {
+        for text in ["/nope", "/unknown-command", "hello"] {
             assert!(
                 bridge
                     .handle_command(&message("om_1", "ou_1", "user", text), text)

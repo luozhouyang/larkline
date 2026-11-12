@@ -6,6 +6,7 @@
 
 pub mod agent_runner;
 pub mod callback;
+pub mod commands;
 pub mod comments;
 pub mod keepalive;
 pub mod meeting;
@@ -22,6 +23,7 @@ pub use callback::{
     CallbackAuth, CallbackExpected, CallbackKey, CallbackPayload, CallbackRejection,
     CallbackSignInput, CallbackTokens,
 };
+pub use commands::{CommandEffect, CommandOutcome};
 pub use meeting::{
     ImReplyTarget, MeetingApi, MeetingConfig, MeetingHandle, MeetingHost, MeetingManager,
     MeetingPush, MeetingPushHealth, MeetingSessionStatus, RestMeetingApi, can_run_meeting_command,
