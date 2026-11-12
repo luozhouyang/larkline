@@ -22,9 +22,9 @@ in [`README.md`](../README.md) and [`README.zh.md`](../README.zh.md).
 ## Compatibility contracts (do not break)
 
 1. **State directory** — same as `src/config/app-paths.ts`:
-   `config.json`, `profiles/<name>/{sessions.json,workspaces.json,secrets.enc,
-   .keystore.salt,logs}`, `registry/{processes.json,locks}` and the
-   `secrets-getter` wrapper. `~/.lark-channel` is renamed to `~/.larkline` on
+   `config.json`, `profiles/<name>/{sessions.json,workspaces.json,
+   callback-nonces.json,secrets.enc,.keystore.salt,logs}`,
+   `registry/{processes.json,locks}` and the `secrets-getter` wrapper. `~/.lark-channel` is renamed to `~/.larkline` on
    first start with the default home when the new directory is absent.
    `LARKLINE_HOME` / `LARK_CHANNEL_HOME` and `LARKLINE_PROFILE` /
    `LARK_CHANNEL_PROFILE` both work.
@@ -85,16 +85,26 @@ Ported:
 - topic scoping: sessions, workspace overrides, pending queues and live runs
   use `chatId:threadId` for topic-group messages (port of `src/bot/scope.ts`);
   replies go back inside the triggering topic
-- agent process runner: stdin prompt, stderr drain, kill-on-drop, 30 minute cap
+- agent process runner: stdin prompt, stderr drain, kill-on-drop, 30-minute
+  wall-clock safety net when the idle watchdog is disabled
 - `/stop` cooperatively interrupts the run and drops its queued batch, via
   command or card button: the agent child is killed, the partial answer is
   kept and the card is finalized with `⏹ 已被中断` (no live button); a 5-second
   abort watchdog covers a hung finalize. `/stop <scope>` (admin) also aborts
   comment and meeting runs by their ids
+- idle watchdog for IM runs (port of `runIdleTimeoutMs` / the
+  `armOrPauseIdle` rule in `src/bot/channel.ts`): a run with no agent activity
+  for N minutes is stopped cooperatively, keeping the partial answer and
+  rendering `⏱ N 分钟无响应,已自动终止`. N comes from the per-scope `/timeout`
+  override (`0` = off) else `preferences.runIdleTimeoutMinutes` (clamped
+  1-120); the timer re-arms on every agent event and pauses while a `tool_use`
+  has no matching `tool_result`. The 30-minute wall clock remains only as a
+  safety net when the watchdog is disabled; `/timeout` persists to
+  `sessions.json` and is now consumed by the run flow
 - workspace store per scope (`/cd`, `/pwd`), working reaction, pending queue
   with the 600 ms merge window
 - in-chat commands: `/new`, `/reset`, `/cd`, `/pwd`, `/status`, `/config`,
-  `/meeting`, `/stop`, `/stop <scope>`, `/help`; `/cd` (admin) expands `~`,
+  `/meeting`, `/stop`, `/stop <scope>`, `/timeout`, `/help`; `/cd` (admin) expands `~`,
   interrupts the live run and resets the session; `/new` interrupts before
   clearing, and a per-scope run generation stops a finishing run from
   re-saving the cleared session
@@ -106,7 +116,9 @@ Ported:
   (`application/v6/applications/<app_id>`, 30-minute cache, fail closed)
 - signed card callbacks: bridge-rendered stop buttons use a process-local key;
   agent-rendered `bridge_token` callbacks are verified, access-checked and
-  forwarded as `[card-click]` messages
+  forwarded as `[card-click]` messages; accepted nonces are written through to
+  `profiles/<name>/callback-nonces.json` (atomic, mode 0600) so a replay is
+  rejected after a restart too
 - file-comment mentions (`drive.notice.comment_add_v1`) for `doc`, `docx`,
   `sheet` and `file`, with in-thread replies; one run per comment thread,
   registered in `Bridge::active` as `comment:<hash>` and abortable
@@ -134,16 +146,17 @@ primitive so it can be picked up without re-deriving the design.
    empty, DMs are open to anyone who can reach the app. `allowedChats` is
    consulted only by the card-click check.
 2. **In-chat command parity** — missing `/ws` (named workspaces), `/resume`,
-   `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`. `/config`
-   is a text subset that can read and set `messageReply`, `showToolCalls` and
+   in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`. `/config` is a text
+   subset that can read and set `messageReply`, `showToolCalls` and
    `maxConcurrentRuns`; the CardKit form, COT/reasoning/access/lark-cli
    settings are not implemented.
-3. **Idle timeout / watchdog** — permission modes are now read from
-   `permissions.defaultAccess` / `maxAccess` (with legacy `sandbox` fallback)
-   and passed to Codex as `--sandbox` and Claude as `--permission-mode`; see
-   `crates/larkline-bridge/src/permissions.rs`. The idle watchdog and
-   `/timeout` are still not wired; `agent_stop_grace_ms` and session idle
-   timeouts are parsed but unused.
+3. **Idle timeout / watchdog for comment and meeting runs** — permission modes
+   are now read from `permissions.defaultAccess` / `maxAccess` (with legacy
+   `sandbox` fallback) and passed to Codex as `--sandbox` and Claude as
+   `--permission-mode`; see `crates/larkline-bridge/src/permissions.rs`. The IM
+   run flow now applies the idle watchdog and `/timeout` override; comment and
+   meeting runs have their own loops and still use only the 30-minute
+   `RUN_TIMEOUT` cap. `agent_stop_grace_ms` is parsed but unused.
 4. **Presentation parity** — no COT process messages and no reasoning bubble.
    The rich card now matches the TypeScript content model (reasoning panel,
    per-tool panels, collapse rules, terminal notices, footer status and stop
@@ -153,8 +166,9 @@ primitive so it can be picked up without re-deriving the design.
    agent still renders (TS keeps it out of `blocks`); and individual tool panels
    below the three-call threshold start collapsed (`expanded: false`) exactly as
    in the TS snapshot. The rich-card terminal timeout notice reports the
-   30-minute bridge deadline because the idle watchdog is not wired; an
-   agent-reported timeout without minutes renders `⏱ 0 分钟`. The text renderer
+   minutes configured by the idle watchdog (or 30 when the wall-clock safety
+   net fired with the watchdog disabled); an agent-reported timeout without
+   minutes renders `⏱ 0 分钟`. The text renderer
    honors `reasoningDisplay: inline` only; `auto`, `off` and `bubble` have no
    COT client behind them. `markdown` mode is a one-element streaming card with
    tool summaries from the text renderer but no tool panel, footer element or
@@ -194,9 +208,12 @@ primitive so it can be picked up without re-deriving the design.
     default, matching TypeScript (`lark-cli` tokens verify without extra
     configuration); explicit `extra.callback.secret`, `extra.callback.keys` or
     `LARKLINE_CALLBACK_SECRET` still take precedence. Replay protection is
-    in-memory, so a token replayed after a restart is accepted until it
-    expires. `run_id` and `policy_fingerprint` are not bound because the Rust
-    bridge keeps neither.
+    durable: accepted nonces are written through to
+    `profiles/<name>/callback-nonces.json` and loaded by the next bridge
+    instance, so a restart cannot replay a token. The file keeps the TS flat
+    `nonce -> "used" | "revoked"` shape plus a reserved expiry sidecar, so a
+    TypeScript bridge can still read it after a downgrade. `run_id` and
+    `policy_fingerprint` are not bound because the Rust bridge keeps neither.
 12. **Session catalog** — `sessions.json.catalog.json` is not written or read;
     resume is keyed by scope and cwd only.
 13. **Test parity** — the Rust workspace has unit and integration tests for the

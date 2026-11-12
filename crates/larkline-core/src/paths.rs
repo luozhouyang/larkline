@@ -10,6 +10,7 @@
 //!   profiles/<name>/
 //!     sessions.json
 //!     workspaces.json
+//!     callback-nonces.json
 //!     secrets.enc
 //!     .keystore.salt
 //!     media/
@@ -37,6 +38,9 @@ pub struct AppPaths {
     pub active_profile_file: PathBuf,
     pub sessions_file: PathBuf,
     pub workspaces_file: PathBuf,
+    /// Used/revoked card-callback nonces. TS writes this next to
+    /// `sessions.json` (`dirname(mediaDir)/callback-nonces.json`).
+    pub callback_nonces_file: PathBuf,
     pub secrets_file: PathBuf,
     pub keystore_salt_file: PathBuf,
     pub secrets_getter_script: PathBuf,
@@ -72,6 +76,7 @@ impl AppPaths {
             active_profile_file: root_dir.join("active-profile"),
             sessions_file: profile_dir.join("sessions.json"),
             workspaces_file: profile_dir.join("workspaces.json"),
+            callback_nonces_file: profile_dir.join("callback-nonces.json"),
             secrets_file: profile_dir.join("secrets.enc"),
             keystore_salt_file: profile_dir.join(".keystore.salt"),
             secrets_getter_script: root_dir.join("secrets-getter"),
@@ -234,6 +239,10 @@ mod tests {
         assert_eq!(
             p.secrets_file,
             PathBuf::from("/home/u/.larkline/profiles/claude/secrets.enc")
+        );
+        assert_eq!(
+            p.callback_nonces_file,
+            PathBuf::from("/home/u/.larkline/profiles/claude/callback-nonces.json")
         );
         assert_eq!(
             p.default_workspace_dir,

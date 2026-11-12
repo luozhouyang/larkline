@@ -6,6 +6,7 @@
 
 pub mod agent_runner;
 pub mod callback;
+pub mod callback_store;
 pub mod commands;
 pub mod comments;
 pub mod keepalive;
@@ -24,6 +25,7 @@ pub use callback::{
     CallbackAuth, CallbackExpected, CallbackKey, CallbackPayload, CallbackRejection,
     CallbackSignInput, CallbackTokens,
 };
+pub use callback_store::{CallbackNonceStore, NonceEntry, NonceState};
 pub use commands::{CommandEffect, CommandOutcome};
 pub use meeting::{
     ImReplyTarget, MeetingApi, MeetingConfig, MeetingHandle, MeetingHost, MeetingManager,

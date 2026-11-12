@@ -90,13 +90,17 @@
 //! also bind the plain chat id in `s` (their click event carries no thread
 //! id); the bridge's own stop button is signed with the full run scope.
 //!
-//! Replay protection is in-memory: a token replayed after a bridge restart is
-//! accepted until it expires. The TypeScript implementation persists used
-//! nonces in `callback-nonces.json`; the Rust bridge deliberately keeps the
-//! verifier dependency-free (no file I/O in this module).
+//! Replay protection is durable: accepted nonces are kept in memory and
+//! written through to `callback-nonces.json` (next to `sessions.json`, the
+//! same file the TypeScript bridge uses) by
+//! [`CallbackAuth::load_nonce_store`]. A token replayed after a bridge restart
+//! is therefore rejected until it expires, and entries loaded from the TS file
+//! (which carries no expiry) are retained like TS retains them. See
+//! [`crate::callback_store`] for the format.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use hmac::{Hmac, Mac};
@@ -105,6 +109,8 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use larkline_core::ProfileConfig;
+
+use crate::callback_store::{CallbackNonceStore, NO_EXPIRY, NonceEntry, NonceState};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -292,6 +298,8 @@ pub enum CallbackRejection {
     Expired,
     ContextMismatch,
     Replay,
+    /// An operator explicitly revoked the nonce (loaded from the TS store).
+    Revoked,
 }
 
 impl CallbackRejection {
@@ -303,6 +311,7 @@ impl CallbackRejection {
             Self::Expired => "expired",
             Self::ContextMismatch => "context-mismatch",
             Self::Replay => "nonce-replay",
+            Self::Revoked => "nonce-revoked",
         }
     }
 }
@@ -317,9 +326,13 @@ impl fmt::Display for CallbackRejection {
 #[derive(Debug)]
 pub struct CallbackAuth {
     keys: Vec<CallbackKey>,
-    /// nonce -> expiry (ms). Pruned on every verify so the map stays bounded
-    /// by the tokens accepted within their TTL.
-    nonces: Mutex<HashMap<String, i64>>,
+    /// nonce -> state/expiry. Kept in memory for the fast path; pruned on
+    /// every verify so the map stays bounded by the tokens accepted within
+    /// their TTL.
+    nonces: Mutex<HashMap<String, NonceEntry>>,
+    /// When attached, every accepted nonce is written through to this file
+    /// before verification returns (see [`crate::callback_store`]).
+    nonce_store: Option<CallbackNonceStore>,
 }
 
 impl CallbackAuth {
@@ -339,7 +352,35 @@ impl CallbackAuth {
         Some(Self {
             keys,
             nonces: Mutex::new(HashMap::new()),
+            nonce_store: None,
         })
+    }
+
+    /// Attach a durable nonce store at `path` and load the persisted nonces.
+    ///
+    /// Missing/corrupt files are tolerated: the store starts empty and logs a
+    /// warning, because replay persistence must never take the bridge down.
+    /// Expired entries are pruned on load. From then on every accepted nonce
+    /// is written through before [`CallbackAuth::verify`] returns, so there is
+    /// no shutdown flush to miss. Returns the number of live nonces loaded.
+    ///
+    /// Call this once, right after construction, before the verifier is shared
+    /// with card handling.
+    pub fn load_nonce_store(&mut self, path: impl Into<PathBuf>) -> usize {
+        let store = CallbackNonceStore::new(path);
+        let loaded = store.load(now_ms());
+        let count = loaded.len();
+        let mut nonces = lock_nonces(&self.nonces);
+        for (nonce, entry) in loaded {
+            nonces.insert(nonce, entry);
+        }
+        self.nonce_store = Some(store);
+        count
+    }
+
+    /// The attached nonce store path, when persistence is enabled.
+    pub fn nonce_store_path(&self) -> Option<&Path> {
+        self.nonce_store.as_ref().map(CallbackNonceStore::path)
     }
 
     /// Build a verifier from the profile's `extra` map, then the environment.
@@ -478,11 +519,36 @@ impl CallbackAuth {
         }
 
         let mut nonces = lock_nonces(&self.nonces);
-        nonces.retain(|_, expiry| *expiry > now);
-        if nonces.contains_key(&payload.n) {
-            return Err(CallbackRejection::Replay);
+        nonces.retain(|_, entry| entry.expires_at_ms == NO_EXPIRY || entry.expires_at_ms > now);
+        if let Some(entry) = nonces.get(&payload.n) {
+            // Both states reject the click with no observable difference to
+            // the caller; `revoked` keeps the TS reason code for logs.
+            return Err(match entry.state {
+                NonceState::Revoked => CallbackRejection::Revoked,
+                NonceState::Used => CallbackRejection::Replay,
+            });
         }
-        nonces.insert(payload.n.clone(), payload.exp);
+        nonces.insert(
+            payload.n.clone(),
+            NonceEntry {
+                state: NonceState::Used,
+                expires_at_ms: payload.exp,
+            },
+        );
+        // Write-through under the nonce lock: the accept is durable before the
+        // caller sees `Ok`, and concurrent verifies cannot persist an older
+        // snapshot over a newer one. A failed write is logged, not fatal: the
+        // token is still consumed in memory, which is what TS does when its
+        // async persist fails.
+        if let Some(store) = &self.nonce_store {
+            if let Err(err) = store.persist(&nonces) {
+                tracing::warn!(
+                    path = %store.path().display(),
+                    error = %err,
+                    "cannot persist an accepted callback nonce"
+                );
+            }
+        }
         Ok(payload)
     }
 }
@@ -592,7 +658,9 @@ fn matches_expected(payload: &CallbackPayload, expected: &CallbackExpected) -> b
         && payload.a == expected.action
 }
 
-fn lock_nonces(nonces: &Mutex<HashMap<String, i64>>) -> MutexGuard<'_, HashMap<String, i64>> {
+fn lock_nonces(
+    nonces: &Mutex<HashMap<String, NonceEntry>>,
+) -> MutexGuard<'_, HashMap<String, NonceEntry>> {
     nonces
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1163,6 +1231,88 @@ mod tests {
         assert!(!debug.contains("super-secret-app-key"), "{debug}");
         assert!(debug.contains("CallbackKey"), "{debug}");
         assert!(debug.contains("version: 1"), "{debug}");
+    }
+
+    #[test]
+    fn a_used_nonce_survives_a_nonce_store_reload() {
+        // A card callback accepted before a bridge restart must stay consumed
+        // afterwards: this is the TS `CallbackNonceStore` persistence contract.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback-nonces.json");
+        // Sign relative to the real clock: `load_nonce_store` prunes by the
+        // current time, unlike the deterministic `*_at` fixtures.
+        let now = now_ms();
+        let token = auth(&[(1, "s3cret", false)])
+            .sign_at(&sign_input("nonce_persist", AGENT_CALLBACK_ACTION), now)
+            .expect("token");
+
+        {
+            let mut verifier = auth(&[(1, "s3cret", false)]);
+            assert_eq!(verifier.load_nonce_store(path.clone()), 0);
+            assert!(
+                verifier
+                    .verify_at(&token, &expected(AGENT_CALLBACK_ACTION), now + 1)
+                    .is_ok()
+            );
+        }
+
+        // A fresh verifier is the bridge after a restart: the used nonce is
+        // loaded from disk and the same token is rejected.
+        let mut reloaded = auth(&[(1, "s3cret", false)]);
+        assert_eq!(reloaded.load_nonce_store(path.clone()), 1);
+        assert_eq!(
+            reloaded.verify_at(&token, &expected(AGENT_CALLBACK_ACTION), now + 1),
+            Err(CallbackRejection::Replay)
+        );
+    }
+
+    #[test]
+    fn a_revoked_nonce_from_a_typescript_store_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback-nonces.json");
+        // TS flat format: no expiry sidecar. A revoked entry must survive the
+        // load and reject the token with the TS reason code.
+        std::fs::write(&path, br#"{"nonce_revoked":"revoked"}"#).unwrap();
+        let token = auth(&[(1, "s3cret", false)])
+            .sign_at(&sign_input("nonce_revoked", AGENT_CALLBACK_ACTION), NOW)
+            .unwrap();
+        let mut verifier = auth(&[(1, "s3cret", false)]);
+        assert_eq!(verifier.load_nonce_store(path), 1);
+        assert_eq!(
+            verifier.verify_at(&token, &expected(AGENT_CALLBACK_ACTION), NOW + 1),
+            Err(CallbackRejection::Revoked)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_nonce_store_is_tolerated_by_the_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback-nonces.json");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        let token = auth(&[(1, "s3cret", false)])
+            .sign_at(&sign_input("nonce_fresh", AGENT_CALLBACK_ACTION), NOW)
+            .unwrap();
+        let mut verifier = auth(&[(1, "s3cret", false)]);
+        assert_eq!(verifier.load_nonce_store(&path), 0);
+        assert!(
+            verifier
+                .verify_at(&token, &expected(AGENT_CALLBACK_ACTION), NOW + 1)
+                .is_ok()
+        );
+        // The accepted nonce rewrote the file in the valid store format.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("nonce_fresh"), "{raw}");
+    }
+
+    #[test]
+    fn the_nonce_store_path_is_exposed_for_wiring() {
+        let mut verifier = auth(&[(1, "s3cret", false)]);
+        assert!(verifier.nonce_store_path().is_none());
+        verifier.load_nonce_store("/tmp/callback-nonces.json");
+        assert_eq!(
+            verifier.nonce_store_path(),
+            Some(std::path::Path::new("/tmp/callback-nonces.json"))
+        );
     }
 
     #[test]

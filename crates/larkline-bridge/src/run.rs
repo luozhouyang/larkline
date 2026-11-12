@@ -14,9 +14,25 @@
 //! live the scope is blocked, so later messages keep accumulating instead of
 //! spawning a competing agent; when the run ends the window re-arms and the
 //! next batch starts. `/stop` interrupts the live run and drops the queued
-//! batch. The run flow itself (`run_batch`) is cooperative: the stop signal,
-//! the 30-minute deadline and the 8.5-minute progress-card pause are all waited
-//! on with `tokio::select!`, and an interrupt always reaches `finalize`.
+//! batch. The run flow itself (`run_batch`) is cooperative: the stop signal, the
+//! idle watchdog, the 30-minute wall-clock safety net and the 8.5-minute
+//! progress-card pause are all waited on with `tokio::select!`, and an
+//! interrupt always reaches `finalize`.
+//!
+//! ## Idle watchdog
+//!
+//! A run is stopped when the agent stays silent for the configured idle
+//! timeout (port of `runIdleTimeoutMs` / `/timeout` in `src/bot/channel.ts`):
+//! the per-scope `/timeout` override (`0` = off) wins over
+//! `preferences.runIdleTimeoutMinutes` (clamped 1-120, absent/0 = off). The
+//! timer re-arms on every agent event and pauses while any `tool_use` id has
+//! no matching `tool_result` — a long-running tool (for example an OAuth flow
+//! blocked on a browser) is legitimate agent silence, not a hang. On expiry
+//! the agent child is killed, the partial answer is kept and the card reports
+//! `⏱ N 分钟无响应,已自动终止` (TS `markIdleTimeout`). TypeScript has no wall
+//! clock at all; the Rust bridge keeps [`RUN_TIMEOUT`] only as a final safety
+//! net for runs where the watchdog is disabled, so an actively streaming run
+//! is never cut at 30 minutes when a timeout is configured.
 //!
 //! ## `/stop` targeting
 //!
@@ -110,7 +126,15 @@ use crate::text_render::{TextFormat, TextRenderOptions, render_text, render_text
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
-/// Hard cap for one agent run.
+/// Hard wall-clock cap for one agent run.
+///
+/// TypeScript has no wall clock: it relies on the idle watchdog alone. The
+/// Rust bridge keeps this cap only as a final safety net when the watchdog is
+/// disabled for the run (no `/timeout` override and no
+/// `preferences.runIdleTimeoutMinutes`); with the watchdog enabled the run is
+/// governed by agent activity instead, so a long but active run is not cut at
+/// 30 minutes. Comment and meeting runs (which have their own loops) still use
+/// it as their only cap.
 pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long a comment / meeting run waits for a global run slot before it
 /// gives up. Those runs have no pending queue, so waiting forever would leave
@@ -339,7 +363,10 @@ enum LoopTick {
     Interrupted,
     /// The 8.5-minute progress-card safe age elapsed.
     PauseElapsed,
-    /// [`RUN_TIMEOUT`] elapsed.
+    /// The idle watchdog expired (no agent activity for the configured
+    /// timeout and no tool call in flight).
+    IdleTimeout,
+    /// [`RUN_TIMEOUT`] elapsed; only armed when the idle watchdog is disabled.
     TimedOut,
 }
 
@@ -360,49 +387,166 @@ impl EventSource for AgentProcess {
     }
 }
 
-/// Wait for the next event while honouring interrupt, run deadline and the
-/// progress-card pause deadline.
+/// Wait for the next event while honouring the interrupt, the run deadline,
+/// the progress-card pause deadline and the idle watchdog.
 ///
 /// `pending` is the pinned `next_events()` future, created by the caller and
-/// kept across pause ticks. It must not be recreated when the pause timer wins:
+/// kept across timer ticks. It must not be recreated when a timer wins:
 /// dropping a partially-read line would lose part of a JSON event at the
-/// 8.5-minute boundary.
+/// 8.5-minute boundary (or on an idle re-arm).
 ///
-/// `pause_deadline` is `None` once the pause frame was written, so a paused run
-/// never writes a second frame. `biased` makes a pending stop win over a stream
+/// `deadline` is `None` while the idle watchdog is enabled (the watchdog
+/// replaces the wall clock, like TS; see [`RUN_TIMEOUT`]). `pause_deadline` is
+/// `None` once the pause frame was written, so a paused run never writes a
+/// second frame. `idle_deadline` is `None` while a tool call is in flight or
+/// the watchdog is disabled. `biased` makes a pending stop win over a stream
 /// event that arrived in the same poll.
 async fn next_tick(
     pending: &mut Pin<Box<dyn Future<Output = Option<Vec<AgentEvent>>> + Send + '_>>,
     interrupt: &RunInterrupt,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     pause_deadline: Option<tokio::time::Instant>,
+    idle_deadline: Option<tokio::time::Instant>,
 ) -> LoopTick {
     if interrupt.is_requested() {
         return LoopTick::Interrupted;
     }
     let events = async {
-        match tokio::time::timeout_at(deadline, &mut *pending).await {
-            Err(_) => LoopTick::TimedOut,
-            Ok(None) => LoopTick::Eof,
-            Ok(Some(events)) => LoopTick::Events(events),
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, &mut *pending).await {
+                Err(_) => LoopTick::TimedOut,
+                Ok(None) => LoopTick::Eof,
+                Ok(Some(events)) => LoopTick::Events(events),
+            },
+            None => match (&mut *pending).await {
+                None => LoopTick::Eof,
+                Some(events) => LoopTick::Events(events),
+            },
         }
     };
-    match pause_deadline {
-        Some(pause_at) => {
-            tokio::select! {
-                biased;
-                _ = interrupt.wait() => LoopTick::Interrupted,
-                _ = tokio::time::sleep_until(pause_at) => LoopTick::PauseElapsed,
-                tick = events => tick,
+    tokio::select! {
+        biased;
+        _ = interrupt.wait() => LoopTick::Interrupted,
+        _ = wait_until_optional(idle_deadline) => LoopTick::IdleTimeout,
+        _ = wait_until_optional(pause_deadline) => LoopTick::PauseElapsed,
+        tick = events => tick,
+    }
+}
+
+/// Resolve at `deadline`, or never when the timer is not armed.
+///
+/// `tokio::select!` has no optional branches; a pending future models an
+/// unarmed timer without a second select variant for every combination.
+async fn wait_until_optional(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolve this run's idle watchdog, in minutes.
+///
+/// Port of the resolution in `src/bot/channel.ts` (the `scopeOverride` block):
+/// the per-scope `/timeout` override wins over
+/// `preferences.runIdleTimeoutMinutes`. `0` disables the watchdog for either
+/// source; the preference is clamped to 1-120 exactly like
+/// `getRunIdleTimeoutMs`. A hand-edited sessions file can carry an override
+/// above 120; TS does not clamp that value either, so it is kept as written
+/// and the deadline computation saturates instead of panicking.
+fn resolve_idle_timeout_minutes(
+    scope_override: Option<u64>,
+    preference: Option<u64>,
+) -> Option<u64> {
+    match scope_override {
+        Some(0) => None,
+        Some(minutes) => Some(minutes),
+        None => preference
+            .filter(|minutes| *minutes > 0)
+            .map(|minutes| minutes.clamp(1, 120)),
+    }
+}
+
+/// The wall-clock deadline for a run.
+///
+/// TS has no wall clock, so the 30-minute cap is armed only when the idle
+/// watchdog is disabled; otherwise the idle deadline governs the run.
+fn wall_clock_deadline(
+    idle_minutes: Option<u64>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    idle_minutes.is_none().then(|| now + RUN_TIMEOUT)
+}
+
+/// Per-run idle watchdog (port of the `armOrPauseIdle` closure in TS
+/// `processAgentStream`).
+///
+/// The timer re-arms after every agent event as long as no tool call is in
+/// flight. `tool_use` opens a window and the matching `tool_result` closes it;
+/// while any tool id is unmatched the watchdog is paused, because a long
+/// tool call (an OAuth flow waiting on the user, a slow build) produces no
+/// agent events but is not a hang. Once the last `tool_result` drains the set,
+/// the next event re-arms the timer. `None` minutes disables the watchdog.
+#[derive(Debug)]
+struct IdleWatchdog {
+    /// Configured idle timeout in minutes; `None` = off.
+    minutes: Option<u64>,
+    /// `tool_use` ids without a matching `tool_result` yet.
+    in_flight_tools: HashSet<String>,
+    /// When the watchdog would fire; `None` while paused or disabled.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl IdleWatchdog {
+    fn new(minutes: Option<u64>, now: tokio::time::Instant) -> Self {
+        let mut watchdog = Self {
+            minutes,
+            in_flight_tools: HashSet::new(),
+            deadline: None,
+        };
+        watchdog.rearm(now);
+        watchdog
+    }
+
+    /// Configured timeout in minutes (`None` when the watchdog is off).
+    fn minutes(&self) -> Option<u64> {
+        self.minutes
+    }
+
+    /// The next expiry instant, or `None` while paused/disabled.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// Fold one agent event into the in-flight tool set, then re-arm.
+    ///
+    /// This is the exact TS order: the tool set is updated *before* the timer
+    /// is re-armed, so a `tool_use` pauses the watchdog immediately and a
+    /// `tool_result` that drains the set re-arms it.
+    fn observe(&mut self, event: &AgentEvent, now: tokio::time::Instant) {
+        match event {
+            AgentEvent::ToolUse { id, .. } => {
+                self.in_flight_tools.insert(id.clone());
             }
-        }
-        None => {
-            tokio::select! {
-                biased;
-                _ = interrupt.wait() => LoopTick::Interrupted,
-                tick = events => tick,
+            AgentEvent::ToolResult { id, .. } => {
+                self.in_flight_tools.remove(id);
             }
+            _ => {}
         }
+        self.rearm(now);
+    }
+
+    fn rearm(&mut self, now: tokio::time::Instant) {
+        let Some(minutes) = self.minutes else {
+            self.deadline = None;
+            return;
+        };
+        self.deadline = if self.in_flight_tools.is_empty() {
+            // `checked_add` keeps a hand-edited, absurd override from
+            // panicking: an unrepresentable deadline behaves as disabled.
+            now.checked_add(Duration::from_secs(minutes.saturating_mul(60)))
+        } else {
+            None
+        };
     }
 }
 
@@ -505,7 +649,18 @@ impl Bridge {
         let workspaces = WorkspaceStore::load_with_default(&paths.workspaces_file, &default_dir)
             .with_context(|| format!("cannot load {}", paths.workspaces_file.display()))?;
 
-        let callback_auth = CallbackAuth::from_profile_and_app_secret(&profile, app_secret);
+        let mut callback_auth = CallbackAuth::from_profile_and_app_secret(&profile, app_secret);
+        if let Some(auth) = callback_auth.as_mut() {
+            // Durable replay protection (TS `CallbackNonceStore`): load the
+            // used/revoked nonces persisted by a previous run, then write
+            // every acceptance through before verify returns.
+            let loaded = auth.load_nonce_store(paths.callback_nonces_file.clone());
+            tracing::info!(
+                path = %paths.callback_nonces_file.display(),
+                loaded,
+                "callback nonce store ready"
+            );
+        }
         match callback_auth.as_ref() {
             Some(auth) => tracing::info!(
                 key_versions = ?auth.key_versions(),
@@ -730,6 +885,24 @@ impl Bridge {
     /// [`Bridge::save_preference`] after `/config set` writes `config.json`.
     pub(crate) fn live_profile(&self) -> ProfileConfig {
         lock(&self.live_profile).clone()
+    }
+
+    /// Idle watchdog for a run scope, in minutes.
+    ///
+    /// The per-scope `/timeout` override (persisted in `sessions.json`) wins
+    /// over the live profile's `preferences.runIdleTimeoutMinutes`. `0` from
+    /// either source disables the watchdog. Resolved once per run, so a
+    /// `/timeout` issued while a run is live applies from the next run —
+    /// exactly like the TypeScript bridge, which computes `idleTimeoutMs` when
+    /// the run starts.
+    async fn run_idle_timeout_minutes(&self, scope: &str) -> Option<u64> {
+        let scope_override = self.sessions.lock().await.idle_timeout_minutes(scope);
+        let preference = self
+            .live_profile()
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.run_idle_timeout_minutes);
+        resolve_idle_timeout_minutes(scope_override, preference)
     }
 
     /// Resolve the runtime owner id for the profile's app, with the 30-minute
@@ -1828,6 +2001,9 @@ impl Bridge {
         let profile = self.live_profile();
         let reply_mode = profile.message_reply();
         let card_format = CardFormat::for_reply_mode(reply_mode);
+        // Idle watchdog for this run (TS `runIdleTimeoutMs`, `/timeout`
+        // override first). Resolved once at run start, like TS.
+        let idle_minutes = self.run_idle_timeout_minutes(&scope).await;
 
         let mut view = RunView::default();
         let mut streaming: Option<StreamingCard> = None;
@@ -1911,7 +2087,12 @@ impl Bridge {
             }
         };
 
-        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        // The 30-minute wall clock is only a safety net for runs without an
+        // idle timeout; TS has no wall clock, so an idle watchdog governs a
+        // live-but-active run for as long as the agent keeps producing events.
+        let now = tokio::time::Instant::now();
+        let deadline = wall_clock_deadline(idle_minutes, now);
+        let mut watchdog = IdleWatchdog::new(idle_minutes, now);
         // CardKit closes a streaming entity around ten minutes; pause the
         // progress card at the crate's safe age and deliver the answer
         // separately when the run finishes.
@@ -1924,7 +2105,15 @@ impl Bridge {
         let mut pending = EventSource::next_events(&mut process);
         loop {
             let pause_at = if paused { None } else { pause_deadline };
-            match next_tick(&mut pending, &interrupt, deadline, pause_at).await {
+            match next_tick(
+                &mut pending,
+                &interrupt,
+                deadline,
+                pause_at,
+                watchdog.deadline(),
+            )
+            .await
+            {
                 LoopTick::Interrupted => {
                     // Cooperative stop: drop the read (and its borrow) before
                     // killing the child. The partial answer stays in `view`
@@ -1932,6 +2121,16 @@ impl Bridge {
                     drop(pending);
                     process.kill().await;
                     view.mark_interrupted();
+                    break;
+                }
+                LoopTick::IdleTimeout => {
+                    // Same cooperative shape as `/stop`: kill the child, keep
+                    // the partial answer and render the TS timeout notice.
+                    drop(pending);
+                    process.kill().await;
+                    let minutes = watchdog.minutes().unwrap_or_default();
+                    tracing::warn!(scope = %scope, minutes, "agent idle timeout; stopping the run");
+                    view.mark_idle_timeout(minutes);
                     break;
                 }
                 LoopTick::TimedOut => {
@@ -1973,6 +2172,9 @@ impl Bridge {
                 LoopTick::Events(events) => {
                     drop(pending);
                     for event in &events {
+                        // Track tool flight and re-arm the watchdog before
+                        // folding the event (the TS `armOrPauseIdle` order).
+                        watchdog.observe(event, tokio::time::Instant::now());
                         view.apply(event);
                     }
                     if view.finished {
@@ -2927,7 +3129,13 @@ fn markdown_render_options(profile: &ProfileConfig) -> TextRenderOptions {
 
 /// Final body for `MessageReplyMode::Text`.
 fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
-    let body = render_text(view, text_render_options(profile));
+    // TS `renderText` reads `state.idleTimeoutMinutes` itself, so the notice
+    // reports the watchdog minutes rather than the options default.
+    let options = TextRenderOptions {
+        idle_timeout_minutes: view.idle_timeout_minutes.unwrap_or(0),
+        ..text_render_options(profile)
+    };
+    let body = render_text(view, options);
     if body.trim().is_empty() {
         "（没有输出）".to_string()
     } else {
@@ -2937,7 +3145,11 @@ fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
 
 /// Final body for `MessageReplyMode::Markdown`.
 fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
-    let body = render_text(view, markdown_render_options(profile));
+    let options = TextRenderOptions {
+        idle_timeout_minutes: view.idle_timeout_minutes.unwrap_or(0),
+        ..markdown_render_options(profile)
+    };
+    let body = render_text(view, options);
     if body.trim().is_empty() {
         "（没有输出）".to_string()
     } else {
@@ -3240,6 +3452,7 @@ mod tests {
 
     use crate::callback::{CallbackKey, CallbackSignInput};
     use crate::owner::OwnerSource;
+    use crate::render::Terminal;
 
     fn profile() -> ProfileConfig {
         ProfileConfig {
@@ -3454,6 +3667,226 @@ mod tests {
         assert!(interrupt.is_requested());
     }
 
+    // ---- idle watchdog ---------------------------------------------------
+
+    #[test]
+    fn idle_timeout_resolution_prefers_the_scope_override_over_the_preference() {
+        // No override: the global preference applies (TS `getRunIdleTimeoutMs`).
+        assert_eq!(resolve_idle_timeout_minutes(None, Some(15)), Some(15));
+        // `/timeout 5` wins over a different global default.
+        assert_eq!(resolve_idle_timeout_minutes(Some(5), Some(30)), Some(5));
+        // `/timeout off` (0) disables the watchdog even with a global default.
+        assert_eq!(resolve_idle_timeout_minutes(Some(0), Some(30)), None);
+        // Absent / 0 preference means no watchdog.
+        assert_eq!(resolve_idle_timeout_minutes(None, None), None);
+        assert_eq!(resolve_idle_timeout_minutes(None, Some(0)), None);
+        // The global preference is clamped to 1-120, like TS.
+        assert_eq!(resolve_idle_timeout_minutes(None, Some(999)), Some(120));
+    }
+
+    #[tokio::test]
+    async fn bridge_resolves_the_idle_timeout_from_preferences_and_the_scope_override() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile
+            .preferences
+            .get_or_insert_with(Preferences::default)
+            .run_idle_timeout_minutes = Some(20);
+        let bridge = test_bridge(root.path(), profile);
+        let scope = "oc_idle";
+
+        // No `/timeout` override: the profile preference is the default.
+        assert_eq!(bridge.run_idle_timeout_minutes(scope).await, Some(20));
+
+        // A per-scope override wins over the preference.
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set_idle_timeout_minutes(scope, 5)
+            .unwrap();
+        assert_eq!(bridge.run_idle_timeout_minutes(scope).await, Some(5));
+
+        // `/timeout 0` disables the watchdog for this scope only.
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set_idle_timeout_minutes(scope, 0)
+            .unwrap();
+        assert_eq!(bridge.run_idle_timeout_minutes(scope).await, None);
+
+        // `/timeout default` clears the override and falls back to the profile.
+        assert!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .clear_idle_timeout_override(scope)
+                .unwrap()
+        );
+        assert_eq!(bridge.run_idle_timeout_minutes(scope).await, Some(20));
+    }
+
+    #[test]
+    fn idle_watchdog_pauses_while_a_tool_is_in_flight_and_rearms_when_it_returns() {
+        let start = tokio::time::Instant::now();
+        let mut watchdog = IdleWatchdog::new(Some(1), start);
+        assert_eq!(
+            watchdog.deadline(),
+            Some(start + Duration::from_secs(60)),
+            "a fresh run arms the idle timer immediately"
+        );
+
+        // A tool call pauses the watchdog: the agent may legitimately be
+        // silent while the tool runs (an OAuth flow waiting on the user).
+        watchdog.observe(
+            &AgentEvent::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: json!({ "command": "sleep 600" }),
+            },
+            start,
+        );
+        assert_eq!(watchdog.deadline(), None);
+
+        // Other events do not re-arm it while the tool window is open.
+        watchdog.observe(
+            &AgentEvent::Thinking {
+                delta: "waiting for the tool".into(),
+            },
+            start,
+        );
+        assert_eq!(watchdog.deadline(), None);
+
+        // The matching tool_result drains the set and re-arms the timer.
+        let returned = start + Duration::from_secs(5);
+        watchdog.observe(
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                output: "done".into(),
+                is_error: false,
+            },
+            returned,
+        );
+        assert_eq!(
+            watchdog.deadline(),
+            Some(returned + Duration::from_secs(60))
+        );
+
+        // Overlapping tools keep it paused until the last one returns.
+        for id in ["t2", "t3"] {
+            watchdog.observe(
+                &AgentEvent::ToolUse {
+                    id: id.into(),
+                    name: "Read".into(),
+                    input: json!({}),
+                },
+                returned,
+            );
+        }
+        watchdog.observe(
+            &AgentEvent::ToolResult {
+                id: "t2".into(),
+                output: String::new(),
+                is_error: false,
+            },
+            returned,
+        );
+        assert_eq!(watchdog.deadline(), None);
+        watchdog.observe(
+            &AgentEvent::ToolResult {
+                id: "t3".into(),
+                output: String::new(),
+                is_error: false,
+            },
+            returned,
+        );
+        assert!(watchdog.deadline().is_some());
+    }
+
+    #[test]
+    fn idle_watchdog_rearms_on_text_and_thinking_activity() {
+        let start = tokio::time::Instant::now();
+        let mut watchdog = IdleWatchdog::new(Some(2), start);
+        let first = watchdog.deadline().unwrap();
+        let text_at = start + Duration::from_secs(30);
+        watchdog.observe(&AgentEvent::Text { delta: "hi".into() }, text_at);
+        assert_eq!(
+            watchdog.deadline(),
+            Some(text_at + Duration::from_secs(120))
+        );
+        assert!(watchdog.deadline().unwrap() > first);
+        let thinking_at = text_at + Duration::from_secs(10);
+        watchdog.observe(&AgentEvent::Thinking { delta: "hm".into() }, thinking_at);
+        assert_eq!(
+            watchdog.deadline(),
+            Some(thinking_at + Duration::from_secs(120))
+        );
+        // Text/thinking events are irrelevant to the tool window.
+        assert!(watchdog.in_flight_tools.is_empty());
+    }
+
+    #[test]
+    fn the_wall_clock_is_only_armed_when_the_idle_watchdog_is_disabled() {
+        let now = tokio::time::Instant::now();
+        // Idle watchdog on: no wall-clock deadline (TS has none either).
+        assert_eq!(wall_clock_deadline(Some(15), now), None);
+        // Idle watchdog off: the 30-minute cap stays as the safety net.
+        assert_eq!(wall_clock_deadline(None, now), Some(now + RUN_TIMEOUT));
+        assert_eq!(IdleWatchdog::new(None, now).deadline(), None);
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_stops_the_run_and_renders_the_ts_timeout_notice() {
+        let start = tokio::time::Instant::now();
+        let watchdog = IdleWatchdog::new(Some(15), start);
+        let mut source = PendingSource;
+        let mut pending = EventSource::next_events(&mut source);
+        let interrupt = RunInterrupt::new();
+        // The watchdog deadline has been reached: no agent event arrived and
+        // no tool is in flight, so the tick must fire instead of waiting.
+        let tick = next_tick(&mut pending, &interrupt, None, None, Some(start)).await;
+        assert!(
+            matches!(tick, LoopTick::IdleTimeout),
+            "an idle run must yield to the idle watchdog"
+        );
+        drop(pending);
+
+        // What the run loop does on `IdleTimeout`: keep the partial answer,
+        // mark the TS terminal, then render the final card.
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial answer".into(),
+        });
+        view.mark_idle_timeout(watchdog.minutes().unwrap());
+        assert_eq!(view.terminal(), Terminal::IdleTimeout);
+        assert_eq!(view.idle_timeout_minutes, Some(15));
+        assert_eq!(view.best_answer(), "partial answer");
+
+        let card = build_card(&profile(), &view, card_status(&view), Instant::now(), None);
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+        assert!(payload.contains("partial answer"), "{payload}");
+        assert!(payload.contains("⏱ 15 分钟无响应,已自动终止"), "{payload}");
+        assert!(
+            !payload.contains("__bridge_cb"),
+            "a timed-out run must not keep a stop button: {payload}"
+        );
+        assert_eq!(card.as_value()["config"]["summary"]["content"], "已超时");
+        assert_eq!(card_status(&view), "已超时");
+
+        // Text and markdown replies use the view's watchdog minutes for the
+        // notice, exactly like TS `renderText` reading `state.idleTimeoutMinutes`.
+        assert!(
+            text_final_body(&profile(), &view).contains("⏱ 15 分钟无响应,已自动终止"),
+            "text notice must report the watchdog minutes"
+        );
+        assert!(
+            markdown_final_body(&profile(), &view).contains("⏱ 15 分钟无响应,已自动终止"),
+            "markdown notice must report the watchdog minutes"
+        );
+    }
+
     #[tokio::test]
     async fn cooperative_interrupt_keeps_the_partial_answer_and_a_terminal_card() {
         let interrupt = RunInterrupt::new();
@@ -3465,8 +3898,8 @@ mod tests {
 
         let mut source = PendingSource;
         let mut pending = EventSource::next_events(&mut source);
-        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
-        let tick = next_tick(&mut pending, &interrupt, deadline, None).await;
+        let deadline = Some(tokio::time::Instant::now() + RUN_TIMEOUT);
+        let tick = next_tick(&mut pending, &interrupt, deadline, None, None).await;
         assert!(
             matches!(tick, LoopTick::Interrupted),
             "a pending agent read must yield to the stop signal"
@@ -3741,18 +4174,18 @@ mod tests {
         let interrupt = RunInterrupt::new();
         let mut source = PendingSource;
         let mut pending = EventSource::next_events(&mut source);
-        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        let deadline = Some(tokio::time::Instant::now() + RUN_TIMEOUT);
         let already_due = tokio::time::Instant::now();
 
         assert!(matches!(
-            next_tick(&mut pending, &interrupt, deadline, Some(already_due)).await,
+            next_tick(&mut pending, &interrupt, deadline, Some(already_due), None).await,
             LoopTick::PauseElapsed
         ));
         // The run loop passes `None` once paused, so no second pause frame can
         // be produced while the run keeps streaming.
         let after_pause = tokio::time::timeout(
             Duration::from_millis(30),
-            next_tick(&mut pending, &interrupt, deadline, None),
+            next_tick(&mut pending, &interrupt, deadline, None, None),
         )
         .await;
         assert!(
@@ -4526,6 +4959,99 @@ mod tests {
         let batch = take_batch(&bridge);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].text, r#"[card-click] {"choice":"a"}"#);
+    }
+
+    #[tokio::test]
+    async fn used_callback_nonce_survives_a_bridge_restart() {
+        // TS persists accepted nonces in `callback-nonces.json`, so a restart
+        // cannot replay a token. The bridge must load that file on
+        // construction and reject the same token from the second instance.
+        let root = tempfile::tempdir().unwrap();
+        let token = sign_callback("s3cret", "nonce_restart");
+        let event = || {
+            card_action_event(json!({
+                "__bridge_cb": true,
+                "bridge_token": token,
+                "choice": "a"
+            }))
+        };
+        {
+            let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+            assert!(bridge.handle_card_action(&event()).await.is_none());
+            assert_eq!(take_batch(&bridge).len(), 1, "first click must forward");
+            // Write-through: the nonce file exists before the bridge drops.
+            let path = root
+                .path()
+                .join("profiles")
+                .join("test")
+                .join("callback-nonces.json");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(raw.contains("nonce_restart"), "{raw}");
+            assert!(raw.contains("\"used\""), "{raw}");
+        }
+
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        assert!(bridge.handle_card_action(&event()).await.is_none());
+        assert!(
+            take_batch(&bridge).is_empty(),
+            "a nonce accepted before the restart must not replay afterwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_callback_nonces_are_pruned_when_the_bridge_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("profiles")
+            .join("test")
+            .join("callback-nonces.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"n_expired":"used","n_live":"used","__larkline_nonce_expiry":{{"n_expired":1,"n_live":{}}} }}"#,
+                now + 60_000
+            ),
+        )
+        .unwrap();
+
+        let _bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("n_expired"), "{raw}");
+        assert!(raw.contains("n_live"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn corrupt_callback_nonce_file_does_not_disable_callbacks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("profiles")
+            .join("test")
+            .join("callback-nonces.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"this is not json").unwrap();
+
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": sign_callback("s3cret", "nonce_after_corrupt"),
+            "choice": "a"
+        }));
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert_eq!(
+            take_batch(&bridge).len(),
+            1,
+            "a corrupt nonce store must not disable callbacks"
+        );
+        // The accepted nonce rewrote the file in the valid format.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("nonce_after_corrupt"), "{raw}");
     }
 
     #[tokio::test]
