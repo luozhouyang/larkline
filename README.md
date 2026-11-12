@@ -1,392 +1,388 @@
 # larkline
 
-A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
+larkline is a single, self-contained static binary that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. **No Node.js. No npm. One binary, at install time and at runtime.** Start the bridge, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
-larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge), renamed from `lark-channel-bridge`. The npm package, CLI binary, local state directory, and environment variables now all use the `larkline` name. Upgrading from the old name is automatic for the state directory, and the old `LARK_CHANNEL_*` environment variables are still accepted as fallbacks.
+larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge), renamed from `lark-channel-bridge`. The Rust implementation keeps the same `~/.larkline` state directory, config schema and encrypted keystore as the TypeScript bridge, so an existing install can switch over without re-onboarding. See [Rust port notes](./docs/RUST-PORT.md).
 
-[中文 README](./README.zh.md)
-
-For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
+[中文 README](./README.zh.md) · [Rust port notes](./docs/RUST-PORT.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## What it does
 
-- Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
-- **Streaming card**: text replies and tool calls update on one Lark card in real time.
-- **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.
-- **Session continuity**: each chat, topic, or document comment thread keeps its own session.
-- **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
-- **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
-- **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
-- **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
-- **Long-running tasks**: Feishu auto-closes a streaming card about 10 minutes after it is created. larkline pauses live updates just before that cutoff and sends the final answer as a separate message, so a long run never ends silently.
+- Forwards Feishu / Lark messages to a local Claude Code or Codex CLI. DM the bot directly, or `@`-mention it in a group.
+- **Streaming card**: the answer and a tool summary update on one Lark card while the agent works. Running cards carry a stop button.
+- **Session continuity**: each chat resumes its own agent session. A session is only resumed from the working directory it was created in.
+- **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. `/stop` aborts the current run and drops its queued batch.
+- **Per-chat working directory**: use `/cd` to switch the directory for the current chat, and `/pwd` to inspect it.
+- **Cloud-doc comments**: `@`-mention the bot in a supported document comment (`doc`, `docx`, `sheet` or `file`) and it replies in the same thread. The app must subscribe to `drive.notice.comment_add_v1`.
+- **In-meeting agent (opt-in)**: join a Feishu meeting, answer in-meeting or over IM, and produce notes from the live transcript.
+- **Long-running tasks**: Feishu stops accepting updates for a streaming card after about 10 minutes. larkline stops updating at 8.5 minutes and sends the final answer as a separate message, so a long run never ends silently.
+- **OS-managed service**: run in the foreground for debugging, then install a per-profile launchd, systemd or Task Scheduler service.
+- **Multiple profiles**: keep separate PersonalAgent apps, agents, sessions and workspaces on one machine.
+- **Encrypted App Secret**: the App Secret is stored in a local encrypted keystore, never in plaintext in `config.json`.
 
-## Prerequisites
+## Requirements
 
-- Node.js **>= 20.12.0**
-- At least one local agent installed and logged in:
+- macOS, Linux or Windows. larkline itself needs no Node.js, npm or any language runtime.
+- One local coding agent installed and logged in:
   - Claude Code: `claude`, see https://docs.anthropic.com/en/docs/claude-code/quickstart
   - Codex CLI: `codex`, see https://developers.openai.com/codex/cli
-- A Feishu / Lark **PersonalAgent** app. The first-run QR wizard can create and bind one for you.
+- A Feishu / Lark **PersonalAgent** app. `larkline onboard` can create and bind one through the QR flow.
+- Network access to Feishu / Lark from the machine running the bridge.
+
+The agent CLI is a separate tool and keeps its own requirements (including Node.js, if that is how you installed it). larkline only spawns the local binary.
 
 ## Install
 
+Download the installer first, then run it:
+
 ```bash
-npm i -g larkline
-# or
-pnpm add -g larkline
+curl -fsSL https://raw.githubusercontent.com/luozhouyang/larkline/main/install.sh -o /tmp/larkline-install.sh
+sh /tmp/larkline-install.sh
 ```
 
-If you previously installed `lark-channel-bridge`, stop and unregister its OS service first (`lark-channel-bridge stop` / `unregister`), then install `larkline` and run `larkline start`. On first launch, `~/.lark-channel` is renamed to `~/.larkline` automatically; set `LARKLINE_HOME` to use a different state directory.
+The two steps are deliberate: the script is saved to a file so you can inspect it before it runs. It is never piped straight from the network into a shell.
 
-## First run
+The default install directory is `~/.local/bin`, with no `sudo`. If that directory is not on `PATH`, the installer prints the exact `export` line.
+
+### Pin a version
+
+```bash
+sh /tmp/larkline-install.sh --version <version>
+```
+
+A leading `v` is accepted too. Use this when you want reproducible installs or need to roll back.
+
+### Choose the install directory
+
+```bash
+LARKLINE_INSTALL_DIR="$HOME/bin" sh /tmp/larkline-install.sh
+# or
+sh /tmp/larkline-install.sh --dir "$HOME/bin"
+```
+
+The installer writes the new binary beside the destination and renames it into place. A running daemon keeps its old inode and finishes its work; the next start picks up the new binary.
+
+### Checksums and platform assets
+
+The installer downloads the matching asset and verifies it against the release's `SHA256SUMS` when that file is present. If a release has no checksums, it prints a warning instead of pretending to verify.
+
+| Platform | Release asset | Notes |
+|---|---|---|
+| macOS (Apple Silicon + Intel) | `larkline-darwin-universal.zip` | Universal binary, Developer ID-signed and notarized by Apple |
+| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | Built on Ubuntu 22.04 |
+| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | Built on Ubuntu 24.04 ARM |
+| Windows x86_64 | `larkline-windows-x86_64.zip` | Unsigned; SmartScreen may warn on first run |
+
+On Windows, extract `larkline.exe` from the release zip and put it on `PATH`. The installer is a POSIX `sh` script, so the zip is the simplest option there.
+
+### Upgrading
+
+```bash
+larkline upgrade --check   # report the latest release
+larkline upgrade           # print the exact installer command for it
+```
+
+`larkline upgrade` never replaces the binary underneath a running daemon. It reports the available version and the installer command; you decide when to run it and restart the service. On Windows, replace `larkline.exe` from the release zip instead.
+
+## Quick start
+
+### 1. Create a profile
+
+The easiest path creates a PersonalAgent app through the QR device flow:
+
+```bash
+larkline onboard
+```
+
+A QR code renders in the terminal. Scan it with Feishu / Lark, confirm in the app, and the profile is written to `~/.larkline/config.json`. The default profile name is `bot` (then `bot-2`, `bot-3`, …); use `--name` to choose one, `--agent codex` for Codex, and `--tenant lark` for a Lark global app.
+
+If you already have a PersonalAgent app, create the profile directly:
+
+```bash
+larkline profile create claude --app-id cli_xxx
+```
+
+The command prompts for the App Secret without echoing it. Pass `--agent codex` for Codex, `--tenant lark` for a Lark global app, and `--app-secret` when a script needs to supply the secret non-interactively. `--no-use` creates the profile without making it active.
+
+You do not need to choose a project directory up front. The bridge creates a profile-managed default workspace; use `/cd <absolute path>` in Feishu / Lark to switch to a real project later.
+
+### 2. Check the setup
+
+```bash
+larkline doctor
+```
+
+`doctor` checks the state directory, config, profiles, active profile, app id, keystore decryption, the agent binary, and (as a warning) `lark-cli`. It exits non-zero when a required check fails.
+
+### 3. Run in the foreground
 
 ```bash
 larkline run
 ```
 
-The first run opens a QR-code wizard:
+`run` prints the profile, app, tenant, agent and workspace, then connects to the Feishu / Lark long connection. Send a direct message or `@`-mention the bot in a group. Press `Ctrl-C` to stop.
 
-1. A QR code renders in your terminal.
-2. Scan it with the Feishu / Lark app.
-3. Pick or create a PersonalAgent app.
-4. If prompted, choose which agent to initialize.
-5. Config is written to `~/.larkline/config.json`.
+Use `larkline run --dry-run` to validate config, credentials and the agent binary without connecting. `--cwd` selects a working directory for this run when the profile does not define `workspaces.default`.
 
-You do not need to choose a project directory up front. The bridge creates a profile-managed default working directory; after startup, send `/cd <path>` in Feishu / Lark to switch to a real project.
+### 4. Run as a service
 
-If you already have a PersonalAgent app, pass `--app-id` during initialization to skip app creation. The command prompts for the App Secret.
-
-```bash
-larkline run --app-id cli_xxx
-# or initialize and start the background service directly
-larkline start --app-id cli_xxx
-```
-
-For Lark global apps, add `--tenant lark`.
-
-## Background service
-
-Use `run` for first-run setup and foreground debugging. After the bot can send and receive messages, stop the foreground process with `Ctrl-C`, then use an OS-managed service for background operation:
+Stop the foreground process first, then install and start the per-profile daemon:
 
 ```bash
 larkline start
 larkline status
-larkline stop
 ```
 
-Install globally before using service commands. The daemon's launchd plist / systemd unit / Windows task records the bridge CLI path; if that path comes from an npm temp cache through `npx`, the daemon can break when the cache is cleaned. `run` is fine through `npx` as a one-shot foreground process.
+`start` installs or updates the OS service definition if needed, stops a live instance, and starts the new one. The service records the binary path, the profile and the invoking shell's `PATH`, so `claude` and `codex` remain discoverable after logout. Do not run `larkline run` and the daemon against the same app at the same time.
 
-Service commands install a per-profile service:
+Service commands are per profile:
 
 ```bash
 larkline start [--profile <name>]
-larkline stop [--profile <name>]
+larkline stop [--profile <name>]        # stop and disable autostart
 larkline restart [--profile <name>]
 larkline status [--profile <name>]
-larkline unregister [--profile <name>]
+larkline unregister [--profile <name>]  # remove the OS registration
 ```
 
 Platform mapping:
+
 - **macOS**: launchd user agent `ai.larkline.bot.<profile>`
 - **Linux**: systemd user unit `larkline.bot.<profile>.service`
-- **Windows**: Task Scheduler task `Larkline.Bot.<profile>`, launched through a `.cmd` wrapper
+- **Windows**: Task Scheduler task `Larkline.Bot.<profile>`, launched through a generated `.cmd` wrapper
 
-Daemon logs are under `~/.larkline/profiles/<profile>/logs/daemon/`.
+Daemon stdout/stderr logs are under `~/.larkline/profiles/<profile>/logs/daemon/`.
 
-### Multiple profiles: Claude and Codex
+## Command reference
 
-By default, the bridge starts with the currently selected bot/profile. Use `bot use <name>` (or the `profile use` alias) to change it. Each one keeps its own app credentials, sessions, working directories, and logs. Create multiple bots only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
+| Command | What it does |
+|---|---|
+| `larkline run [--cwd <path>] [--dry-run]` | Run the bridge in the foreground. `--dry-run` validates and prints what would run without connecting. |
+| `larkline doctor` | Check config, credentials, keystore, profiles and agent binaries. Non-zero exit on a failed required check. |
+| `larkline onboard [--name <name>] [--agent claude\|codex] [--tenant feishu\|lark] [--no-use]` | Create a profile by scanning a QR code (app registration device flow). |
+| `larkline profile list\|create\|use\|remove\|show` | Manage profiles. `create` needs `--app-id`; it also accepts `--app-secret`, `--agent`, `--tenant` and `--no-use`. `remove` takes `--yes` and `--purge-secret`. `show` prints one profile as JSON. |
+| `larkline secrets get\|set\|list\|remove` | Manage the encrypted keystore. `get` speaks the exec-provider JSON protocol on stdin/stdout; `list` prints ids, never values. |
+| `larkline upgrade [--check]` | Report the latest release and print the installer command. It never replaces the binary automatically. |
+| `larkline start` | Install (if needed) and start the OS-managed daemon. |
+| `larkline stop` | Stop the daemon and disable autostart. |
+| `larkline restart` | Restart an installed daemon. |
+| `larkline status` | Show the service definition, whether it is installed and running, pid and last exit. |
+| `larkline unregister` | Remove the OS service registration. Local state is kept. |
+| `larkline ps` | List bridge processes recorded in the shared process registry, marking stale entries. |
+| `larkline kill <id\|#>` | Stop a registered bridge process by short id or 1-based list index. |
 
-```bash
-larkline start --profile claude --agent claude
-larkline start --profile codex --agent codex
-```
+Global options: `--home <path>` (defaults to `$LARKLINE_HOME` or `~/.larkline`), `--profile <name>` (defaults to `$LARKLINE_PROFILE` or the active profile), and `-v`/`-vv` for more logging.
 
-For example, to restart only the Codex bot:
+`ps` and `kill` read `~/.larkline/registry/processes.json`. The Rust bridge does not register its own `run` process yet, so a Rust-only setup shows an empty list; entries written by the TypeScript bridge are still readable during migration.
 
-```bash
-larkline restart --profile codex
-larkline status --profile codex
-```
-
-## Commands
-
-### Host CLI
-
-```text
-larkline run [--profile <name>] [--no-bootstrap] [--agent claude|codex] [--workspace <path>] [-c <config>]
-larkline bot create|list|use|remove|export ...
-larkline migrate [--profile <name>] [--agent claude|codex]
-larkline ps
-larkline kill <id|#>
-larkline --help
-```
-
-`bot use <name>` changes the bot/profile used by later default starts. Use these bot management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
-
-```bash
-larkline bot create claude --agent claude   # QR-create a new bot
-larkline bot create codex --agent codex
-larkline bot list
-larkline bot use <name>
-larkline bot remove <name>
-larkline bot remove <name> --purge --yes
-larkline bot export <name> [--output ./profile.json] [--force]
-larkline bot export <name> --include-secrets --yes
-```
-
-`profile` remains an alias for `bot` (same commands and data), for compatibility with older scripts: `profile remove` and `profile export` still work unchanged. `bot remove` archives local state by default, including the active bot. If others remain, the bridge switches to the next one; if it was the last one, the root config is cleared so the same name can be created again. `--purge --yes` permanently deletes local state. `bot export` redacts app secrets by default; `--include-secrets --yes` includes sensitive config.
-
-`run` and `start` still support first-run bootstrap for convenience. Pass `--no-bootstrap` when you want them to only use an existing bot and fail instead of creating/migrating one.
-
-If a bot was created with the wrong agent kind, stop or unregister any matching background service first, then run `bot remove <name>` and recreate it with the intended `--agent`.
-
-### Slash commands inside Feishu / Lark
+## Commands inside Feishu / Lark
 
 | Command | Effect |
 |---|---|
-| `/new`, `/reset` | Clear the current session |
-| `/cd <path>` | Switch working directory and reset the session |
-| `/ws list` | List named workspaces |
-| `/ws save <name>` | Save the current working directory as a named workspace |
-| `/ws use <name>` | Switch to a named workspace |
-| `/ws remove <name>` | Delete a named workspace |
-| `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
-| `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
-| `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
-| `/invite user @name` | Allow a user to use the bot in DMs |
-| `/invite admin @name` | Add an access-control admin |
-| `/invite group` | Allow the current group to use the bot |
-| `/invite all group` | Allow all groups the bot has joined |
-| `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
-| `/stop` | Stop the current run, including the card stop button |
-| `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
-| `/ps` | List local bridge processes |
-| `/exit <id\|#>` | Stop a bridge process |
-| `/reconnect` | Force a WebSocket reconnect |
-| `/doctor [description]` | Run low-sensitive diagnostics |
-| `/help` | Help card |
+| `/new`, `/reset` | Clear the current session for this chat. |
+| `/cd <absolute path>` | Switch this chat's working directory. The path must exist and be absolute; it is canonicalized. |
+| `/pwd` | Show the effective working directory. |
+| `/status` | Show profile, agent, app id, tenant, cwd, reply mode and whether a session is resumable. |
+| `/config` | Show the current reply preferences. |
+| `/config set messageReply <card\|markdown\|text>` | Set the reply mode (admin only). |
+| `/config set showToolCalls <true\|false>` | Show or hide tool summaries (admin only). |
+| `/meeting` | Show the in-meeting agent status. Requires `meeting.enabled`. |
+| `/meeting join <9-digit number>` | Join a meeting by its 9-digit meeting number. |
+| `/meeting leave [meeting number]` | Leave the selected meeting. |
+| `/meeting notes [meeting number]` | Summarize the transcript for the selected meeting. |
+| `/meeting ask <question>` | Ask a question with the meeting transcript as context. |
+| `/meeting transcript [meeting number]` | Show the transcript context the agent actually receives. |
+| `/meeting stop [meeting number]` | Interrupt the meeting's current agent run. |
+| `/stop` | Abort the current run, including the card's stop button. |
+| `/help` | Show the list of available commands. |
 
-DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. When a group has only one human member (bots don't count), the mention requirement is relaxed automatically — this covers dedicated groups created with `/new chat`. Adding a second person restores the `@` requirement immediately when the app receives member-change events, and within about a minute otherwise. Cloud-doc comments in supported document types run when the bot is mentioned.
+Notes:
 
-## Reply Display and COT
+- DMs do not need an `@` mention. Groups require one by default; set `access.requireMentionInGroup` to `false` to relax that.
+- `/config set` and `/meeting` are admin commands. They accept a sender in `access.admins`; while the admin list is empty, a sender in `access.allowedUsers` is accepted instead. With both lists empty they fail closed.
+- `/config` reads are open to any sender the message policy already admitted.
+- Commands bypass the debounce queue and drop anything already waiting for that chat.
+- `/meeting` additionally requires the profile's `meeting.enabled` to be `true`, and the app must have the VC bot scopes.
+- Commands are replied to as text, not as interactive cards.
 
-`/config` controls four presentation settings:
+## Reply modes
 
-- **Message reply mode**: `message card` streams the final reply; `plain text` sends once after the run finishes.
-- **Tool-call display**: controls whether tool blocks appear in the final card / markdown reply.
-- **COT process message**: `off` sends only the final reply; `brief` first sends a COT message with agent progress text and tool summaries; `detailed` also includes tool args and truncated output.
-- **Reasoning display**: controls whether agent thinking is shown in normal replies or a dedicated bubble.
+`/config set messageReply` controls how the final answer is delivered:
 
-When COT is enabled, the bridge splits the process view and final answer into two messages. The COT message is for tracing what the agent did; the final answer is still generated from the agent's raw text, without heuristic bridge-side filtering. If an agent emits final-answer text as ordinary stream text, that text can also appear in the COT process message.
+- **`card`** — one CardKit streaming card is created and updated while the agent runs. The card shows the answer and a compact tool summary, plus a stop button while the run is live.
+- **`markdown`** — the default. The current Rust build also uses the card renderer for this mode, and falls back to a plain message when the card can no longer be updated.
+- **`text`** — no card. The bridge sends one plain-text message when the run finishes.
 
-### Reasoning display
+`showToolCalls` controls whether the tool summary appears in the final card or text reply. It does not change what the agent does.
 
-- **Auto (default)**: preserves the old behavior — interactive cards show a collapsible thinking panel; Markdown/plain-text replies hide it.
-- **Off**: hide reasoning in normal replies. An explicitly enabled COT process message still follows its own settings.
-- **Inline**: include reasoning in the normal reply. Cards use a collapsible panel; Markdown/plain text uses a blockquote.
-- **Bubble**: when COT is off, publish a dedicated “thinking process” message. When COT is on, merge reasoning into that bubble instead of creating a duplicate.
+Feishu force-finalizes a streaming card about 10 minutes after creation and drops later updates. larkline keeps updating until 8.5 minutes, then stops and delivers the final answer as a new message. This is a server-side limit, so it applies to desktop and mobile clients alike.
 
-Claude Code thinking is streamed incrementally; larkline passes `--include-partial-messages`, so make sure the installed Claude Code build supports that flag. Codex reasoning is shown only when the CLI emits reasoning-summary items; that usually depends on `model_reasoning_summary` in `~/.codex/config.toml` and on the authentication mode.
+## Configuration
 
-⚠️ Reasoning may contain code, file paths, command output, or other sensitive data, and every member of a group chat can see it. The default **Auto** mode does not widen existing visibility; confirm the audience before enabling **Inline** or **Bubble**.
+### Profiles
 
-## lark-cli identity policy
+A profile is one bot identity: its Feishu / Lark app credentials, agent kind, preferences, access lists, sessions and working directory. `config.json` uses schema v2 with an `activeProfile` and a `profiles` map. `--profile` (or `LARKLINE_PROFILE`) selects a profile for one command; otherwise the active profile is used.
 
-Each profile uses a profile-local lark-cli directory at `~/.larkline/profiles/<profile>/lark-cli`. The agent process receives `LARKSUITE_CLI_CONFIG_DIR` for that directory, so personal authorization in one profile is not shared with another profile.
-
-The default policy is `bot-only`: lark-cli uses the app/bot identity and does not access personal resources. When a user authorizes personal resources such as calendar, mail, or drive, the current profile can switch to `user-default`, which keeps app identity available and also allows the authorized user identity. Owner/admin users can inspect or change this policy in `/config`; `/status` shows the current summary as `lark-cli: app` or `lark-cli: user-ready`.
-
-## Working directories
-
-Each profile may define a default working directory through `workspaces.default`. New profiles may be created with `--workspace <path>`; if omitted, the bridge creates a profile-managed default working directory.
-
-This is a profile-field snippet. Do not replace the whole `config.json` with it; edit the matching profile's `workspaces` field.
+A profile fragment looks like this. Do not replace the whole `config.json` with it; edit the matching profile.
 
 ```json
 {
+  "agentKind": "claude",
+  "accounts": {
+    "app": {
+      "id": "cli_xxx",
+      "tenant": "feishu",
+      "secret": {
+        "source": "exec",
+        "provider": "bridge",
+        "id": "app-cli_xxx"
+      }
+    }
+  },
+  "preferences": {
+    "messageReply": "card",
+    "showToolCalls": true
+  },
+  "access": {
+    "allowedUsers": ["ou_xxx"],
+    "requireMentionInGroup": true,
+    "admins": ["ou_xxx"]
+  },
   "workspaces": {
-    "default": "/Users/me/.larkline-workspaces/claude/default"
+    "default": "/Users/me/projects/app"
   }
 }
 ```
 
-The bridge checks that a selected directory exists, is a directory, and is not an overly broad location such as `/`, the home root, a system directory, or a temp root. The working directory is only the current directory for an agent run. It is not a filesystem sandbox; actual file access still depends on the local agent process and its permission mode.
+The Rust binary preserves config fields it does not read yet, so a round-trip never drops settings written by the TypeScript bridge.
 
-## Permission modes
+### App Secret and the keystore
 
-The recommended user-facing profile config is `permissions.defaultAccess` and `permissions.maxAccess`. New profiles default to `full` for both values so the bridge can keep local tools, authorization flows, file writes, and other agent features fully usable. To tighten a profile, set one or both values to `workspace` or `read-only`; stricter modes can limit local tool execution, login/authorization flows, file writes, and similar capabilities.
+`profile create` and `onboard` encrypt the App Secret into the profile's `secrets.enc` using AES-256-GCM. The config stores only a reference (`source: "exec"`, `provider: "bridge"`, `id: "app-<app_id>"`); the plaintext never appears in `config.json`.
 
-This is a profile-field snippet. Do not replace the whole `config.json` with it; edit the matching profile's `permissions` field.
+```bash
+larkline secrets list                       # ids only
+larkline secrets set app-cli_xxx            # prompts without echo
+larkline secrets remove app-cli_xxx
+```
+
+The encryption key is derived from the machine's hostname and your user name, plus a per-profile salt in `.keystore.salt`. Copying only `secrets.enc` to a different machine or user account will generally not decrypt; re-enter the App Secret there.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `LARKLINE_HOME` | State root. Defaults to `~/.larkline`; `--home` overrides it. |
+| `LARKLINE_PROFILE` | Profile for this process. `--profile` overrides it. |
+| `LARKLINE_CALLBACK_SECRET` | HMAC key used to verify card buttons rendered by the agent. If it is not configured, those clicks are rejected. |
+
+The pre-rename fallbacks `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE` and `LARK_CHANNEL_CALLBACK_SECRET` are still read when the new names are absent.
+
+For callbacks, the key can also come from the profile's `callback.secret` (or `callback.keys` for key rotation). The bridge and the card-signing client must share the same value.
+
+### Working directories
+
+The profile may define a default working directory at `workspaces.default`. If it does not, the bridge uses the profile-managed default workspace under `<state-root>-workspaces/<profile>/default` (`~/.larkline-workspaces/<profile>/default` with the default home) and creates it on demand.
+
+The working directory is the current directory for an agent run, not a filesystem sandbox. Actual file access still depends on the agent process and its permissions.
+
+### Access control
+
+The Rust bridge implements a subset of the TypeScript access model:
+
+- `access.allowedUsers` restricts who can trigger the bot in DMs, groups and comment threads. When the list is empty, no user allowlist is applied.
+- Group messages require an `@` mention by default. `access.requireMentionInGroup` can turn that off for a profile.
+- `access.admins` gates `/config set` and `/meeting`; while `admins` is empty, `access.allowedUsers` acts as the admin set.
+- `access.allowedChats` is not applied to ordinary messages yet. It is only consulted when verifying card-button clicks.
+
+Runtime app-owner discovery, `/invite`, `/remove` and the TypeScript owner-bypass rules are not ported yet. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
+
+### Meetings
+
+The in-meeting agent is opt-in. Add the meeting block to the profile and restart:
 
 ```json
 {
-  "permissions": {
-    "defaultAccess": "full",
-    "maxAccess": "full"
+  "meeting": {
+    "enabled": true
   }
 }
 ```
 
-Mode mapping:
+The app needs the VC bot scopes, and the tenant must support the VC bot capability. Once enabled, `/meeting join <9-digit number>` joins a meeting; in-meeting chat prefixed with the configured trigger can ask questions, and `/meeting notes` summarizes the transcript. See [Rust port notes](./docs/RUST-PORT.md) for the exact limitations.
 
-| Bridge access | Claude permission mode | Codex mode |
-|---|---|---|
-| `full` | `bypassPermissions` | `danger-full-access` |
-| `workspace` | `acceptEdits` | `workspace-write` |
-| `read-only` | `plan` | `read-only` |
-
-The legacy `sandbox` field is still readable for old configs. After the bridge saves the profile, it migrates that setting to canonical `permissions`.
-
-## Data directories
+## Data directory and compatibility
 
 | Path | Content |
 |---|---|
-| `~/.larkline/config.json` | Root config with profiles and active profile |
-| `~/.larkline/active-profile` | Last selected profile |
-| `~/.larkline/profiles/<profile>/sessions.json` | Session state |
-| `~/.larkline/profiles/<profile>/sessions.json.catalog.json` | Agent-aware session catalog |
-| `~/.larkline/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
-| `~/.larkline/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
-| `~/.larkline/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
-| `~/.larkline/profiles/<profile>/media/` | Attachment cache |
-| `~/.larkline/profiles/<profile>/logs/` | Structured run logs |
-| `~/.larkline/registry/processes.json` | Local process registry |
-| `~/.larkline/registry/locks/` | Profile and app locks |
+| `~/.larkline/config.json` | Root config: `activeProfile` and `profiles` |
+| `~/.larkline/profiles/<profile>/sessions.json` | Resumable session per chat |
+| `~/.larkline/profiles/<profile>/workspaces.json` | Per-chat working directory overrides |
+| `~/.larkline/profiles/<profile>/secrets.enc` | Encrypted App Secret and other secrets |
+| `~/.larkline/profiles/<profile>/.keystore.salt` | Per-profile keystore salt |
+| `~/.larkline/profiles/<profile>/logs/daemon/` | Daemon stdout/stderr logs |
+| `~/.larkline/registry/processes.json` | Process registry read by `ps` / `kill` |
+| `~/.larkline/secrets-getter` | Exec-provider wrapper used by lark-cli |
 
-Set `LARKLINE_HOME=/path/to/state` to move all local bridge state. `LARKLINE_LOG_DAYS` overrides log retention.
+### Same config, same keystore
 
-## Access control
+- The state layout, config schema v2 and encrypted keystore are shared with the TypeScript bridge.
+- The keystore uses the same AES-256-GCM / PBKDF2-HMAC-SHA256 construction, so the Rust binary can decrypt an App Secret written by the TypeScript bridge (and the other way round).
+- `~/.lark-channel` is renamed to `~/.larkline` automatically on first launch with the default home when `~/.larkline` does not exist. `~/.lark-channel-workspaces` is moved the same way when possible.
+- Either implementation can read the same config. Stop one before starting the other; do not run both against the same app and profile at once.
 
-**Chat access is private by default: out of the box, only *you* can use the bot in DMs and groups.** "You" = whoever created / owns the Feishu app (the person who scanned the QR to set it up). The bot figures out who the app owner is automatically from Feishu, so **solo chat use needs zero configuration** — you can DM it and `@`-mention it in any group, and everyone else's chat messages are silently ignored (no "permission denied" reply, which would only confirm the bot exists). Cloud-doc comments are document-scoped; see below.
+### Migrating from the TypeScript bridge
 
-To let other people or groups in, add them to one of three lists:
+1. Stop and unregister the old service with the old CLI: `larkline stop` and `larkline unregister`.
+2. Install the Rust binary with `install.sh` and make sure `command -v larkline` resolves to it.
+3. Run `larkline doctor`. The same profile, app id, keystore and sessions are found.
+4. Start the service with `larkline start`.
 
-| List | Controls | Add | Remove |
-|------|----------|-----|--------|
-| **Allowed users** | who can DM the bot | `/invite user @them` | `/remove user @them` |
-| **Allowed chats** | which groups the bot answers in (for **everyone** in them) | `/invite group` (current group) / `/invite all group` (every group the bot is in) | `/remove group` (current group) |
-| **Admins** | who can change settings, and use the bot in any group | `/invite admin @them` | `/remove admin @them` |
+If both `~/.lark-channel` and `~/.larkline` exist, nothing is renamed; the existing `~/.larkline` wins. No re-onboarding and no App Secret re-entry are needed.
 
-> `/invite` and `/remove` can only be run by **you (the creator) and admins**. The `@` in the command points at the *target person* (not the bot) — the bot resolves the mention to their identity, so you never deal with raw IDs.
+### Not yet ported
 
-### Two identities that bypass everything
+The Rust bridge does not yet implement these TypeScript features:
 
-- **You (the creator)**: subject to no list at all — DMs, any group, every command. You **can never lock yourself out**: even if the lists get messed up, DM the bot and send `/config` to get back in. Transfer the app's ownership in the Feishu console and the bot follows the new owner automatically.
-- **Admins**: can DM, run management commands like `/config`, and **bypass the allowed-chats list** — the bot answers them in any group, listed or not. Good for teammates who co-maintain the bot.
+- Runtime app-owner discovery, `/invite` / `/remove`, and `allowedChats` for ordinary messages.
+- `/ws` named workspaces, `/resume`, `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`.
+- The full `/config` card form and the remaining presentation settings (COT process messages, reasoning bubble/panel, access and lark-cli policy).
+- Agent permission modes (`permissions.defaultAccess` / `maxAccess`); runs currently use full access.
+- Inbound image and file download. Agent runs receive text prompts only.
+- Topic/thread-scoped sessions; sessions are keyed by chat id.
+- The keepalive watchdog and the process-registry writer.
 
-### Common setups
-
-- **Just me** → nothing to do; this is the default.
-- **Let a teammate DM the bot** → `/invite user @them`
-- **Open a work group to everyone in it** → send `/invite group` inside that group
-- **First-time setup, onboard every group the bot is already in** → `/invite all group` pulls them all into the list at once; trim with `/remove group` afterwards
-- **Add a co-admin** → `/invite admin @them`
-
-### Worth knowing
-
-- Changes take effect on the **next message** — no restart needed.
-- **In groups you must `@` the bot first** (DMs don't need it; a group with only one human relaxes this automatically). That's a separate toggle (`/config` → "require @ in groups"), independent of the lists above.
-- Strangers get pure silence — no reply at all. The one exception: if someone `@`-mentions the bot in a group that hasn't been opened up, the bot posts a friendly one-liner telling them an admin can run `/invite group` to enable it.
-- Cloud-doc comments are document-scoped: anyone who can comment in a supported document and mention the bot can trigger a reply.
-
-### Advanced: editing the config file directly
-
-If you'd rather not do it inside Feishu, `/invite` and `/config` write the matching profile's `access` field in `~/.larkline/config.json`. Empty lists mean nobody from that list, not open access. This is a profile-field snippet; do not replace the whole `config.json` with it:
-
-```json
-{
-  "schemaVersion": 2,
-  "profiles": {
-    "claude": {
-      "agentKind": "claude",
-      "access": {
-        "allowedUsers": ["ou_xxxxxxxxxxxxx"],
-        "allowedChats": ["oc_xxxxxxxxxxxxx"],
-        "admins": ["ou_xxxxxxxxxxxxx"],
-        "requireMentionInGroup": true
-      }
-    }
-  }
-}
-```
-
-`allowedUsers` / `admins` take user `open_id`s; `allowedChats` takes group `chat_id`s. The easiest way to find an ID by hand: have the person message the bot (or `@` it in the group), then check the active profile's log:
-
-```bash
-grep '"event":"enter"' ~/.larkline/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
-```
-
-Each line carries `chatId` (group / DM id) and `senderId` (user `open_id`). After a manual edit, **restart the bridge** or send `/reconnect` from an allowed admin context to apply it. For day-to-day tweaks `/invite` / `/config` are easier; direct edits are mainly for deployment scripts that pre-seed access.
-
-## Cloud-doc comments
-
-Cloud-doc comments do not need a separate workspace binding or document allowlist. In supported document comments, mention the bot and the bridge replies in the same thread. Comment runs reuse the document session key and fall back to the user home directory when no document cwd was previously recorded.
+See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reasons behind each gap.
 
 ## FAQ
 
-**The bot stays silent or the local CLI never replies.** Usually the local `claude` or `codex` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
+**The bot is silent, or the local agent never replies.** Run `larkline doctor` first. Then check that the agent CLI is installed and logged in, and send `/status` to see the current cwd and whether a session is resumable. `/new` often fixes a stale session.
 
-**The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
+**The card stops updating and no answer arrives.** If the run passed about 8.5 minutes, this is the card-lifetime guard: the bridge stops updating the card and sends the final answer as a new message. Wait for the run to finish instead of expecting further card updates.
 
-**A long run stops updating at "正在调用工具" and no answer arrives.** Feishu force-finalizes a streaming card about 10 minutes after it is created and silently drops later card updates. This is a server-side Feishu limit, so it can happen with desktop and mobile clients alike. larkline pauses the progress card at ~8.5 minutes with an explicit notice, then delivers the final answer as a new message when the run finishes. The pause threshold can be overridden with `LARKLINE_STREAM_CARD_SAFE_MS` (milliseconds, capped below 10 minutes). When the guard fires, the log contains `stream card-lifetime-expiring` and `stream card-lifetime-final-fallback`.
+**Can I use Claude Code for one bot and Codex for another?** Yes. Create two profiles with different `--agent` values and run one service per profile. The agent kind is set at profile creation; create a new profile if you need to switch it.
 
-**The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.
+**How do I change the App Secret?** Run `larkline secrets set app-<app_id>`, then restart the bridge or service. The config reference stays the same.
 
-## Testing and CI
+**Windows shows a SmartScreen warning.** The Windows binary is not code-signed yet. The macOS build is signed and notarized; the Linux builds are unsigned but checksummed.
 
-Local checks:
+**`larkline ps` shows nothing.** The Rust bridge does not register its own process yet, so the list is empty in a Rust-only setup. This is a known gap, not an error.
 
-```bash
-pnpm test
-pnpm typecheck
-pnpm build
-```
+**How do I uninstall?** Run `larkline stop`, then `larkline unregister`, remove the `larkline` binary, and delete `~/.larkline` if you also want to remove local state.
 
-`pnpm test` includes unit, integration, and process-level adapter tests. CI runs on macOS, Ubuntu, and Windows with `pnpm install --frozen-lockfile`, `pnpm test`, `pnpm typecheck`, and `pnpm build`.
+## Development and release
 
-### Release
-
-Releases are tag-driven. Pushing a `v*` tag runs `.github/workflows/release.yml`, which verifies that the tag matches `package.json`, runs tests / typecheck / build, publishes to npm with provenance through [npm trusted publishing](https://docs.npmjs.com/trusted-publishers), and creates a GitHub Release. No `NPM_TOKEN` secret is used.
-
-One-time setup:
-
-1. If `larkline` does not exist on npm yet, publish the first version manually: `npm login && npm publish --access public`.
-2. On npmjs.com → `larkline` → Settings → Trusted publishing, add a GitHub Actions publisher with owner `luozhouyang`, repository `larkline`, and workflow filename `release.yml`.
-3. After that, cut releases with the tag and push it:
+Build and test from the repository root:
 
 ```bash
-pnpm version patch   # or minor / major
-git push --follow-tags
+cargo build --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+./target/release/larkline doctor
 ```
 
-The tag and `package.json` must agree (`v0.7.1` ↔ `0.7.1`), otherwise the workflow stops before publishing.
-
-## Optional telemetry
-
-By default the bridge reports **nothing**: no metrics, no logs leave your machine, and it pulls in zero telemetry dependencies. The hook below is inert unless you opt in.
-
-To wire up your own monitoring, point an environment variable at a module that default-exports (or exports `createAdapter`) an `AdapterFactory`:
-
-```bash
-LARKLINE_TELEMETRY_MODULE=your-telemetry-package larkline start
-```
-
-That module receives every `log.*` event plus error/metric hooks and forwards them wherever you like. The interface is exported from the package root:
-
-```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'larkline';
-
-const createAdapter: AdapterFactory = (meta) => ({
-  emit(event) {/* ship event */},
-  recordError(err, ctx) {/* ship exception */},
-  recordMetric(name, value, tags) {/* ship metric */},
-  flush(timeoutMs) {/* drain buffered events */},
-});
-export default createAdapter;
-```
-
-A missing module, a bad factory, or a throwing adapter all degrade to noop — telemetry can never stop the bridge from starting or break logging.
+Rust 1.85 or newer is required. CI runs the test suite on macOS, Ubuntu and Windows; formatting and clippy run on Linux. Releases are tag-driven: pushing a `v*` tag runs the release workflow, which formats and tests the workspace, builds Linux x86_64/aarch64, a signed and notarized macOS universal binary, and Windows x86_64, then publishes the assets with `SHA256SUMS` and a GitHub Release.
 
 ## License
 

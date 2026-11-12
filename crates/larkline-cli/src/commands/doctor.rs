@@ -5,7 +5,6 @@
 
 use std::path::Path;
 
-use larkline_agent::resolve_executable;
 
 use crate::context::AppContext;
 
@@ -114,7 +113,9 @@ pub fn execute(ctx: &AppContext) -> anyhow::Result<()> {
             }
 
             let binary_name = profile.agent_kind.binary_name();
-            match resolve_executable(binary_name) {
+            let configured = larkline_core::env::agent_bin_override(binary_name)
+                .unwrap_or_else(|| binary_name.to_string());
+            match larkline_agent::resolve_executable(&configured) {
                 Ok(found) => checks.push(Check::ok(
                     "agent",
                     format!(
@@ -135,7 +136,7 @@ pub fn execute(ctx: &AppContext) -> anyhow::Result<()> {
         }
     }
 
-    match resolve_executable("lark-cli") {
+    match larkline_agent::resolve_executable("lark-cli") {
         Ok(found) => checks.push(Check::ok("lark-cli", found.path.display().to_string())),
         Err(_) => checks.push(Check::warn(
             "lark-cli",

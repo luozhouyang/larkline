@@ -1,394 +1,388 @@
 # larkline
 
-把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
+larkline 是一个自包含的单个静态二进制文件，用来把飞书 / Lark 消息和本机 Claude Code 或 Codex CLI 打通。**不依赖 Node.js，不需要 npm；安装和运行时都只需要这一个二进制。** 启动 bridge，扫码绑定 PersonalAgent 应用，就可以在飞书里和本机编程助手对话。
 
-larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)，由 `lark-channel-bridge` 更名而来。npm 包名、CLI 命令、本地状态目录和环境变量现在统一使用 `larkline`。升级时状态目录会自动迁移，旧的 `LARK_CHANNEL_*` 环境变量仍可作为回退读取。
+larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)，由 `lark-channel-bridge` 更名而来。Rust 实现沿用 TypeScript 版本的 `~/.larkline` 状态目录、配置结构和加密 keystore，老用户不需要重新扫码或重新录入 App Secret。详见 [Rust 移植说明](./docs/RUST-PORT.md)。
 
-[English README](./README.md)
-
-关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
+[English README](./README.md) · [Rust 移植说明](./docs/RUST-PORT.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## 主要功能
 
-- 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code / Codex CLI。
-- **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。
-- **COT 过程消息**：可选先发一条过程消息展示 agent 的阶段性文本和工具调用，再单独发送最终答案。
-- **会话延续**：每个聊天、话题或文档评论有自己的会话，不会互相串。
-- **排队与消息合并**：短时间连续发送的消息会合并处理；任务运行中收到的普通消息会排队到下一轮，`/new`、`/cd`、`/ws use`、`/stop` 这类命令可以中断当前任务。
-- **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
-- **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
-- **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
-- **长任务保护**：飞书会在流式卡片创建约 10 分钟后强制结束它。larkline 会在到达这个上限前暂停实时更新，并在任务结束后把最终答案作为一条新消息单独发送，避免长任务静默丢失结果。
+- 把飞书 / Lark 消息转发给本机 Claude Code 或 Codex CLI。可以私聊 bot，也可以在群里 `@bot`。
+- **流式卡片**：agent 工作期间，答案和工具摘要持续更新在同一张飞书卡片上；运行中的卡片带停止按钮。
+- **会话延续**：每个聊天恢复自己的 agent 会话；只有会话创建时使用的工作目录一致，才会恢复。
+- **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮；`/stop` 会中断当前任务并丢弃排队消息。
+- **按聊天切换工作目录**：用 `/cd` 切换当前聊天的工作目录，用 `/pwd` 查看。
+- **云文档评论**：在支持的文档评论（`doc`、`docx`、`sheet` 或 `file`）里 `@bot`，bridge 会在同一个评论线程里回复。应用需要订阅 `drive.notice.comment_add_v1` 事件。
+- **会议智能体（可选）**：让 bot 入会，在会中或通过私聊回答问题，并基于实时字幕生成纪要。
+- **长任务保护**：飞书会在流式卡片创建约 10 分钟后停止接受更新。larkline 在约 8.5 分钟时停止更新卡片，等任务结束后把最终答案作为一条新消息单独发送，避免长任务静默丢失结果。
+- **系统服务**：可以前台调试，也可以安装按 profile 隔离的 launchd、systemd 或 Task Scheduler 服务。
+- **多 profile**：同一台机器上可以维护多套 PersonalAgent 应用、agent、会话和工作目录。
+- **加密 App Secret**：App Secret 存在本地加密 keystore 中，不会明文写进 `config.json`。
 
 ## 前置条件
 
-- Node.js **>= 20.12.0**
-- 本机至少安装并登录一个 agent：
+- macOS、Linux 或 Windows。larkline 本身不需要 Node.js、npm 或任何语言运行时。
+- 本机安装并登录至少一个编程 agent：
   - Claude Code：`claude`，安装说明：https://docs.anthropic.com/en/docs/claude-code/quickstart
   - Codex CLI：`codex`，安装说明：https://developers.openai.com/codex/cli
-- 一个飞书 / Lark PersonalAgent 应用。首次启动的扫码向导可以帮你创建并绑定。
+- 一个飞书 / Lark **PersonalAgent** 应用。`larkline onboard` 可以通过扫码流程创建并绑定。
+- 运行 bridge 的机器能访问飞书 / Lark 网络。
+
+agent CLI 是独立工具，仍然遵循它自己的安装要求（例如通过 Node.js 安装的 Claude Code 仍需要 Node.js）。larkline 只负责启动本机已有的二进制。
 
 ## 安装
 
+先把安装脚本下载到本地，再执行：
+
 ```bash
-npm i -g larkline
-# 或
-pnpm add -g larkline
+curl -fsSL https://raw.githubusercontent.com/luozhouyang/larkline/main/install.sh -o /tmp/larkline-install.sh
+sh /tmp/larkline-install.sh
 ```
 
-如果之前安装过 `lark-channel-bridge`，请先停止并注销旧的后台服务（`lark-channel-bridge stop` / `unregister`），再安装 `larkline` 并运行 `larkline start`。首次启动会自动把 `~/.lark-channel` 重命名为 `~/.larkline`；也可以用 `LARKLINE_HOME` 指定其他状态目录。
+故意分成两步：脚本先落到文件里，你可以在执行前检查内容，而不是把网络上的脚本直接通过管道交给 shell。
 
-## 首次启动
+默认安装到 `~/.local/bin`，不需要 `sudo`。如果该目录不在 `PATH` 中，安装脚本会打印对应的 `export` 命令。
+
+### 固定版本
+
+```bash
+sh /tmp/larkline-install.sh --version <version>
+```
+
+版本号前带 `v` 也可以。需要可复现安装或回滚时使用。
+
+### 指定安装目录
+
+```bash
+LARKLINE_INSTALL_DIR="$HOME/bin" sh /tmp/larkline-install.sh
+# 或
+sh /tmp/larkline-install.sh --dir "$HOME/bin"
+```
+
+安装脚本先把新二进制写到目标目录旁边，再 rename 到位。正在运行的 daemon 会继续持有旧 inode 并完成手头工作；下一次启动自动使用新二进制。
+
+### 校验和与平台产物
+
+安装脚本会下载对应产物，并在发布提供 `SHA256SUMS` 时校验；如果某个版本没有校验和文件，会打印警告，而不是假装校验通过。
+
+| 平台 | 发布产物 | 说明 |
+|---|---|---|
+| macOS（Apple Silicon + Intel） | `larkline-darwin-universal.zip` | Universal 二进制，Developer ID 签名并由 Apple notarize |
+| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | 在 Ubuntu 22.04 上构建 |
+| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | 在 Ubuntu 24.04 ARM 上构建 |
+| Windows x86_64 | `larkline-windows-x86_64.zip` | 未签名；首次运行可能触发 SmartScreen 警告 |
+
+Windows 上请从 release zip 解压 `larkline.exe` 并放进 `PATH`。安装脚本是 POSIX `sh` 脚本，Windows 上直接用 zip 最省事。
+
+### 升级
+
+```bash
+larkline upgrade --check   # 只检查最新版本
+larkline upgrade           # 打印对应的安装命令
+```
+
+`larkline upgrade` 不会在 daemon 运行时偷偷替换二进制。它只报告可用版本和安装命令，由你决定什么时候执行并重启服务。Windows 上用 release zip 替换 `larkline.exe`。
+
+## 快速开始
+
+### 1. 创建 profile
+
+最省事的方式是通过扫码设备流创建 PersonalAgent 应用：
+
+```bash
+larkline onboard
+```
+
+终端会渲染二维码。用飞书 / Lark 扫码并在 App 内确认，profile 会写入 `~/.larkline/config.json`。默认 profile 名是 `bot`（之后是 `bot-2`、`bot-3`……）；可以用 `--name` 指定名字，`--agent codex` 选择 Codex，`--tenant lark` 选择 Lark 国际版。
+
+如果已经有 PersonalAgent 应用，可以直接创建 profile：
+
+```bash
+larkline profile create claude --app-id cli_xxx
+```
+
+命令会提示输入 App Secret，输入时不回显。Codex 加 `--agent codex`，Lark 国际版加 `--tenant lark`；脚本化场景可以用 `--app-secret` 非交互传入。`--no-use` 表示创建后不切换为当前 profile。
+
+不需要提前指定项目目录。bridge 会创建一个由 profile 托管的默认工作目录；之后在飞书 / Lark 里用 `/cd <绝对路径>` 切到实际项目。
+
+### 2. 检查配置
+
+```bash
+larkline doctor
+```
+
+`doctor` 会检查状态目录、配置文件、profile、当前 profile、app id、keystore 解密、agent 二进制，并把 `lark-cli` 作为警告项检查。必要检查失败时退出码非 0。
+
+### 3. 前台运行
 
 ```bash
 larkline run
 ```
 
-第一次运行会进入扫码向导：
+`run` 会打印 profile、app、tenant、agent 和工作目录，然后连接飞书 / Lark 长连接。可以私聊 bot，或在群里 `@bot`。按 `Ctrl-C` 停止。
 
-1. 终端渲染二维码。
-2. 用飞书 App 扫码。
-3. 选择或创建 PersonalAgent 应用。
-4. 如果终端提示，选择本次要初始化的 agent。
-5. 成功后配置写入 `~/.larkline/config.json`。
+用 `larkline run --dry-run` 可以在不连接的情况下校验配置、凭据和 agent 二进制。profile 没有配置 `workspaces.default` 时，`--cwd` 可以指定本次运行的工作目录。
 
-没有指定项目目录也可以启动。bridge 会创建一个 profile 托管的默认工作目录；启动后在飞书里发送 `/cd <path>` 切到实际项目。
+### 4. 作为系统服务运行
 
-如果已经有 PersonalAgent app，可以在初始化时传 `--app-id` 跳过创建应用流程；命令会提示输入 App Secret。
-
-```bash
-larkline run --app-id cli_xxx
-# 或直接初始化并启动后台服务
-larkline start --app-id cli_xxx
-```
-
-Lark 国际版应用可加 `--tenant lark`。
-
-## 后台运行
-
-`run` 适合首次配置和前台调试。确认 bot 能正常收发消息后，先用 `Ctrl-C` 停掉前台进程，再用系统服务常驻后台：
+先停掉前台进程，再安装并启动按 profile 隔离的 daemon：
 
 ```bash
 larkline start
 larkline status
-larkline stop
 ```
 
-服务层命令必须先全局安装，不能直接用 `npx`。daemon 的 launchd plist / systemd unit / Windows 任务会记录 bridge CLI 的路径；如果这个路径来自 npm 临时缓存，缓存清掉后 daemon 就起不来。`run` 用 `npx` 单次启动没问题。
+`start` 会在需要时安装或更新系统服务定义，停掉已在运行的实例，然后启动新实例。服务定义会记录二进制路径、profile 和当前 shell 的 `PATH`，所以退出登录后 `claude`、`codex` 仍然可被发现。不要同时用 `larkline run` 和 daemon 连接同一个应用。
 
-服务层命令按 profile 注册，每个 profile 有独立服务：
+服务命令按 profile 注册：
 
 ```bash
 larkline start [--profile <name>]
-larkline stop [--profile <name>]
+larkline stop [--profile <name>]        # 停止并关闭开机自启
 larkline restart [--profile <name>]
 larkline status [--profile <name>]
-larkline unregister [--profile <name>]
+larkline unregister [--profile <name>]  # 删除系统服务注册
 ```
 
 平台映射：
+
 - **macOS**：launchd 用户代理 `ai.larkline.bot.<profile>`
 - **Linux**：systemd 用户单元 `larkline.bot.<profile>.service`
-- **Windows**：Task Scheduler 任务 `Larkline.Bot.<profile>`，launcher 是 `.cmd`
+- **Windows**：Task Scheduler 任务 `Larkline.Bot.<profile>`，通过生成的 `.cmd` 启动
 
-daemon 日志在 `~/.larkline/profiles/<profile>/logs/daemon/`。
-
-### 多 profile：分别运行 Claude 和 Codex
-
-默认情况下，bridge 使用当前激活的 bot / profile；可以通过 `bot use <name>`（或 `profile use` 别名）切换。每个 bot 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 bot：
-
-```bash
-larkline start --profile claude --agent claude
-larkline start --profile codex --agent codex
-```
-
-例如只重启 Codex bot：
-
-```bash
-larkline restart --profile codex
-larkline status --profile codex
-```
+daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon/`。
 
 ## 命令速查
 
-### 宿主 CLI
+| 命令 | 作用 |
+|---|---|
+| `larkline run [--cwd <path>] [--dry-run]` | 前台运行 bridge。`--dry-run` 只校验并打印将要运行的内容，不建立连接。 |
+| `larkline doctor` | 检查配置、凭据、keystore、profile 和 agent 二进制。必要检查失败时退出码非 0。 |
+| `larkline onboard [--name <name>] [--agent claude\|codex] [--tenant feishu\|lark] [--no-use]` | 扫码创建 profile（应用注册设备流）。 |
+| `larkline profile list\|create\|use\|remove\|show` | 管理 profile。`create` 必须传 `--app-id`，还支持 `--app-secret`、`--agent`、`--tenant` 和 `--no-use`；`remove` 支持 `--yes` 和 `--purge-secret`；`show` 以 JSON 打印一个 profile。 |
+| `larkline secrets get\|set\|list\|remove` | 管理加密 keystore。`get` 在 stdin/stdout 上使用 exec-provider JSON 协议；`list` 只打印 id，不打印值。 |
+| `larkline upgrade [--check]` | 报告最新版本并打印安装命令；不会自动替换二进制。 |
+| `larkline start` | 安装（如有需要）并启动系统服务。 |
+| `larkline stop` | 停止 daemon 并关闭开机自启。 |
+| `larkline restart` | 重启已安装的 daemon。 |
+| `larkline status` | 显示服务定义、是否安装、是否运行、pid 和上次退出码。 |
+| `larkline unregister` | 删除系统服务注册，保留本地状态。 |
+| `larkline ps` | 列出共享进程注册表中记录的 bridge 进程，并标记已失效的条目。 |
+| `larkline kill <id\|#>` | 按短 id 或从 1 开始的列表序号停止已注册的 bridge 进程。 |
 
-```text
-larkline run [--profile <name>] [--no-bootstrap] [--agent claude|codex] [--workspace <path>] [-c <config>]
-larkline bot create|list|use|remove|export ...
-larkline migrate [--profile <name>] [--agent claude|codex]
-larkline ps
-larkline kill <id|#>
-larkline --help
-```
+全局选项：`--home <path>`（默认 `$LARKLINE_HOME` 或 `~/.larkline`）、`--profile <name>`（默认 `$LARKLINE_PROFILE` 或当前 profile）、`-v` / `-vv` 提高日志级别。
 
-`bot use <name>` 会切换后续默认启动使用的 bot / profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，使用这些 bot 管理命令：
+`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。Rust bridge 目前不会注册自己的 `run` 进程，所以纯 Rust 环境下列表为空；迁移期间由 TypeScript bridge 写入的条目仍然可以读取。
 
-```bash
-larkline bot create claude --agent claude   # 扫码创建新 bot
-larkline bot create codex --agent codex
-larkline bot list
-larkline bot use <name>
-larkline bot remove <name>
-larkline bot remove <name> --purge --yes
-larkline bot export <name> [--output ./profile.json] [--force]
-larkline bot export <name> --include-secrets --yes
-```
-
-`profile` 仍然保留为 `bot` 的别名（命令和数据完全一致），兼容旧脚本：`profile remove`、`profile export` 等旧用法继续可用。`bot remove` 默认归档本地状态，也可以删除当前激活的 bot。若还剩其他 bot，会自动切到下一个；若这是最后一个，会清空 root config，之后可以用同名重新创建。只有加 `--purge --yes` 才会永久删除。`bot export` 默认脱敏 app secret；只有加 `--include-secrets --yes` 才会导出敏感配置。
-
-`run` / `start` 仍保留首次启动自动初始化，方便新用户一条命令跑起来；传 `--no-bootstrap` 可以强制只使用已有 bot，不再自动创建或迁移。
-
-如果某个 bot 被建成了错误的 agent 类型，先 `stop` 或 `unregister --profile <name>` 清理对应后台服务，再 `bot remove <name>`，然后用正确的 `--agent` 重新创建。
-
-### 飞书内斜杠命令
+## 飞书内命令
 
 | 命令 | 作用 |
 |---|---|
-| `/new`, `/reset` | 清空当前会话 |
-| `/cd <path>` | 切换工作目录并重置会话 |
-| `/ws list` | 列出命名工作空间 |
-| `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
-| `/ws use <name>` | 切换到命名工作空间 |
-| `/ws remove <name>` | 删除命名工作空间 |
-| `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
-| `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
-| `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
-| `/invite user @某人` | 允许用户私聊使用 bot |
-| `/invite admin @某人` | 添加访问控制管理员 |
-| `/invite group` | 允许当前群使用 bot |
-| `/invite all group` | 允许 bot 所在的所有群使用 |
-| `/remove user @某人`, `/remove admin @某人`, `/remove group` | 移除访问控制条目 |
-| `/stop` | 停止当前 run，也可点卡片停止按钮 |
-| `/timeout [N\|off\|default]` | 设置或清除当前会话的 idle watchdog |
-| `/ps` | 列出本机 bridge 进程 |
-| `/exit <id\|#>` | 停止指定 bridge 进程 |
-| `/reconnect` | 强制 WebSocket 重连 |
-| `/doctor [描述]` | 执行低敏诊断 |
-| `/help` | 帮助卡片 |
+| `/new`, `/reset` | 清空当前聊天的会话。 |
+| `/cd <绝对路径>` | 切换当前聊天的工作目录。路径必须存在且为绝对路径，会被 canonicalize。 |
+| `/pwd` | 显示当前生效的工作目录。 |
+| `/status` | 显示 profile、agent、app id、tenant、cwd、回复模式和会话是否可恢复。 |
+| `/config` | 显示当前回复偏好。 |
+| `/config set messageReply <card\|markdown\|text>` | 设置回复模式（仅管理员）。 |
+| `/config set showToolCalls <true\|false>` | 显示或隐藏工具摘要（仅管理员）。 |
+| `/meeting` | 显示会议智能体状态。需要 `meeting.enabled`。 |
+| `/meeting join <9 位会议号>` | 按 9 位会议号入会。 |
+| `/meeting leave [会议号]` | 离开指定会议。 |
+| `/meeting notes [会议号]` | 为指定会议生成纪要。 |
+| `/meeting ask <问题>` | 带上会议字幕上下文提问。 |
+| `/meeting transcript [会议号]` | 查看 agent 实际拿到的字幕上下文。 |
+| `/meeting stop [会议号]` | 中断该会议当前的 agent 任务。 |
+| `/stop` | 中断当前任务，效果等同于卡片上的停止按钮。 |
+| `/help` | 显示可用命令列表。 |
 
-私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。当群里只有你一个真人成员（bot 不计）时会自动免 @，`/new chat` 创建的专属群就是这种情况；加入第二个人后会自动恢复为需要 @（应用订阅成员变动事件时立即生效，否则最迟约 1 分钟）。支持的云文档评论里 @bot 就会触发回复。
+说明：
 
-## 回复展示与 COT
+- 私聊不需要 `@`；群聊默认需要。可以把 `access.requireMentionInGroup` 设为 `false` 放宽。
+- `/config set` 和 `/meeting` 是管理员命令。发送者在 `access.admins` 中可以通过；`admins` 为空时，`access.allowedUsers` 作为管理员名单；两个名单都为空时一律拒绝。
+- `/config` 的读取对所有已经通过消息策略的发送者开放。
+- 命令会绕过防抖队列，并丢弃该聊天中已经排队的消息。
+- `/meeting` 还要求 profile 的 `meeting.enabled` 为 `true`，并且应用具备 VC bot 相关 scope。
+- 命令回复都是文本消息，不是交互卡片。
 
-`/config` 可以调整四类展示选项：
+## 回复模式
 
-- **消息回复方式**：`消息卡片` 流式更新最终回复；`纯文本` 在 run 完成后一次性发送。
-- **工具调用显示**：控制最终回复卡片 / markdown 中是否展示工具块。
-- **COT 过程消息**：`关闭` 只发送最终回复；`简略` 先用 COT 消息展示 agent 的过程文本和工具摘要；`详细` 还会展示工具参数和截断后的输出。
-- **思考内容显示**：控制是否展示 agent 的 reasoning，详见下一节。
+`/config set messageReply` 控制最终答案的发送方式：
 
-开启 COT 后，bridge 会把过程消息和最终答案拆成两条消息。过程消息用于追踪 agent 做了什么；最终答案仍由 agent 原始文本生成，bridge 不做启发式过滤。若 agent 把最终答案也作为普通流式文本输出，COT 过程消息中可能会出现对应片段。
+- **`card`**：创建一张 CardKit 流式卡片，agent 运行期间持续更新。卡片展示答案和精简工具摘要，运行中还有停止按钮。
+- **`markdown`**：默认值。当前 Rust 实现也走卡片渲染；卡片无法继续更新时回退为普通消息。
+- **`text`**：不创建卡片，run 结束后发送一条纯文本消息。
 
-### 思考内容显示
+`showToolCalls` 控制最终卡片或文本回复里是否展示工具摘要，不影响 agent 实际执行的操作。
 
-`/config` 的「思考内容显示」控制是否在手机 / 桌面飞书里展示 agent 的 reasoning：
+飞书会在流式卡片创建约 10 分钟后强制结束卡片并丢弃后续更新。larkline 会更新到约 8.5 分钟，然后停止更新，并在任务结束后把最终答案作为一条新消息发送。这是服务端限制，桌面端和手机端都一样。
 
-- **自动（默认）**：保持旧行为——消息卡片显示可折叠的思考面板；Markdown / 纯文本回复不显示。
-- **关闭**：普通回复里不显示思考内容；显式开启 COT 时仍按 COT 配置处理。
-- **内联显示**：在正常回复里输出思考过程。卡片模式用折叠面板，Markdown / 纯文本模式用引用块。
-- **独立气泡**：COT 关闭时，单独发一条“思考过程”消息；COT 开启时合并进 COT，避免重复气泡。
+## 配置
 
-Claude Code 的 thinking 会按流式增量展示；larkline 会传入 `--include-partial-messages`，请确认本机 Claude Code 版本支持该参数。Codex 只会在 CLI 实际输出 reasoning summary item 时展示；这通常取决于 `~/.codex/config.toml` 里的 `model_reasoning_summary` 以及认证方式。
+### Profile
 
-⚠️ 思考内容可能包含代码、文件路径、命令输出或其他敏感信息，并且群聊里所有成员都能看到。默认的「自动」不会改变现有可见范围；开启「内联」或「独立气泡」前请确认接收范围。
+一个 profile 就是一套 bot 身份：飞书 / Lark 应用凭据、agent 类型、展示偏好、访问名单、会话和工作目录。`config.json` 使用 schema v2，包含 `activeProfile` 和 `profiles` 映射。单条命令可以用 `--profile`（或 `LARKLINE_PROFILE`）指定 profile，否则使用当前 profile。
 
-## lark-cli 身份策略
-
-每个 profile 都使用当前 profile 的 lark-cli 目录：`~/.larkline/profiles/<profile>/lark-cli`。agent 子进程会收到指向这个目录的 `LARKSUITE_CLI_CONFIG_DIR`，所以一个 profile 里的个人授权不会共享给另一个 profile。
-
-默认策略是 `bot-only`：lark-cli 使用应用 / bot 身份，不访问个人资源。当用户为了日历、邮箱、云盘等个人资源完成授权后，当前 profile 可以切到 `user-default`，保留应用身份，同时允许已授权的用户身份。owner/admin 可以在 `/config` 查看或切换这个策略；`/status` 会用 `lark-cli: app` 或 `lark-cli: user-ready` 展示当前摘要。
-
-## 工作目录
-
-每个 profile 都可以有一个默认工作目录：`workspaces.default`。新建 profile 时可以传 `--workspace <path>` 作为初始目录；没传时 bridge 会创建一个 profile 托管的默认工作目录。
-
-下面只是 profile 里的字段片段，不要整段覆盖 `config.json`；请改对应 profile 下的 `workspaces` 字段。
+下面只是 profile 里的字段片段，不要整段覆盖 `config.json`；请改对应 profile。
 
 ```json
 {
+  "agentKind": "claude",
+  "accounts": {
+    "app": {
+      "id": "cli_xxx",
+      "tenant": "feishu",
+      "secret": {
+        "source": "exec",
+        "provider": "bridge",
+        "id": "app-cli_xxx"
+      }
+    }
+  },
+  "preferences": {
+    "messageReply": "card",
+    "showToolCalls": true
+  },
+  "access": {
+    "allowedUsers": ["ou_xxx"],
+    "requireMentionInGroup": true,
+    "admins": ["ou_xxx"]
+  },
   "workspaces": {
-    "default": "/Users/me/.larkline-workspaces/claude/default"
+    "default": "/Users/me/projects/app"
   }
 }
 ```
 
-bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、系统目录或临时目录根这类范围过大的位置。工作目录只是 agent run 的当前目录，不是文件系统 sandbox；agent 实际能访问哪些文件仍取决于本机 agent 进程及其权限模式。
+Rust 二进制会保留自己暂时不读取的配置字段，因此与 TypeScript 版本往返读写不会丢设置。
 
-## 权限模式
+### App Secret 与 keystore
 
-推荐给用户配置的是 `permissions.defaultAccess` 和 `permissions.maxAccess`。新 profile 默认两项都是 `full`，以保持 bridge 的本地工具、授权流程、文件写入等能力完整可用。如需收紧权限，可以改成 `workspace` 或 `read-only`；收紧后本地工具执行、登录 / 授权流程、文件写入等能力可能受限。
+`profile create` 和 `onboard` 会把 App Secret 用 AES-256-GCM 加密后写入 profile 的 `secrets.enc`。配置里只保存引用（`source: "exec"`、`provider: "bridge"`、`id: "app-<app_id>"`），明文不会出现在 `config.json`。
 
-下面只是 profile 里的字段片段，不要整段覆盖 `config.json`；请改对应 profile 下的 `permissions` 字段。
+```bash
+larkline secrets list                       # 只列 id
+larkline secrets set app-cli_xxx            # 提示输入，不回显
+larkline secrets remove app-cli_xxx
+```
+
+加密密钥由机器 hostname、用户名和 profile 私有的 `.keystore.salt` 派生。把 `secrets.enc` 单独拷到另一台机器或另一个用户下通常无法解密；需要重新录入 App Secret。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `LARKLINE_HOME` | 状态根目录，默认 `~/.larkline`；`--home` 优先。 |
+| `LARKLINE_PROFILE` | 当前进程使用的 profile；`--profile` 优先。 |
+| `LARKLINE_CALLBACK_SECRET` | 校验 agent 渲染的卡片按钮时使用的 HMAC key。未配置时这类点击会被拒绝。 |
+
+改名前的回退变量 `LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`LARK_CHANNEL_CALLBACK_SECRET` 在新变量不存在时仍然生效。
+
+卡片回调的 key 也可以来自 profile 的 `callback.secret`（密钥轮换时用 `callback.keys`）。bridge 和负责签名卡片的客户端必须使用同一个值。
+
+### 工作目录
+
+profile 可以通过 `workspaces.default` 指定默认工作目录。没有指定时，bridge 使用 profile 托管的默认工作目录 `<state-root>-workspaces/<profile>/default`（默认 home 下即 `~/.larkline-workspaces/<profile>/default`），并在需要时创建。
+
+工作目录只是 agent run 的当前目录，不是文件系统 sandbox；agent 实际能访问哪些文件仍取决于它自己的权限。
+
+### 访问控制
+
+Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
+
+- `access.allowedUsers` 限制谁能在私聊、群聊和评论线程中触发 bot。名单为空时，不启用用户白名单。
+- 群消息默认要求 `@` mention；`access.requireMentionInGroup` 可以按 profile 关闭这个要求。
+- `access.admins` 控制 `/config set` 和 `/meeting`；`admins` 为空时，`access.allowedUsers` 作为管理员集合。
+- `access.allowedChats` 暂不作用于普通消息，只在校验卡片按钮点击时使用。
+
+运行时应用 owner 识别、`/invite`、`/remove` 以及 TypeScript 版本的 owner 绕过规则尚未移植。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
+
+### 会议
+
+会议智能体是可选能力。在 profile 中加入会议配置并重启：
 
 ```json
 {
-  "permissions": {
-    "defaultAccess": "full",
-    "maxAccess": "full"
+  "meeting": {
+    "enabled": true
   }
 }
 ```
 
-模式映射：
+应用需要具备 VC bot 相关 scope，租户需要支持 VC bot 能力。启用后可以用 `/meeting join <9 位会议号>` 入会；会中聊天带配置的 trigger 前缀即可提问，`/meeting notes` 可以总结字幕。具体限制见 [Rust 移植说明](./docs/RUST-PORT.md)。
 
-| Bridge access | Claude permission mode | Codex mode |
-|---|---|---|
-| `full` | `bypassPermissions` | `danger-full-access` |
-| `workspace` | `acceptEdits` | `workspace-write` |
-| `read-only` | `plan` | `read-only` |
-
-旧版 `sandbox` 字段仍可读取。bridge 保存 profile 后，会把该设置迁移为 canonical `permissions`。
-
-## 数据目录
+## 数据目录与兼容性
 
 | 路径 | 内容 |
 |---|---|
-| `~/.larkline/config.json` | root config，包含 profiles 和 active profile |
-| `~/.larkline/active-profile` | 最近选择的 profile |
-| `~/.larkline/profiles/<profile>/sessions.json` | 会话状态 |
-| `~/.larkline/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
-| `~/.larkline/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
-| `~/.larkline/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
-| `~/.larkline/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
-| `~/.larkline/profiles/<profile>/media/` | 附件缓存 |
-| `~/.larkline/profiles/<profile>/logs/` | 结构化运行日志 |
-| `~/.larkline/registry/processes.json` | 本机进程注册表 |
-| `~/.larkline/registry/locks/` | profile lock 和 app lock |
+| `~/.larkline/config.json` | root config：`activeProfile` 和 `profiles` |
+| `~/.larkline/profiles/<profile>/sessions.json` | 每个聊天的可恢复会话 |
+| `~/.larkline/profiles/<profile>/workspaces.json` | 按聊天保存的工作目录覆盖 |
+| `~/.larkline/profiles/<profile>/secrets.enc` | 加密的 App Secret 和其他 secret |
+| `~/.larkline/profiles/<profile>/.keystore.salt` | 每个 profile 的 keystore salt |
+| `~/.larkline/profiles/<profile>/logs/daemon/` | daemon 的 stdout / stderr 日志 |
+| `~/.larkline/registry/processes.json` | `ps` / `kill` 读取的进程注册表 |
+| `~/.larkline/secrets-getter` | 供 lark-cli 使用的 exec-provider wrapper |
 
-设置 `LARKLINE_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARKLINE_LOG_DAYS` 可以调整日志保留天数。
+### 同一份配置，同一个 keystore
 
-## 访问控制
+- 状态布局、配置 schema v2 和加密 keystore 与 TypeScript 版本共用。
+- keystore 使用相同的 AES-256-GCM / PBKDF2-HMAC-SHA256 构造，因此 Rust 二进制可以解密 TypeScript 版本写入的 App Secret，反过来也一样。
+- 使用默认 home 首次启动时，如果 `~/.larkline` 不存在，会自动把 `~/.lark-channel` rename 为 `~/.larkline`；`~/.lark-channel-workspaces` 也会尽量一并迁移。
+- 两个实现可以读取同一份配置。切换前先停掉其中一个；不要同时用两个实现连接同一个应用和 profile。
 
-**聊天访问默认是私有的：开箱即用时，只有"你"能在私聊和群聊里用这个 bot。** 这里的"你" = 创建 / 拥有这个飞书应用的人（也就是扫码把 bot 建起来的那位）。bot 会自动从飞书查出谁是应用 owner，所以**一个人用聊天入口完全不用配置**——你私聊它、在任意群里 @它都正常工作，其他人的聊天消息会被静默忽略（bot 不会回"你没权限"，免得暴露自己的存在）。云文档评论按文档权限生效，见下文。
+### 从 TypeScript 版本迁移
 
-想让别的同事或某些群也能用，就把他们加进下面三类名单：
+1. 用旧 CLI 停止并注销旧服务：`larkline stop`、`larkline unregister`。
+2. 用 `install.sh` 安装 Rust 二进制，并确认 `command -v larkline` 指向它。
+3. 运行 `larkline doctor`。它会找到原有 profile、app id、keystore 和会话。
+4. 用 `larkline start` 启动服务。
 
-| 名单 | 控制谁 | 加入 | 移除 |
-|------|--------|------|------|
-| **允许私聊的用户** | 谁可以私聊 bot | `/invite user @某人` | `/remove user @某人` |
-| **响应的群** | bot 在哪些群里对**群内所有人**响应 | `/invite group`（当前群）/ `/invite all group`（bot 所在的全部群） | `/remove group`（当前群） |
-| **管理员** | 谁能改设置、并能在任意群用 bot | `/invite admin @某人` | `/remove admin @某人` |
+如果 `~/.lark-channel` 和 `~/.larkline` 同时存在，不会做 rename，已有的 `~/.larkline` 优先。不需要重新扫码，也不需要重新输入 App Secret。
 
-> `/invite`、`/remove` 这些命令只有**你（创建者）和管理员**能发。命令里 @ 的是**对方**（不是 @ bot），bot 会自动把 @ 解析成对应的人，你不用手动去找 ID。
+### 尚未移植
 
-### 两种"畅通无阻"的身份
+Rust bridge 暂未实现以下 TypeScript 功能：
 
-- **你（创建者）**：不受任何名单限制——私聊、任意群、所有命令都能用，而且**永远锁不死自己**：哪怕名单配乱了，回到 bot 私聊发 `/config` 总能进来。在飞书后台把应用 owner 转给别人后，bot 也会自动跟着切换。
-- **管理员**：能私聊、能用 `/config` 等管理命令，而且**不受"响应的群"名单限制**——无论群在不在名单里，bot 都会回他们。适合给一起维护 bot 的同事。
+- 运行时应用 owner 识别、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。
+- `/ws` 命名工作空间、`/resume`、`/timeout`、飞书内 `/ps`、`/exit`、`/reconnect`、`/doctor`。
+- 完整的 `/config` 卡片表单，以及其余展示设置（COT 过程消息、思考内容气泡 / 面板、访问控制和 lark-cli 策略）。
+- Agent 权限模式（`permissions.defaultAccess` / `maxAccess`）；当前 run 使用完整权限。
+- 入站图片和文件下载。agent 目前只收到文本 prompt。
+- 按话题 / thread 拆分的会话；会话目前按 chat id 存储。
+- Keepalive watchdog 和进程注册表写入。
 
-### 几种常见配置
-
-- **只给自己用** → 什么都不用做，默认就是。
-- **让某个同事能私聊 bot** → `/invite user @他`
-- **让某个工作群里所有人都能用** → 在那个群里发 `/invite group`
-- **第一次配，想把 bot 已经在的群一次性全开放** → 发 `/invite all group` 一键拉取 bot 所在的全部群加入名单，之后再用 `/remove group` 删掉不想要的
-- **再拉个人一起当管理员** → `/invite admin @他`
-
-### 还需要知道的
-
-- 改完**下一条消息**就生效，不用重启。
-- **群里默认要先 @bot 才会回**（私聊不用 @；群里只剩你一个真人时也会自动免 @）。这是另一个独立开关（`/config` →"群里需要 @ bot"），和上面的名单是两回事。
-- 陌生人发消息一律静默丢弃，不会有任何回复。唯一的例外：有人在一个还没开放的群里 @bot，bot 会回一句友好提示，告诉他可以让管理员发 `/invite group` 开放这个群。
-- 云文档评论按文档权限生效：能在支持的文档里评论并 @bot 的人可以触发回复。
-
-### 高级：直接改配置文件
-
-不想在飞书里点的话，`/invite`、`/config` 背后写的是 `~/.larkline/config.json` 中对应 profile 的 `access` 字段。空白名单表示这个名单没人，不表示所有人都能用。下面只是 profile 里的字段片段，不要整段覆盖 `config.json`：
-
-```json
-{
-  "schemaVersion": 2,
-  "profiles": {
-    "claude": {
-      "agentKind": "claude",
-      "access": {
-        "allowedUsers": ["ou_xxxxxxxxxxxxx"],
-        "allowedChats": ["oc_xxxxxxxxxxxxx"],
-        "admins": ["ou_xxxxxxxxxxxxx"],
-        "requireMentionInGroup": true
-      }
-    }
-  }
-}
-```
-
-`allowedUsers` / `admins` 填用户 `open_id`，`allowedChats` 填群 `chat_id`。手动找 ID 最简单的办法：让对方给 bot 发条消息（群里就 @ 它一下），然后看当前 profile 的日志：
-
-```bash
-grep '"event":"enter"' ~/.larkline/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl | tail -5
-```
-
-每行都带 `chatId`（群 / 私聊 ID）和 `senderId`（用户 `open_id`）。手改完后**重启 bridge**，或在允许的 admin 上下文里发 `/reconnect` 让它生效。日常调整还是 `/invite` / `/config` 更省事，直接改文件主要用于部署脚本预填。
-
-## 云文档评论
-
-云文档评论不再需要单独绑定工作目录或维护文档白名单。支持的文档评论里 @bot 后，bridge 会在同一个评论线程里回复。评论运行复用文档级 session key；没有记录过文档 cwd 时回退到用户 home 目录。
+每项缺口的原因和当前状态见 [Rust 移植说明](./docs/RUST-PORT.md)。
 
 ## 常见问题
 
-**bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
+**bot 没反应，或者本机 agent 一直不回复。** 先运行 `larkline doctor`。然后确认 agent CLI 已安装并登录，再发 `/status` 查看当前 cwd 和会话是否可恢复。`/new` 通常可以解决过期会话。
 
-**agent 子进程假死（卡片停在最后一帧不动）**：支持 idle 探活。agent 一段时间没输出就会被 SIGTERM kill，卡片末尾会标出自动终止原因。默认关闭。开启方式：`/config` 设全局值（分钟），或 `/timeout 10` 只对当前会话生效；`/timeout off` 关掉当前会话的探活；`/timeout default` 清掉会话覆盖，回退到全局设置。
+**卡片停在某一帧，之后收不到答案。** 如果 run 已经超过约 8.5 分钟，这是卡片生命周期保护：bridge 停止更新卡片，并在任务结束后单独发送最终答案。等 run 结束即可，不要期待卡片继续更新。
 
-**长任务停在“正在调用工具”，之后收不到任何消息**：飞书会在流式卡片创建约 10 分钟后强制结束它，并静默丢弃之后的卡片更新。这是飞书服务端的限制，桌面端和手机端都可能出现。larkline 会在约 8.5 分钟时暂停过程卡片并显示说明，等任务结束后把最终答案作为一条新消息发送。可以用 `LARKLINE_STREAM_CARD_SAFE_MS`（毫秒，上限小于 10 分钟）调整暂停阈值。触发保护时，日志中会出现 `stream card-lifetime-expiring` 和 `stream card-lifetime-final-fallback`。
+**可以让一个 bot 用 Claude Code，另一个用 Codex 吗？** 可以。用不同的 `--agent` 创建两个 profile，然后各跑一个服务。agent 类型在创建 profile 时确定；需要换类型时请新建 profile。
 
-**图片发过去 agent 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。
+**怎么更换 App Secret？** 运行 `larkline secrets set app-<app_id>`，然后重启 bridge 或服务。配置里的引用不需要改。
 
-## 测试与 CI
+**Windows 提示 SmartScreen 警告。** Windows 二进制目前没有代码签名。macOS 版本已签名并 notarize；Linux 版本未签名，但提供校验和。
 
-本地检查：
+**`larkline ps` 是空的。** Rust bridge 目前不会注册自己的进程，所以纯 Rust 环境下列表为空。这是已知缺口，不是错误。
 
-```bash
-pnpm test
-pnpm typecheck
-pnpm build
-```
+**怎么卸载？** 先 `larkline stop`，再 `larkline unregister`，删除 `larkline` 二进制；如果也要删除本地状态，再删除 `~/.larkline`。
 
-`pnpm test` 包含 unit、integration 和 process-level adapter 测试。CI 在 macOS、Ubuntu、Windows 上执行 `pnpm install --frozen-lockfile`、`pnpm test`、`pnpm typecheck` 和 `pnpm build`。
+## 开发与发布
 
-### 发布
-
-发布由 tag 触发。推送 `v*` tag 后会运行 `.github/workflows/release.yml`：校验 tag 与 `package.json` 版本一致，执行测试 / typecheck / build，通过 [npm trusted publishing](https://docs.npmjs.com/trusted-publishers) 带 provenance 发布到 npm，并创建 GitHub Release。不需要 `NPM_TOKEN` secret。
-
-首次配置：
-
-1. 如果 npm 上还没有 `larkline`，先在本地手动发布第一个版本：`npm login && npm publish --access public`。
-2. 在 npmjs.com → `larkline` → Settings → Trusted publishing 添加 GitHub Actions：owner `luozhouyang`、repository `larkline`、workflow 文件名 `release.yml`。
-3. 之后用 tag 发布：
+在仓库根目录构建和测试：
 
 ```bash
-pnpm version patch   # 或 minor / major
-git push --follow-tags
+cargo build --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+./target/release/larkline doctor
 ```
 
-tag 必须和 `package.json` 版本一致（`v0.7.1` ↔ `0.7.1`），否则流水线会在发布前停止。
-
-## 可选：遥测（Telemetry）
-
-默认情况下 bridge **不上报任何数据**：没有指标、没有日志离开你的机器，也不引入任何遥测依赖。下面这个钩子在你主动开启前完全是空操作。
-
-想接自己的监控时，用环境变量指向一个 default export（或导出 `createAdapter`）`AdapterFactory` 的模块：
-
-```bash
-LARKLINE_TELEMETRY_MODULE=your-telemetry-package larkline start
-```
-
-该模块会收到每一条 `log.*` 事件，以及错误 / 指标钩子，转发到任何你想要的地方。接口从包根导出：
-
-```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'larkline';
-
-const createAdapter: AdapterFactory = (meta) => ({
-  emit(event) {/* 上报事件 */},
-  recordError(err, ctx) {/* 上报异常 */},
-  recordMetric(name, value, tags) {/* 上报指标 */},
-  flush(timeoutMs) {/* 冲刷缓冲事件 */},
-});
-export default createAdapter;
-```
-
-模块不存在、工厂函数不合法、或者 adapter 抛错，都会降级为空操作——遥测永远不会阻止 bridge 启动，也不会打断日志。
+需要 Rust 1.85 或更新版本。CI 在 macOS、Ubuntu 和 Windows 上跑测试；格式检查和 clippy 只在 Linux 上跑。发布由 tag 触发：推送 `v*` tag 后会运行发布流水线，执行格式检查和测试，构建 Linux x86_64/aarch64、macOS Universal（签名并 notarize）和 Windows x86_64，然后上传产物、`SHA256SUMS` 并创建 GitHub Release。
 
 ## 许可
 

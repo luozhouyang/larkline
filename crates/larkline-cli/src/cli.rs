@@ -198,6 +198,6 @@ pub struct UpgradeArgs {
     pub check: bool,
 
     /// Pin a specific version instead of the latest release.
-    #[arg(long)]
+    #[arg(long = "target-version")]
     pub version: Option<String>,
 }

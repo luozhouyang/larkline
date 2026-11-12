@@ -76,6 +76,13 @@ pub fn keystore_for(root_dir: &Path, profile: &str) -> anyhow::Result<Keystore> 
     ))
 }
 
+/// Resolve an agent binary, honouring `CLAUDE_BIN` / `CODEX_BIN`.
+pub fn resolve_agent_binary(kind: larkline_core::AgentKind) -> Result<std::path::PathBuf, larkline_agent::detect::DetectError> {
+    let name = kind.binary_name();
+    let configured = larkline_core::env::agent_bin_override(name).unwrap_or_else(|| name.to_string());
+    larkline_agent::resolve_executable(&configured).map(|resolved| resolved.path)
+}
+
 /// Prompt for a value without echoing it (used for App Secrets).
 pub fn prompt_secret(prompt: impl AsRef<str>) -> anyhow::Result<String> {
     let value = rpassword::prompt_password(prompt.as_ref())?;

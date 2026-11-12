@@ -12,7 +12,6 @@ use lark_channel::event::{
     ChannelEvent, EventLoop, EventLoopOptions, OpenApiWebSocketEventConnector,
 };
 use lark_channel::lark_openapi::{TokioTungsteniteWebSocketTransport, WebSocketEventAck};
-use larkline_agent::resolve_executable;
 use larkline_bridge::Bridge;
 use larkline_lark::Channel;
 
@@ -31,13 +30,15 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     }
 
     let secret = ctx.app_secret()?;
-    let agent_binary = resolve_executable(profile.agent_kind.binary_name()).with_context(|| {
-        format!(
-            "{} is not installed; install it or set {}_BIN",
-            profile.agent_kind.display_name(),
-            profile.agent_kind.binary_name().to_ascii_uppercase()
-        )
-    })?;
+    let agent_binary = larkline_agent::ResolvedBinary {
+        path: crate::context::resolve_agent_binary(profile.agent_kind).with_context(|| {
+            format!(
+                "{} is not installed; install it or set {}_BIN",
+                profile.agent_kind.display_name(),
+                profile.agent_kind.binary_name().to_ascii_uppercase()
+            )
+        })?,
+    };
 
     let cwd = args
         .cwd
