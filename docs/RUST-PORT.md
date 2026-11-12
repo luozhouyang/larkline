@@ -54,6 +54,9 @@ Ported and tested:
 - session store (resume only from the same cwd), `/stop`, `/new`, `/help`
 - agent process runner: stdin prompt, stderr drain, kill-on-drop, 30 min cap
 - `/stop` aborts the task, which drops the child process
+- OS daemon lifecycle (`start`/`stop`/`restart`/`status`/`unregister`) with
+  launchd, systemd --user and schtasks renderers, plus `ps`/`kill` over the
+  shared process registry
 - signed card callbacks: running cards carry a HMAC-signed ⏹ button; clicks
   are verified per chat and abort the run (agent-rendered callbacks are not
   forwarded yet)
@@ -65,7 +68,6 @@ Still to port (rough order):
 2. workspace store, pending queue, max-concurrency handling, keepalive
 3. comments, meetings, reactions (raw REST endpoints)
 4. QR app registration (device flow: `begin` + poll)
-5. daemon install (launchd/systemd/schtasks) and `ps`/`kill`
 6. port the remaining TypeScript test files as behaviour specs
 
 ## Build & test

@@ -9,6 +9,8 @@
 mod cli;
 mod commands;
 mod context;
+mod daemon;
+mod ps;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -36,6 +38,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Profile(args) => commands::profile::execute(&cli, args),
         Commands::Secrets(args) => commands::secrets::execute(&cli, args),
         Commands::Upgrade(args) => commands::upgrade::execute(args).await,
+        Commands::Start => commands::service::start(&cli),
+        Commands::Stop => commands::service::stop(&cli),
+        Commands::Restart => commands::service::restart(&cli),
+        Commands::Status => commands::service::status(&cli),
+        Commands::Unregister => commands::service::unregister(&cli),
+        Commands::Ps => commands::ps::list(&cli),
+        Commands::Kill { target } => commands::ps::kill(&cli, target),
     }
 }
 

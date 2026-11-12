@@ -44,6 +44,22 @@ pub enum Commands {
     Secrets(SecretsArgs),
     /// Upgrade the larkline binary (explicit; never automatic).
     Upgrade(UpgradeArgs),
+    /// Install (if needed) and start the bridge as an OS-managed daemon.
+    Start,
+    /// Stop the OS-managed daemon and disable autostart.
+    Stop,
+    /// Restart the OS-managed daemon.
+    Restart,
+    /// Show OS service status (pid, last exit, log paths).
+    Status,
+    /// Remove the OS service registration.
+    Unregister,
+    /// List running bridge processes on this machine.
+    Ps,
+    /// Kill a running bridge process by short id or list index.
+    Kill {
+        target: String,
+    },
 }
 
 #[derive(Debug, Args)]

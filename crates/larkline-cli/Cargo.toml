@@ -26,6 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+libc.workspace = true
 rpassword = "7"
 
 [dev-dependencies]
