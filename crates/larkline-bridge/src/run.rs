@@ -15,6 +15,29 @@
 //! spawning a competing agent; when the run ends the window re-arms and the
 //! next batch starts. `/stop` aborts the live run and drops the queued batch.
 //!
+//! ## `/stop` targeting
+//!
+//! Every live run is registered in [`Bridge::active`] by scope, so `/stop`
+//! works for all three run kinds:
+//!
+//! * **Plain `/stop`** aborts exactly the scope of the message that sent it:
+//!   the chat for p2p / regular groups, or `chatId:threadId` for a topic, and
+//!   drops that scope's queued batch. This matches the TypeScript bridge.
+//! * **`/stop <scope>`** (admin-only, like TypeScript's `handleStop`) aborts
+//!   the run registered under that exact scope. This is how a user aborts a
+//!   run that has no chat scope of its own: a cloud-doc comment run under
+//!   `comment:<16-hex digest>` or a meeting run under `meeting:<meeting_id>`.
+//!   `/status` lists every live scope so the id is discoverable.
+//! * **The card stop button** signs the run scope into its callback token and
+//!   calls the same `stop_scope`, so it aborts the same runs (IM runs have the
+//!   only cards; comment/meeting runs have no stop button of their own).
+//!
+//! The abort path is shared: the task handle is aborted, the run guard removes
+//! the `active` entry, the future drops its global run permit, the agent child
+//! is killed by `kill_on_drop`, and the working reaction is removed by its
+//! guard. Comment and meeting runs acquire their permit inside the run future,
+//! so cancellation releases it just like normal completion.
+//!
 //! A second, global limit caps how many agent runs may be live at once across
 //! every scope ([`crate::run_limit`], the port of `src/bot/process-pool.ts`).
 //! The cap comes from the live profile's `preferences.maxConcurrentRuns` and is
@@ -61,7 +84,7 @@ use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
 use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
@@ -70,6 +93,7 @@ use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
 use crate::render::RunView;
+use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
 use crate::text_render::{TextFormat, TextRenderOptions, render_text};
 
@@ -116,6 +140,9 @@ const CONFIG_USAGE: &str = "用法：\n\
 
 /// Reply for a `/config set` from a sender outside the admin gate.
 const CONFIG_DENIED_REPLY: &str = "❌ 只有管理员可以修改配置。";
+
+/// Reply for `/stop <scope>` from a sender outside the admin gate.
+const STOP_SCOPE_DENIED_REPLY: &str = "❌ 指定 scope 停止任务仅管理员可用。";
 
 /// Session / pending-queue / active-run scope for an inbound message.
 ///
@@ -199,10 +226,17 @@ struct MeetingRuntime {
     handle: MeetingHandle,
 }
 
-/// One live agent run owned by a chat.
+/// One live agent run, keyed by its run scope.
+///
+/// IM batch runs (`start_due_batch`), comment runs (`comment:<hash>`) and
+/// meeting runs (`meeting:<id>`) all live in [`Bridge::active`], so `/stop`
+/// and the card stop button can abort any of them by scope. The handle is an
+/// [`AbortHandle`] rather than a [`JoinHandle`] so a caller that already owns
+/// the task handle (the meeting manager) can hand over abort rights without
+/// giving up its own handle.
 struct ActiveRun {
     id: u64,
-    handle: JoinHandle<()>,
+    abort: AbortHandle,
 }
 
 /// A batch that owns a global run slot and may be spawned.
@@ -247,6 +281,23 @@ struct RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         drop(self.permit.take());
+        self.bridge.finish_run(&self.scope, self.id);
+    }
+}
+
+/// Removes a non-IM (comment / meeting) run from [`Bridge::active`].
+///
+/// Mirrors [`RunGuard`] for runs that acquire their global slot inside the
+/// future: the future's drop releases the permit, then this guard removes the
+/// active entry. Dropped on normal completion and on task abort (`/stop`).
+struct TrackedRunGuard {
+    bridge: Arc<Bridge>,
+    scope: String,
+    id: u64,
+}
+
+impl Drop for TrackedRunGuard {
+    fn drop(&mut self) {
         self.bridge.finish_run(&self.scope, self.id);
     }
 }
@@ -429,8 +480,17 @@ impl Bridge {
         let Some(manager) = self.meeting_manager() else {
             return meeting::MEETING_NOT_READY_REPLY.to_string();
         };
+        let scope = scope_key(message);
         manager
-            .handle_command(args, sender_id, &message.chat_id)
+            .handle_command_with_reply(
+                args,
+                sender_id,
+                &message.chat_id,
+                meeting::ImReplyTarget {
+                    scope: Some(&scope),
+                    parent_message_id: Some(&message.message_id),
+                },
+            )
             .await
     }
 
@@ -576,9 +636,18 @@ impl Bridge {
         if is_meeting_command(&text) {
             self.discard_pending(&scope);
             let bridge = Arc::clone(self);
+            let meeting_scope = scope.clone();
             tokio::spawn(async move {
                 if let Some(reply) = bridge.handle_command(&message, &text).await {
-                    if let Err(err) = bridge.channel.send_text(&message.chat_id, reply).await {
+                    if let Err(err) = reply::send_text(
+                        &bridge.channel,
+                        &meeting_scope,
+                        &message.chat_id,
+                        Some(&message.message_id),
+                        reply,
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %err, "cannot send /meeting reply");
                     }
                 }
@@ -590,7 +659,19 @@ impl Bridge {
             // Commands bypass the debounce queue and drop anything that was
             // waiting for this scope (TS: `pending.cancel(scope)`).
             self.discard_pending(&scope);
-            let _ = self.channel.send_text(&message.chat_id, reply).await;
+            // Topic scopes reply to the triggering message with
+            // `reply_in_thread`; everything else stays a top-level send.
+            if let Err(err) = reply::send_text(
+                &self.channel,
+                &scope,
+                &message.chat_id,
+                Some(&message.message_id),
+                reply,
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "cannot send command reply");
+            }
             return;
         }
 
@@ -771,12 +852,66 @@ impl Bridge {
         });
 
         let mut active = lock(&self.active);
-        active.retain(|_, run| !run.handle.is_finished());
-        active.insert(scope, ActiveRun { id, handle });
+        active.retain(|_, run| !run.abort.is_finished());
+        active.insert(
+            scope,
+            ActiveRun {
+                id,
+                abort: handle.abort_handle(),
+            },
+        );
         drop(active);
         drop(pending);
         let _ = start.send(());
         BatchStart::Started
+    }
+
+    /// Spawn and register a run that has no pending queue (comment / meeting).
+    ///
+    /// The task is gated on a `ready` signal until its entry is visible in
+    /// [`Bridge::active`], so `/stop` either sees the run and aborts it or sees
+    /// nothing at all. The returned guard inside the task removes the entry on
+    /// normal completion *and* on abort; the run future owns its global
+    /// [`RunPermit`](crate::run_limit::RunPermit), so aborting also releases
+    /// the slot and drops the agent child (`kill_on_drop`).
+    ///
+    /// Returns the task handle so the meeting manager can keep its own
+    /// per-meeting abort map in sync (it aborts the same task).
+    pub(crate) fn spawn_tracked<F>(self: &Arc<Self>, scope: &str, future: F) -> JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let bridge = Arc::clone(self);
+        let task_scope = scope.to_string();
+        let handle = tokio::spawn(async move {
+            let _ = ready.await;
+            let _guard = TrackedRunGuard {
+                bridge: Arc::clone(&bridge),
+                scope: task_scope,
+                id,
+            };
+            future.await;
+        });
+
+        let mut active = lock(&self.active);
+        active.retain(|_, run| !run.abort.is_finished());
+        if let Some(previous) = active.insert(
+            scope.to_string(),
+            ActiveRun {
+                id,
+                abort: handle.abort_handle(),
+            },
+        ) {
+            // Callers serialize per scope (the comment guard / meeting map),
+            // but never leave an old task running unregistered if they race.
+            tracing::warn!(scope, "replacing an already active run for this scope");
+            previous.abort.abort();
+        }
+        drop(active);
+        let _ = start.send(());
+        handle
     }
 
     /// Run finished (or was aborted): release its scope for the next batch.
@@ -786,7 +921,7 @@ impl Bridge {
     /// still wakes the driver, because it may just have released the global
     /// run slot (the permit is dropped before this call) even when a newer run
     /// already owns the scope.
-    fn finish_run(&self, scope: &str, id: u64) {
+    pub(crate) fn finish_run(&self, scope: &str, id: u64) {
         let mut pending = lock(&self.pending);
         let owns = {
             let mut active = lock(&self.active);
@@ -811,7 +946,7 @@ impl Bridge {
         let mut active = lock(&self.active);
         match active.remove(scope) {
             Some(run) => {
-                run.handle.abort();
+                run.abort.abort();
                 true
             }
             None => false,
@@ -820,7 +955,12 @@ impl Bridge {
 
     /// `/stop` and the card stop button: abort the run, drop its queued
     /// follow-up batch, and clear the block so the chat can be used again.
-    fn stop_scope(&self, scope: &str) -> (bool, usize) {
+    ///
+    /// Works for every run kind registered in [`Bridge::active`]: an IM batch
+    /// under its chat/topic scope, a comment run under `comment:<hash>`, or a
+    /// meeting run under `meeting:<id>`. The pending-queue cleanup is a no-op
+    /// for scopes that have no queue.
+    pub(crate) fn stop_scope(&self, scope: &str) -> (bool, usize) {
         // Holding the pending lock makes stop atomic with respect to a driver
         // that is registering a new batch (same lock order as `start_due_batch`).
         let mut pending = lock(&self.pending);
@@ -830,6 +970,31 @@ impl Bridge {
         drop(pending);
         self.pending_wakeup.notify_one();
         (stopped, dropped)
+    }
+
+    /// Whether a run is currently registered under `scope`.
+    ///
+    /// Used by `/status` (through the collected scope list) and by tests that
+    /// assert an abort removed the entry. Finished tasks are treated as gone
+    /// even if their guard has not run yet.
+    pub(crate) fn is_scope_active(&self, scope: &str) -> bool {
+        lock(&self.active)
+            .get(scope)
+            .is_some_and(|run| !run.abort.is_finished())
+    }
+
+    /// Fallback abort for `/stop meeting:<id>` when the mirror entry is gone.
+    ///
+    /// The meeting manager's own map is the authority for its runs; normally
+    /// [`Bridge::stop_scope`] already aborted the mirrored task, but calling
+    /// the manager keeps `/meeting stop` and `/stop meeting:<id>` consistent
+    /// even if the two maps ever diverge.
+    fn interrupt_meeting_scope(&self, scope: &str) -> bool {
+        let Some(meeting_id) = scope.strip_prefix("meeting:") else {
+            return false;
+        };
+        self.meeting_manager()
+            .is_some_and(|manager| manager.interrupt(meeting_id))
     }
 
     /// Drop the scope's queued batch (any handled command does this).
@@ -855,11 +1020,33 @@ impl Bridge {
         let scope = scope_key(message);
         match command {
             "/stop" => {
-                let (stopped, _dropped) = self.stop_scope(&scope);
+                let target = args.trim();
+                if target.is_empty() {
+                    let (stopped, _dropped) = self.stop_scope(&scope);
+                    return Some(if stopped {
+                        "已停止当前任务。".to_string()
+                    } else {
+                        "当前没有正在运行的任务。".to_string()
+                    });
+                }
+                // Explicit scopes are admin-only, matching the TypeScript
+                // `handleStop` gate. They let a user abort a run that has no
+                // chat scope: a cloud-doc comment run (`comment:<hash>`) or a
+                // meeting run (`meeting:<id>`).
+                if !self.can_run_admin_command(message_sender_id(message)).await {
+                    tracing::info!(command = "/stop", target, "admin-deny");
+                    return Some(STOP_SCOPE_DENIED_REPLY.to_string());
+                }
+                let (stopped, _dropped) = self.stop_scope(target);
+                // The meeting manager keeps its own handle for `/meeting stop`
+                // and the in-meeting "stop" trigger. It is mirrored in
+                // `active`, but fall back to it if the mirror is ever absent
+                // (e.g. a manager started before this bridge).
+                let stopped = stopped || self.interrupt_meeting_scope(target);
                 Some(if stopped {
-                    "已停止当前任务。".to_string()
+                    format!("已请求停止 `{target}`。")
                 } else {
-                    "当前没有正在运行的任务。".to_string()
+                    format!("未找到正在运行的任务：`{target}`。")
                 })
             }
             "/new" | "/reset" => match self.sessions.lock().await.clear(&scope) {
@@ -879,6 +1066,7 @@ impl Bridge {
                  /status 显示当前状态\n\
                  /config 查看/修改回复偏好（修改需管理员）\n\
                  /stop 中断当前任务\n\
+                 /stop <scope> 中断指定运行（如 comment:… / meeting:…，需管理员）\n\
                  /meeting 会议智能体（入会/离会/纪要，需管理员）\n\
                  /help 显示帮助"
                     .to_string(),
@@ -929,6 +1117,24 @@ impl Bridge {
             Some(id) => format!("可恢复（{}…）", id.chars().take(8).collect::<String>()),
             None => "不可恢复（当前 cwd 下没有会话）".to_string(),
         };
+        // Expose every live run scope, including the comment / meeting scopes
+        // that `/stop <scope>` can target. Without this, those ids would be
+        // impossible to discover from IM.
+        let mut active_scopes: Vec<String> = {
+            let active = lock(&self.active);
+            active
+                .iter()
+                .filter(|(_, run)| !run.abort.is_finished())
+                .map(|(scope, _)| scope.clone())
+                .collect()
+        };
+        active_scopes.sort();
+        let active_run = self.is_scope_active(scope);
+        let active_scopes = if active_scopes.is_empty() {
+            "(无)".to_string()
+        } else {
+            active_scopes.join(", ")
+        };
 
         format!(
             "📊 当前状态\n\
@@ -938,11 +1144,14 @@ impl Bridge {
              tenant: {tenant}\n\
              cwd: {}\n\
              reply mode: {}\n\
-             session: {session}",
+             session: {session}\n\
+             active run: {}\n\
+             active scopes: {active_scopes}",
             self.paths.profile,
             profile.agent_kind.display_name(),
             cwd.display(),
             reply_mode_label(profile.message_reply()),
+            if active_run { "yes" } else { "no" },
         )
     }
 
@@ -1241,7 +1450,7 @@ impl Bridge {
         // run is live. Failures are logged and never fail the run; the guard
         // removes the reaction from `Drop`, which also covers `/stop`.
         let _working_reaction =
-            WorkingReaction::start(self.channel.rest().clone(), last_message_id);
+            WorkingReaction::start(self.channel.rest().clone(), last_message_id.clone());
         // Snapshot the effective cwd for the whole run: session resume/record
         // and the agent process must agree even if `/cd` lands mid-run. Topic
         // scopes get their own cwd entry in the workspace store.
@@ -1264,8 +1473,15 @@ impl Bridge {
             // whole-card PUT with its own sequence. If either the entity or the
             // reference message cannot be created, the plain message path below
             // is the fallback (and is the only path when streaming is off).
-            match StreamingCard::start(&self.channel, &chat_id, card.clone(), STREAMING_ELEMENT_ID)
-                .await
+            match reply::start_streaming_card(
+                &self.channel,
+                &scope,
+                &chat_id,
+                Some(&last_message_id),
+                card.clone(),
+                STREAMING_ELEMENT_ID,
+            )
+            .await
             {
                 Ok(handle) => {
                     message_id = Some(handle.message_id().0.clone());
@@ -1276,7 +1492,15 @@ impl Bridge {
                         error = %err,
                         "cannot start streaming card; falling back to message card"
                     );
-                    match self.channel.send_card(&chat_id, &card).await {
+                    match reply::send_card(
+                        &self.channel,
+                        &scope,
+                        &chat_id,
+                        Some(&last_message_id),
+                        &card,
+                    )
+                    .await
+                    {
                         Ok(id) => message_id = Some(id.0),
                         Err(err) => {
                             tracing::warn!(error = %err, "cannot send run card; falling back to text");
@@ -1311,6 +1535,7 @@ impl Bridge {
                     &chat_id,
                     &mut streaming,
                     message_id.as_deref(),
+                    Some(&last_message_id),
                     &view,
                     reply_mode,
                     started,
@@ -1369,6 +1594,7 @@ impl Bridge {
             &chat_id,
             &mut streaming,
             message_id.as_deref(),
+            Some(&last_message_id),
             &view,
             reply_mode,
             started,
@@ -1386,6 +1612,7 @@ impl Bridge {
         chat_id: &str,
         streaming: &mut Option<StreamingCard>,
         message_id: Option<&str>,
+        source_message_id: Option<&str>,
         view: &RunView,
         reply_mode: MessageReplyMode,
         started: Instant,
@@ -1436,7 +1663,11 @@ impl Bridge {
                 truncate_chars(answer, 4_000)
             }
         };
-        let _ = self.channel.send_text(chat_id, body).await;
+        if let Err(err) =
+            reply::send_text(&self.channel, scope, chat_id, source_message_id, body).await
+        {
+            tracing::warn!(error = %err, chat = %chat_id, "cannot send final answer");
+        }
     }
 
     /// Push the current view to the run card.
@@ -1567,8 +1798,8 @@ impl Bridge {
 /// be a reference cycle (bridge -> manager -> bridge). The CLI stops the
 /// manager explicitly; the weak handle also keeps the cycle from leaking when
 /// a bridge is dropped first.
-struct BridgeMeetingHost {
-    bridge: std::sync::Weak<Bridge>,
+pub(crate) struct BridgeMeetingHost {
+    pub(crate) bridge: std::sync::Weak<Bridge>,
 }
 
 #[async_trait]
@@ -1597,6 +1828,47 @@ impl MeetingHost for BridgeMeetingHost {
         if let Err(err) = bridge.sessions.lock().await.set(scope, session_key, cwd) {
             tracing::warn!(error = %err, "cannot persist meeting session");
         }
+    }
+
+    fn spawn_tracked_run(
+        &self,
+        scope: &str,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> JoinHandle<()> {
+        match self.bridge.upgrade() {
+            Some(bridge) => bridge.spawn_tracked(scope, future),
+            None => tokio::spawn(future),
+        }
+    }
+
+    async fn send_im_text_reply(
+        &self,
+        to: &str,
+        target: crate::meeting::ImReplyTarget<'_>,
+        text: &str,
+    ) {
+        let Some(bridge) = self.bridge.upgrade() else {
+            return;
+        };
+        // The thread path only applies to chat ids; `ou_*` is a DM and has no
+        // thread to reply into.
+        if let (Some(scope), true) = (target.scope, to.starts_with("oc_")) {
+            match reply::send_text(&bridge.channel, scope, to, target.parent_message_id, text).await
+            {
+                Ok(_) => tracing::info!(
+                    to = %to,
+                    chars = text.chars().count(),
+                    "meeting reply sent over IM"
+                ),
+                Err(err) => tracing::warn!(
+                    to = %to,
+                    error = %err,
+                    "cannot send meeting reply over IM"
+                ),
+            }
+            return;
+        }
+        self.send_im_text(to, text).await;
     }
 
     async fn send_im_text(&self, to: &str, text: &str) {
@@ -1717,7 +1989,7 @@ fn merge_mentions(batch: &[NormalizedMessage]) -> Vec<PromptMention> {
 /// cleanup normally, or the add task itself when it observes that the run is
 /// already over.
 #[derive(Debug, Default, PartialEq, Eq)]
-enum ReactionState {
+pub(crate) enum ReactionState {
     /// No reaction was requested yet.
     #[default]
     Idle,
@@ -1732,7 +2004,7 @@ enum ReactionState {
 }
 
 impl ReactionState {
-    fn begin_add(&mut self) {
+    pub(crate) fn begin_add(&mut self) {
         *self = Self::Adding;
     }
 
@@ -1740,7 +2012,7 @@ impl ReactionState {
     ///
     /// Returns `true` when the run already ended while the request was in
     /// flight, so the caller must delete the reaction itself.
-    fn added(&mut self, reaction_id: &str) -> bool {
+    pub(crate) fn added(&mut self, reaction_id: &str) -> bool {
         match self {
             Self::Adding => {
                 *self = Self::Active(reaction_id.to_string());
@@ -1755,7 +2027,7 @@ impl ReactionState {
         }
     }
 
-    fn add_failed(&mut self) {
+    pub(crate) fn add_failed(&mut self) {
         *self = Self::Done;
     }
 
@@ -1765,7 +2037,7 @@ impl ReactionState {
     /// the add task is responsible for the deletion once it lands.
     ///
     /// [`Abandoned`]: ReactionState::Abandoned
-    fn finish(&mut self) -> Option<String> {
+    pub(crate) fn finish(&mut self) -> Option<String> {
         match std::mem::replace(self, Self::Done) {
             Self::Active(reaction_id) => Some(reaction_id),
             Self::Adding => {
@@ -3253,14 +3525,14 @@ mod tests {
                 scope_a.to_string(),
                 ActiveRun {
                     id: 1,
-                    handle: handle_a,
+                    abort: handle_a.abort_handle(),
                 },
             );
             active.insert(
                 scope_b.to_string(),
                 ActiveRun {
                     id: 2,
-                    handle: handle_b,
+                    abort: handle_b.abort_handle(),
                 },
             );
         }
@@ -3320,14 +3592,14 @@ mod tests {
                 scope_a.to_string(),
                 ActiveRun {
                     id: 1,
-                    handle: tokio::spawn(std::future::pending::<()>()),
+                    abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 },
             );
             active.insert(
                 scope_b.to_string(),
                 ActiveRun {
                     id: 2,
-                    handle: handle_b,
+                    abort: handle_b.abort_handle(),
                 },
             );
         }
@@ -3348,6 +3620,125 @@ mod tests {
             assert!(active.contains_key(scope_b));
         }
         assert!(bridge.stop_scope(scope_b).0);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_aborts_comment_and_meeting_scopes_by_id() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let bridge = test_bridge(root.path(), profile);
+        let comment_scope = "comment:0123456789abcdef";
+        let meeting_scope = "meeting:70001";
+        let other_scope = "oc_2";
+
+        let comment_run = bridge.spawn_tracked(comment_scope, std::future::pending::<()>());
+        let meeting_run = bridge.spawn_tracked(meeting_scope, std::future::pending::<()>());
+        let other_run = bridge.spawn_tracked(other_scope, std::future::pending::<()>());
+        assert!(bridge.is_scope_active(comment_scope));
+        assert!(bridge.is_scope_active(meeting_scope));
+
+        // A non-admin cannot target an arbitrary scope.
+        let denied = bridge
+            .handle_command(
+                &message(
+                    "om_stop",
+                    "ou_user",
+                    "user",
+                    "/stop comment:0123456789abcdef",
+                ),
+                "/stop comment:0123456789abcdef",
+            )
+            .await
+            .expect("handled");
+        assert_eq!(denied, STOP_SCOPE_DENIED_REPLY);
+        assert!(bridge.is_scope_active(comment_scope));
+
+        let stopped = bridge
+            .handle_command(
+                &message(
+                    "om_stop",
+                    "ou_admin",
+                    "user",
+                    "/stop comment:0123456789abcdef",
+                ),
+                "/stop comment:0123456789abcdef",
+            )
+            .await
+            .expect("handled");
+        assert_eq!(stopped, "已请求停止 `comment:0123456789abcdef`。");
+        assert!(!bridge.is_scope_active(comment_scope));
+        assert!(
+            bridge.is_scope_active(meeting_scope),
+            "stopping a comment scope must not abort a meeting run"
+        );
+        assert!(bridge.is_scope_active(other_scope));
+
+        let stopped = bridge
+            .handle_command(
+                &message("om_stop", "ou_admin", "user", "/stop meeting:70001"),
+                "/stop meeting:70001",
+            )
+            .await
+            .expect("handled");
+        assert_eq!(stopped, "已请求停止 `meeting:70001`。");
+        assert!(!bridge.is_scope_active(meeting_scope));
+        assert!(
+            bridge.is_scope_active(other_scope),
+            "stopping a meeting scope must not abort an IM run"
+        );
+
+        let missing = bridge
+            .handle_command(
+                &message("om_stop", "ou_admin", "user", "/stop comment:missing"),
+                "/stop comment:missing",
+            )
+            .await
+            .expect("handled");
+        assert_eq!(missing, "未找到正在运行的任务：`comment:missing`。");
+
+        // Aborted tasks are cancelled, not left running.
+        for handle in [comment_run, meeting_run] {
+            let error = tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("aborted task finishes")
+                .expect_err("abort yields JoinError");
+            assert!(error.is_cancelled());
+        }
+        assert!(bridge.stop_scope(other_scope).0);
+        assert!(!bridge.is_scope_active(other_scope));
+        let _ = other_run.await;
+    }
+
+    #[tokio::test]
+    async fn plain_stop_does_not_abort_other_run_kinds() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let comment_scope = "comment:fedcba9876543210";
+        let meeting_scope = "meeting:70002";
+        let chat_scope = "oc_1";
+
+        let comment_run = bridge.spawn_tracked(comment_scope, std::future::pending::<()>());
+        let meeting_run = bridge.spawn_tracked(meeting_scope, std::future::pending::<()>());
+        let chat_run = bridge.spawn_tracked(chat_scope, std::future::pending::<()>());
+
+        let reply = bridge
+            .handle_command(&message("om_stop", "ou_1", "user", "/stop"), "/stop")
+            .await
+            .expect("handled");
+        assert_eq!(reply, "已停止当前任务。");
+        assert!(!bridge.is_scope_active(chat_scope));
+        assert!(bridge.is_scope_active(comment_scope));
+        assert!(bridge.is_scope_active(meeting_scope));
+
+        assert!(bridge.stop_scope(comment_scope).0);
+        assert!(bridge.stop_scope(meeting_scope).0);
+        for handle in [comment_run, meeting_run, chat_run] {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
     }
 
     #[tokio::test]
@@ -3576,7 +3967,13 @@ mod tests {
         });
         let scope = "oc_1";
         lock(&bridge.pending).block(scope);
-        lock(&bridge.active).insert(scope.to_string(), ActiveRun { id: 7, handle });
+        lock(&bridge.active).insert(
+            scope.to_string(),
+            ActiveRun {
+                id: 7,
+                abort: handle.abort_handle(),
+            },
+        );
 
         let (stopped, dropped) = bridge.stop_scope(scope);
         assert!(stopped);

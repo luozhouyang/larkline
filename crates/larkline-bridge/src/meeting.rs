@@ -13,6 +13,14 @@
 //! to a bounded budget for a slot and reports a user-visible timeout instead
 //! of spawning the agent over the cap.
 //!
+//! Every meeting run is registered under `meeting:<meeting_id>` in the
+//! bridge's active-run map through [`MeetingHost::spawn_tracked_run`], and in
+//! the manager's own `runs` map. `/meeting stop`, the in-meeting stop trigger
+//! and an admin `/stop meeting:<meeting_id>` therefore abort the same task;
+//! aborting drops the run future, which releases the global permit, kills the
+//! agent child (`kill_on_drop`) and removes both map entries through their
+//! guards. Meeting runs have no stop button of their own.
+//!
 //! # Configuration
 //!
 //! The Rust profile schema is deliberately closed and keeps unknown keys in
@@ -67,7 +75,9 @@
 //! [`MeetingHost`], both faked in the tests below.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -1590,6 +1600,17 @@ impl MeetingApi for RestMeetingApi {
     }
 }
 
+/// Where an IM-side meeting reply should go.
+///
+/// `scope` is the message scope that issued the command (`chatId` or
+/// `chatId:threadId`) and `parent_message_id` is the triggering message.
+/// A topic scope replies inside its thread; everything else stays top-level.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImReplyTarget<'a> {
+    pub scope: Option<&'a str>,
+    pub parent_message_id: Option<&'a str>,
+}
+
 /// What a meeting run needs from the bridge: workspace, session persistence and
 /// IM delivery. Implemented by the bridge; faked in the tests below.
 #[async_trait]
@@ -1602,6 +1623,27 @@ pub trait MeetingHost: Send + Sync {
     async fn save_session(&self, scope: &str, session_key: &str, cwd: &str);
     /// Send a text message over IM. Accepts `oc_*` chat ids and `ou_*` open ids.
     async fn send_im_text(&self, to: &str, text: &str);
+    /// Send an IM text reply through `target` (thread-aware when the host can).
+    ///
+    /// The default is top-level [`MeetingHost::send_im_text`]; the bridge
+    /// overrides it to honour a topic command's `reply_in_thread`.
+    async fn send_im_text_reply(&self, to: &str, target: ImReplyTarget<'_>, text: &str) {
+        let _ = target;
+        self.send_im_text(to, text).await;
+    }
+    /// Spawn one meeting agent task under `scope`.
+    ///
+    /// The bridge implementation also registers the task in its active-run map
+    /// (`meeting:<meeting_id>`) so `/stop meeting:<id>` can abort it; the
+    /// default is a plain spawn for standalone managers and tests.
+    fn spawn_tracked_run(
+        &self,
+        scope: &str,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> JoinHandle<()> {
+        let _ = scope;
+        tokio::spawn(future)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1900,6 +1942,11 @@ impl MeetingManager {
     }
 
     /// Abort the live agent run for a meeting. Returns whether one was running.
+    ///
+    /// This aborts the same task that is mirrored in the bridge's active-run
+    /// map (`meeting:<id>`); the task's guards remove both entries, so
+    /// `/meeting stop`, the in-meeting stop trigger and `/stop meeting:<id>`
+    /// stay consistent.
     pub fn interrupt(&self, meeting_id: &str) -> bool {
         let scope = meeting_scope_id(meeting_id);
         let mut runs = lock(&self.runs);
@@ -2173,7 +2220,11 @@ impl MeetingManager {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         let manager = Arc::clone(self);
         let task_scope = scope.clone();
-        let handle = tokio::spawn(async move {
+        // The host registers the task in the bridge's active-run map
+        // (`meeting:<id>`) before it can run, so `/stop meeting:<id>` and the
+        // manager's own `interrupt` abort the same task. The run guard removes
+        // the manager entry on normal completion and on abort.
+        let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
             let _guard = MeetingRunGuard {
                 manager: Arc::clone(&manager),
                 scope: task_scope,
@@ -2181,6 +2232,7 @@ impl MeetingManager {
             };
             manager.execute_answer(plan).await;
         });
+        let handle = self.host.spawn_tracked_run(&scope, future);
         runs.insert(scope, ActiveMeetingRun { id, handle });
         Ok(())
     }
@@ -2360,7 +2412,18 @@ impl MeetingManager {
         let title = snapshot.title();
         let manager = Arc::clone(self);
         let summary_target = target.clone();
-        tokio::spawn(async move {
+        let scope = meeting_scope_id(&snapshot.meeting_id);
+        let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let task_scope = scope.clone();
+        // Summaries are meeting runs too: register them under the same scope
+        // so `/stop meeting:<id>` can abort a long summary, and so shutdown's
+        // `interrupt_all` cancels it.
+        let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let _guard = MeetingRunGuard {
+                manager: Arc::clone(&manager),
+                scope: task_scope.clone(),
+                id,
+            };
             let transcript = snapshot.recent_transcript(Some(manager.config.transcript.keep));
             let prompt = build_meeting_prompt(
                 SUMMARY_QUESTION,
@@ -2368,8 +2431,7 @@ impl MeetingManager {
                 snapshot.topic.as_deref(),
                 None,
             );
-            let scope = meeting_scope_id(&snapshot.meeting_id);
-            let answer = manager.run_agent(&scope, prompt).await;
+            let answer = manager.run_agent(&task_scope, prompt).await;
             let answer = answer.trim().to_string();
             if answer.is_empty() {
                 return;
@@ -2385,6 +2447,17 @@ impl MeetingManager {
                 "meeting summary sent"
             );
         });
+        // Hold the manager map across spawn + insert: the task's guard takes
+        // the same lock, so it cannot remove an entry that was never inserted.
+        let mut runs = lock(&self.runs);
+        // `end_meeting` already interrupted the answer run; this closes the
+        // small race where a new answer was spawned between that interrupt
+        // and the summary start.
+        if let Some(previous) = runs.remove(&scope) {
+            previous.handle.abort();
+        }
+        let handle = self.host.spawn_tracked_run(&scope, future);
+        runs.insert(scope, ActiveMeetingRun { id, handle });
     }
 
     fn busy_reply(&self, used_prefix: Option<&str>) -> String {
@@ -2405,8 +2478,24 @@ impl MeetingManager {
     pub async fn handle_command(
         self: &Arc<Self>,
         args: &str,
+        sender_id: &str,
+        chat_id: &str,
+    ) -> String {
+        self.handle_command_with_reply(args, sender_id, chat_id, ImReplyTarget::default())
+            .await
+    }
+
+    /// [`Self::handle_command`] with an explicit IM reply target.
+    ///
+    /// `/meeting ask|notes` acknowledges immediately; the acknowledgement is a
+    /// command reply and must follow the sender's topic, so the bridge passes
+    /// the message scope and parent id here.
+    pub async fn handle_command_with_reply(
+        self: &Arc<Self>,
+        args: &str,
         _sender_id: &str,
         chat_id: &str,
+        reply_target: ImReplyTarget<'_>,
     ) -> String {
         let (sub, rest) = split_command(args);
         match sub {
@@ -2473,8 +2562,9 @@ impl MeetingManager {
                 // Immediate acknowledgement: the run itself can take minutes,
                 // and this command is detached from the event loop.
                 self.host
-                    .send_im_text(
+                    .send_im_text_reply(
                         chat_id,
+                        reply_target,
                         if sub == "notes" {
                             "正在总结会议…"
                         } else {
@@ -2712,7 +2802,11 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use larkline_core::config::Access;
+    use larkline_core::{AppPaths, TenantBrand};
+    use larkline_lark::Channel;
     use serde_json::json;
+
+    use crate::run::BridgeMeetingHost;
 
     // -----------------------------------------------------------------------
     // Fakes: network + bridge seam
@@ -2813,11 +2907,16 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         im: StdMutex<Vec<(String, String)>>,
+        replies: StdMutex<Vec<(String, Option<String>, Option<String>, String)>>,
     }
 
     impl FakeHost {
         fn im(&self) -> Vec<(String, String)> {
             lock(&self.im).clone()
+        }
+
+        fn replies(&self) -> Vec<(String, Option<String>, Option<String>, String)> {
+            lock(&self.replies).clone()
         }
     }
 
@@ -2837,6 +2936,16 @@ mod tests {
 
         async fn send_im_text(&self, to: &str, text: &str) {
             lock(&self.im).push((to.to_string(), text.to_string()));
+        }
+
+        async fn send_im_text_reply(&self, to: &str, target: ImReplyTarget<'_>, text: &str) {
+            lock(&self.replies).push((
+                to.to_string(),
+                target.scope.map(str::to_string),
+                target.parent_message_id.map(str::to_string),
+                text.to_string(),
+            ));
+            self.send_im_text(to, text).await;
         }
     }
 
@@ -2923,6 +3032,27 @@ mod tests {
             .with_run_limit(Arc::clone(&limiter)),
         );
         (manager, limiter)
+    }
+
+    /// Minimal real bridge, used by the `/stop meeting:<id>` integration test.
+    fn bridge_with_agent(root: &std::path::Path, binary: PathBuf) -> Arc<crate::run::Bridge> {
+        let paths = AppPaths::resolve(root, "test").expect("app paths");
+        let profile = ProfileConfig {
+            agent_kind: AgentKind::Claude,
+            ..ProfileConfig::default()
+        };
+        Arc::new(
+            crate::run::Bridge::new(
+                Channel::new("cli_test_app", "secret", TenantBrand::Feishu),
+                profile,
+                binary,
+                root.join("workspace"),
+                None,
+                None,
+                paths,
+            )
+            .expect("bridge"),
+        )
     }
 
     /// Serialize fake-script write + spawn across the test binary; see
@@ -4132,5 +4262,126 @@ mod tests {
 
         drop(held);
         assert_eq!(limiter.active(), 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_stop_aborts_a_meeting_run_and_releases_the_slot() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("meeting-stop-started");
+        let release = root.path().join("meeting-stop-release");
+        let bridge = bridge_with_agent(
+            root.path(),
+            blocking_fake_agent(root.path(), &started, &release),
+        );
+        let host: Arc<dyn MeetingHost> = Arc::new(BridgeMeetingHost {
+            bridge: Arc::downgrade(&bridge),
+        });
+        let api = Arc::new(FakeApi::new());
+        api.push_join(Ok(join_result("70001", "123456789")));
+        let manager = Arc::new(
+            MeetingManager::new(
+                MeetingConfig {
+                    respond_in: RespondIn::Im,
+                    ..MeetingConfig::default()
+                },
+                AgentSettings {
+                    kind: AgentKind::Claude,
+                    binary: bridge.agent_binary.clone(),
+                    bot_open_id: None,
+                    bot_name: None,
+                },
+                api,
+                host,
+            )
+            .with_run_limit(Arc::clone(bridge.run_limiter())),
+        );
+        manager
+            .join("123456789", Some("oc_origin"))
+            .await
+            .expect("scripted join");
+        assert!(manager.handle_push(&activity_frame(vec![chat_item(
+            "@bot 方案 A 的风险是什么？",
+            None,
+            "Alice"
+        )])));
+
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the fake meeting agent must start");
+        let scope = meeting_scope_id("70001");
+        assert!(
+            bridge.is_scope_active(&scope),
+            "the meeting run must be registered in the bridge"
+        );
+        assert_eq!(bridge.run_limiter().active(), 1);
+
+        let (stopped, dropped) = bridge.stop_scope(&scope);
+        assert!(stopped, "the meeting run must be aborted");
+        assert_eq!(dropped, 0, "a meeting scope has no pending queue");
+        assert!(!bridge.is_scope_active(&scope));
+
+        // The manager's own map and the global slot are released by the
+        // aborted task's guards.
+        for _ in 0..400 {
+            if lock(&manager.runs).is_empty() && bridge.run_limiter().active() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            lock(&manager.runs).is_empty(),
+            "the manager run entry must be removed on abort"
+        );
+        assert_eq!(
+            bridge.run_limiter().active(),
+            0,
+            "the aborted meeting run must release its global slot"
+        );
+        assert!(bridge.run_limiter().try_acquire().is_some());
+        assert!(
+            !manager.interrupt("70001"),
+            "nothing is left for a second interrupt"
+        );
+    }
+    #[tokio::test]
+    async fn ask_acknowledgement_uses_the_topic_reply_target() {
+        let api = Arc::new(FakeApi::new());
+        api.push_join(Ok(join_result("70001", "123456789")));
+        let host = Arc::new(FakeHost::default());
+        let manager = manager(
+            MeetingConfig::default(),
+            Arc::clone(&api),
+            Arc::clone(&host),
+        );
+        manager
+            .join("123456789", Some("oc_origin"))
+            .await
+            .expect("scripted join");
+
+        let answer = manager
+            .handle_command_with_reply(
+                "ask 现在开会了吗",
+                "ou_admin",
+                "oc_origin",
+                ImReplyTarget {
+                    scope: Some("oc_origin:omt_1"),
+                    parent_message_id: Some("om_1"),
+                },
+            )
+            .await;
+        assert!(answer.contains("无法启动 agent"), "got {answer:?}");
+
+        let replies = host.replies();
+        assert_eq!(replies.len(), 1, "one immediate acknowledgement");
+        let (to, scope, parent, text) = &replies[0];
+        assert_eq!(to, "oc_origin");
+        assert_eq!(scope.as_deref(), Some("oc_origin:omt_1"));
+        assert_eq!(parent.as_deref(), Some("om_1"));
+        assert!(text.contains("正在思考"), "got {text:?}");
     }
 }

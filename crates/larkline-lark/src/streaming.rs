@@ -278,6 +278,14 @@ impl StreamingState {
     }
 }
 
+/// How the message that references a CardKit entity is delivered.
+enum CardMessageTarget<'a> {
+    /// Top-level message in a chat.
+    Chat(&'a str),
+    /// Threaded reply to an existing message.
+    Thread(MessageId),
+}
+
 /// A live CardKit 2.0 streaming card.
 ///
 /// Created by [`StreamingCard::start`], which creates the entity and sends the
@@ -326,17 +334,79 @@ impl StreamingCard {
         element_id: &str,
         safe_age: Duration,
     ) -> LarkResult<Self> {
+        Self::start_for_target(
+            channel,
+            CardMessageTarget::Chat(chat_id),
+            card,
+            element_id,
+            safe_age,
+        )
+        .await
+    }
+
+    /// Like [`StreamingCard::start`], but sends the reference message as a
+    /// threaded reply to `parent_message_id` (`reply_in_thread: true`).
+    ///
+    /// Topic-group runs use this so the live card lives in the thread the user
+    /// wrote in instead of at the chat's top level.
+    pub async fn start_reply(
+        channel: &Channel,
+        parent_message_id: MessageId,
+        card: Card,
+        element_id: &str,
+    ) -> LarkResult<Self> {
+        Self::start_reply_with_safe_age(channel, parent_message_id, card, element_id, CARD_SAFE_AGE)
+            .await
+    }
+
+    /// Like [`StreamingCard::start_reply`] with an explicit server-safe window.
+    pub async fn start_reply_with_safe_age(
+        channel: &Channel,
+        parent_message_id: MessageId,
+        card: Card,
+        element_id: &str,
+        safe_age: Duration,
+    ) -> LarkResult<Self> {
+        Self::start_for_target(
+            channel,
+            CardMessageTarget::Thread(parent_message_id),
+            card,
+            element_id,
+            safe_age,
+        )
+        .await
+    }
+
+    async fn start_for_target(
+        channel: &Channel,
+        target: CardMessageTarget<'_>,
+        card: Card,
+        element_id: &str,
+        safe_age: Duration,
+    ) -> LarkResult<Self> {
         validate_element_id(element_id)?;
         // Deliberately before entity creation: starting a touch early only
         // makes the guard more conservative.
         let created_at = Instant::now();
         let card = enable_streaming(card)?;
         let card_id = channel.create_card_entity(&card).await?;
-        let message_id = channel
-            .sender()
-            .card_reference_message(Recipient::Chat(chat_id.to_owned()), card_id.clone())
-            .send()
-            .await?;
+        let message_id = match target {
+            CardMessageTarget::Chat(chat_id) => {
+                channel
+                    .sender()
+                    .card_reference_message(Recipient::Chat(chat_id.to_owned()), card_id.clone())
+                    .send()
+                    .await?
+            }
+            CardMessageTarget::Thread(parent_message_id) => {
+                channel
+                    .sender()
+                    .card_reference_reply(parent_message_id, card_id.clone())
+                    .reply_in_thread(true)
+                    .send()
+                    .await?
+            }
+        };
         Ok(Self {
             channel: channel.clone(),
             card_id,

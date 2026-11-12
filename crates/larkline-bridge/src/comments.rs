@@ -82,9 +82,15 @@
 //!   to the underlying `obj_token` before any comment call. `larkline-lark`
 //!   has no wiki accessor, so `file_type: "wiki"` events are logged and
 //!   skipped instead of being resolved (see [`SUPPORTED_FILE_TYPES`]).
-//! * **`/stop`**: comment runs are detached from the event loop and are not
-//!   registered in `Bridge::active`, so `/stop comment:<hash>` cannot abort
-//!   one yet. The run is bounded by `RUN_TIMEOUT`.
+//! * **`/stop`**: comment runs are registered in `Bridge::active` under their
+//!   thread scope (`comment:<16-hex digest>`), so an admin can abort one with
+//!   `/stop comment:<hash>`; plain `/stop` only targets the sender's IM scope.
+//!   `/status` lists live scopes. Aborting drops the run future, which
+//!   releases the global permit, kills the agent child (`kill_on_drop`) and
+//!   removes the "Typing" reaction through the guard. The run is also bounded
+//!   by `RUN_TIMEOUT`. Registration starts once the comment thread has been
+//!   fetched (the fetch itself is a short, bounded API call); a `/stop` during
+//!   that fetch is a no-op.
 //! * **Acknowledgement**: the CLI acknowledges the WebSocket frame immediately
 //!   and runs the comment in a spawned task (a run may take up to
 //!   `RUN_TIMEOUT`; holding the event loop for that long would stall
@@ -93,7 +99,7 @@
 //!   redelivery from starting a second concurrent run in the same thread.
 
 use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
 use larkline_agent::{AgentEvent, PromptContext, SandboxMode, TerminationReason};
@@ -107,7 +113,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::render::RunView;
-use crate::run::{Bridge, RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT};
+use crate::run::{Bridge, RUN_SLOT_TIMEOUT_REPLY, RUN_SLOT_WAIT, RUN_TIMEOUT, ReactionState};
 
 /// Platform event type of a cloud-doc comment @-mention.
 ///
@@ -787,60 +793,118 @@ impl Drop for CommentRunGuard {
 }
 
 /// Best-effort "Typing" reaction on the reply that @-mentioned the bot.
+///
+/// Mirrors [`crate::run`]'s `WorkingReaction`: the add is detached, and a
+/// shared state machine decides who removes the reaction when the run is
+/// aborted mid-flight (`/stop comment:<hash>`). The comment API identifies a
+/// reaction by its emoji type rather than by an id, so [`ReactionState`]'s id
+/// is the emoji constant here.
 struct CommentTypingReaction {
     rest: RestClient,
     file_token: String,
     file_type: String,
     reply_id: Option<String>,
-    added: bool,
+    state: Arc<StdMutex<ReactionState>>,
 }
 
 impl CommentTypingReaction {
-    async fn start(rest: RestClient, mention: &CommentMention) -> Self {
+    /// Start the reaction without delaying the run.
+    fn start(rest: RestClient, mention: &CommentMention) -> Self {
         let reply_id = mention.target_reply_id.clone();
-        let added = match reply_id.as_deref() {
-            Some(reply_id) => match comments::add_reaction(
-                &rest,
-                &mention.file_token,
-                &mention.file_type,
-                reply_id,
-                TYPING,
-            )
-            .await
-            {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(error = %error, "cannot add comment reaction");
-                    false
-                }
-            },
-            None => false,
-        };
-        Self {
+        let guard = Self {
             rest,
             file_token: mention.file_token.clone(),
             file_type: mention.file_type.clone(),
-            reply_id,
-            added,
-        }
+            reply_id: reply_id.clone(),
+            state: Arc::new(StdMutex::new(ReactionState::default())),
+        };
+        let Some(reply_id) = reply_id else {
+            // Whole-document comments have no reply to decorate.
+            lock_reaction(&guard.state).add_failed();
+            return guard;
+        };
+        lock_reaction(&guard.state).begin_add();
+
+        let rest = guard.rest.clone();
+        let file_token = guard.file_token.clone();
+        let file_type = guard.file_type.clone();
+        let state = Arc::clone(&guard.state);
+        tokio::spawn(async move {
+            match comments::add_reaction(&rest, &file_token, &file_type, &reply_id, TYPING).await {
+                Ok(()) => {
+                    // The comment API has no reaction id; the emoji type is
+                    // the stable key used by the delete call.
+                    let remove_now = lock_reaction(&state).added(TYPING);
+                    if remove_now {
+                        remove_comment_reaction(&rest, &file_token, &file_type, &reply_id).await;
+                    }
+                }
+                Err(error) => {
+                    lock_reaction(&state).add_failed();
+                    tracing::debug!(error = %error, "cannot add comment reaction");
+                }
+            }
+        });
+        guard
     }
 
+    /// Remove the reaction on the normal path.
     async fn finish(self) {
-        let (Some(reply_id), true) = (self.reply_id.as_deref(), self.added) else {
+        let Some(reply_id) = self.reply_id.as_deref() else {
             return;
         };
-        if let Err(error) = comments::remove_reaction(
-            &self.rest,
-            &self.file_token,
-            &self.file_type,
-            reply_id,
-            TYPING,
-        )
-        .await
-        {
-            tracing::debug!(error = %error, "cannot remove comment reaction");
+        if lock_reaction(&self.state).finish().is_some() {
+            remove_comment_reaction(&self.rest, &self.file_token, &self.file_type, reply_id).await;
         }
     }
+}
+
+impl Drop for CommentTypingReaction {
+    fn drop(&mut self) {
+        if lock_reaction(&self.state).finish().is_none() {
+            return;
+        }
+        let Some(reply_id) = self.reply_id.clone() else {
+            return;
+        };
+        let rest = self.rest.clone();
+        let file_token = self.file_token.clone();
+        let file_type = self.file_type.clone();
+        let removal = async move {
+            remove_comment_reaction(&rest, &file_token, &file_type, &reply_id).await;
+        };
+        // `/stop` aborts the comment run task, so this detached task is the
+        // only cleanup path available there.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(removal);
+            }
+            Err(_) => tracing::warn!(
+                file_token = %self.file_token,
+                "no tokio runtime to remove comment reaction"
+            ),
+        }
+    }
+}
+
+async fn remove_comment_reaction(
+    rest: &RestClient,
+    file_token: &str,
+    file_type: &str,
+    reply_id: &str,
+) {
+    if let Err(error) =
+        comments::remove_reaction(rest, file_token, file_type, reply_id, TYPING).await
+    {
+        tracing::debug!(error = %error, "cannot remove comment reaction");
+    }
+}
+
+/// Lock the reaction state, recovering the guard if a panic poisoned it.
+fn lock_reaction(state: &StdMutex<ReactionState>) -> std::sync::MutexGuard<'_, ReactionState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Handle one untyped event: parse, gate, fetch the thread, run the agent and
@@ -878,7 +942,7 @@ pub async fn handle_comment_mention(bridge: &std::sync::Arc<Bridge>, raw: &Value
         return;
     }
 
-    let Some(_run_guard) = CommentRunGuard::acquire(&thread_scope) else {
+    let Some(run_guard) = CommentRunGuard::acquire(&thread_scope) else {
         tracing::info!(
             thread = %thread_scope,
             "comment thread already has a live run; skipping redelivery"
@@ -898,11 +962,41 @@ pub async fn handle_comment_mention(bridge: &std::sync::Arc<Bridge>, raw: &Value
         "file-comment mention parsed"
     );
 
-    let reaction = CommentTypingReaction::start(bridge.channel.rest().clone(), &mention).await;
-    let view = run_comment_agent(bridge, &event, &mention, &thread_scope).await;
-    let text = comment_reply_text(&view, bridge.profile.agent_kind.display_name());
-    post_comment_reply(bridge, &mention, &text).await;
-    reaction.finish().await;
+    let handle = spawn_comment_run(bridge, event, mention, thread_scope.clone(), run_guard);
+    if let Err(error) = handle.await {
+        tracing::info!(
+            thread = %thread_scope,
+            cancelled = error.is_cancelled(),
+            "comment run ended without a reply"
+        );
+    }
+}
+
+/// Spawn the agent + reply task for one comment and register it for `/stop`.
+///
+/// The run is registered in `Bridge::active` under its thread scope before the
+/// task can run, so `/stop comment:<hash>` aborts it. The guard inside the
+/// task removes the entry on normal completion and on abort; the run future
+/// owns its global permit and its agent child (`kill_on_drop`), so
+/// cancellation releases both. `run_guard` keeps a redelivery from starting a
+/// second run for the same thread and is released when the task is dropped.
+fn spawn_comment_run(
+    bridge: &std::sync::Arc<Bridge>,
+    event: RawCommentEvent,
+    mention: CommentMention,
+    thread_scope: String,
+    run_guard: CommentRunGuard,
+) -> tokio::task::JoinHandle<()> {
+    let task_scope = thread_scope.clone();
+    let bridge = Arc::clone(bridge);
+    Arc::clone(&bridge).spawn_tracked(&thread_scope, async move {
+        let _run_guard = run_guard;
+        let reaction = CommentTypingReaction::start(bridge.channel.rest().clone(), &mention);
+        let view = run_comment_agent(&bridge, &event, &mention, &task_scope).await;
+        let text = comment_reply_text(&view, bridge.profile.agent_kind.display_name());
+        post_comment_reply(&bridge, &mention, &text).await;
+        reaction.finish().await;
+    })
 }
 
 /// Fetch the comment thread and turn it into a [`CommentMention`].
@@ -1795,5 +1889,70 @@ mod tests {
             .expect("comment task");
         assert_eq!(view.best_answer(), "comment done");
         assert_eq!(bridge.run_limiter().active(), 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_aborts_the_comment_run_and_releases_its_slot() {
+        let _agent_lock = fake_agent_lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("comment-stop-started");
+        let release = root.path().join("comment-stop-release");
+        let bridge = bridge_for(
+            root.path(),
+            blocking_fake_agent(root.path(), &started, &release),
+            1,
+        );
+        let (event, mention) = run_fixture();
+        let thread_scope = comment_scope_id(&event.file_token, &event.comment_id);
+        let run_guard = CommentRunGuard::acquire(&thread_scope).expect("thread guard");
+
+        let handle = spawn_comment_run(&bridge, event, mention, thread_scope.clone(), run_guard);
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the fake agent must start");
+        assert!(
+            bridge.is_scope_active(&thread_scope),
+            "the comment run must be registered under its thread scope"
+        );
+        assert_eq!(bridge.run_limiter().active(), 1);
+
+        let (stopped, dropped) = bridge.stop_scope(&thread_scope);
+        assert!(stopped, "the comment run must be aborted");
+        assert_eq!(dropped, 0, "a comment scope has no pending queue");
+
+        let error = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("aborted comment task finishes")
+            .expect_err("aborting a task yields JoinError");
+        assert!(error.is_cancelled(), "the task must be cancelled");
+        assert!(
+            !bridge.is_scope_active(&thread_scope),
+            "the active entry must be removed on abort"
+        );
+        assert!(
+            CommentRunGuard::acquire(&thread_scope).is_some(),
+            "the per-thread run guard must be released on abort"
+        );
+        assert_eq!(
+            bridge.run_limiter().active(),
+            0,
+            "the aborted run must release its global slot"
+        );
+        assert!(bridge.run_limiter().try_acquire().is_some());
+
+        // No cross-scope aborts: a sibling comment thread is untouched.
+        let sibling = comment_scope_id("other_file", "other_comment");
+        assert_ne!(sibling, thread_scope);
+        assert!(!bridge.stop_scope(&sibling).0);
+        assert_eq!(
+            bridge.run_limiter().active(),
+            0,
+            "the sibling abort must not touch any slot"
+        );
+        assert!(!bridge.is_scope_active(&sibling));
     }
 }
