@@ -9,6 +9,7 @@ pub mod callback;
 pub mod callback_store;
 pub mod commands;
 pub mod comments;
+pub mod cot;
 pub mod keepalive;
 pub mod media;
 pub mod meeting;
@@ -28,6 +29,7 @@ pub use callback::{
 };
 pub use callback_store::{CallbackNonceStore, NonceEntry, NonceState};
 pub use commands::{CommandEffect, CommandOutcome};
+pub use cot::{CotPlan, CotPublisher, CotRunMode, CotRunParams, CotStream};
 pub use media::{
     AttachmentCandidate, AttachmentDecision, AttachmentKind, AttachmentRequiredness, MediaCache,
     MediaError, MediaPolicy, NormalizedAttachment, ResourceDownloader, SdkResourceDownloader,

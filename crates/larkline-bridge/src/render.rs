@@ -961,7 +961,10 @@ fn terminal_notice(view: &RunView) -> Option<Value> {
 }
 
 /// Per-tool header line (TS `toolHeaderText`).
-fn tool_header_text(tool: &ToolCall) -> String {
+///
+/// Public because the COT publisher reuses it for `brief` tool titles
+/// (TS `cotBriefToolTitle`) before stripping the `**` markers.
+pub fn tool_header_text(tool: &ToolCall) -> String {
     let icon = match tool.status {
         ToolStatus::Done => "✅",
         ToolStatus::Error => "❌",

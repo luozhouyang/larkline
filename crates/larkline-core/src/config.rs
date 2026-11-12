@@ -73,6 +73,12 @@ impl Default for MessageReplyMode {
     }
 }
 
+/// Whether a run publishes a chain-of-thought (COT) process message.
+///
+/// Mirrors `CotMessagesMode` in `src/config/schema.ts`. The legacy values
+/// (`on`, `simple`) are accepted by [`deserialize_cot_messages`] and collapse
+/// onto [`CotMessagesMode::Detailed`] / [`CotMessagesMode::Brief`], exactly
+/// like `getCotMessages` in TypeScript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CotMessagesMode {
@@ -85,6 +91,39 @@ impl Default for CotMessagesMode {
     fn default() -> Self {
         Self::Off
     }
+}
+
+impl CotMessagesMode {
+    /// Whether the mode publishes anything at all (TS `cotMessages !== 'off'`).
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// Deserialize `preferences.cotMessages`, accepting the legacy TypeScript
+/// values `on` (detailed) and `simple` (brief).
+///
+/// A typed enum alone would reject those strings and fail the *whole* profile
+/// load, so the coercion happens here rather than surfacing as a parse error.
+fn deserialize_cot_messages<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CotMessagesMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as DeError;
+
+    let raw = Option::<String>::deserialize(deserializer)?;
+    raw.map(|value| match value.as_str() {
+        "off" => Ok(CotMessagesMode::Off),
+        "brief" | "simple" => Ok(CotMessagesMode::Brief),
+        "detailed" | "on" => Ok(CotMessagesMode::Detailed),
+        other => Err(DeError::unknown_variant(
+            other,
+            &["off", "brief", "simple", "detailed", "on"],
+        )),
+    })
+    .transpose()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -165,7 +204,11 @@ pub struct Preferences {
     pub message_reply_migrated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_tool_calls: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_cot_messages",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cot_messages: Option<CotMessagesMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_display: Option<ReasoningDisplay>,
@@ -298,6 +341,23 @@ impl ProfileConfig {
             .as_ref()
             .and_then(|p| p.show_tool_calls)
             .unwrap_or(true)
+    }
+
+    /// COT process-message mode, defaulting to off (TS `getCotMessages`).
+    pub fn cot_messages(&self) -> CotMessagesMode {
+        self.preferences
+            .as_ref()
+            .and_then(|p| p.cot_messages)
+            .unwrap_or_default()
+    }
+
+    /// Where reasoning is rendered, defaulting to the legacy `auto`
+    /// (TS `getReasoningDisplay`).
+    pub fn reasoning_display(&self) -> ReasoningDisplay {
+        self.preferences
+            .as_ref()
+            .and_then(|p| p.reasoning_display)
+            .unwrap_or_default()
     }
 
     pub fn max_concurrent_runs(&self) -> u32 {
@@ -435,5 +495,57 @@ mod tests {
         .unwrap();
         assert!(matches!(app.secret, SecretInput::Plain(_)));
         assert_eq!(app.tenant, TenantBrand::Lark);
+    }
+
+    #[test]
+    fn cot_messages_accepts_the_legacy_typescript_values() {
+        // TS `getCotMessages` coerces `simple` -> brief and `on` -> detailed.
+        for (raw, expected) in [
+            ("off", CotMessagesMode::Off),
+            ("brief", CotMessagesMode::Brief),
+            ("simple", CotMessagesMode::Brief),
+            ("detailed", CotMessagesMode::Detailed),
+            ("on", CotMessagesMode::Detailed),
+        ] {
+            let profile: ProfileConfig = serde_json::from_value(json!({
+                "preferences": { "cotMessages": raw }
+            }))
+            .unwrap();
+            assert_eq!(profile.cot_messages(), expected, "cotMessages={raw}");
+        }
+
+        // A typo still surfaces instead of silently disabling the feature.
+        let error = serde_json::from_value::<ProfileConfig>(json!({
+            "preferences": { "cotMessages": "loud" }
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected error: {error}"
+        );
+
+        // Absent preferences keep the COT feature off (TS default).
+        let empty: ProfileConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.cot_messages(), CotMessagesMode::Off);
+        assert!(!empty.cot_messages().is_enabled());
+        assert_eq!(empty.reasoning_display(), ReasoningDisplay::Auto);
+    }
+
+    #[test]
+    fn reasoning_display_resolves_every_typed_value_and_defaults_to_auto() {
+        for (raw, expected) in [
+            ("auto", ReasoningDisplay::Auto),
+            ("off", ReasoningDisplay::Off),
+            ("inline", ReasoningDisplay::Inline),
+            ("bubble", ReasoningDisplay::Bubble),
+        ] {
+            let profile: ProfileConfig = serde_json::from_value(json!({
+                "preferences": { "reasoningDisplay": raw }
+            }))
+            .unwrap();
+            assert_eq!(profile.reasoning_display(), expected, "display={raw}");
+        }
+        let missing: ProfileConfig = serde_json::from_value(json!({ "preferences": {} })).unwrap();
+        assert_eq!(missing.reasoning_display(), ReasoningDisplay::Auto);
     }
 }

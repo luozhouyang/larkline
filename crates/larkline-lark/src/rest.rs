@@ -156,6 +156,11 @@ impl RestClient {
                 truncate(&text, 300)
             )));
         }
+        // Some endpoints answer 200 with an empty body; the TypeScript client
+        // treats that as `{}` (`if (!text) return {}`) instead of a JSON error.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| RestError::Message(format!("invalid json from {path}: {e}")))?;
         parse_envelope(value)

@@ -358,7 +358,7 @@ The Rust bridge does not yet implement these TypeScript features:
 
 - The TypeScript owner bypass for ordinary messages, team mode for usage, per-chat `chatRequireMention` overrides, `/invite` / `/remove`, and `allowedChats` for ordinary messages. (The runtime app owner is resolved for admin commands only.)
 - `/ws` named workspaces, `/resume`, `/timeout`, in-chat `/ps`, `/exit`, `/reconnect` and `/doctor`.
-- The full `/config` card form and the remaining presentation settings (COT process messages, reasoning bubble/panel, access and lark-cli policy).
+- The full `/config` card form; the text subset cannot edit the COT/reasoning presentation settings, access or lark-cli policy. (COT process messages and the reasoning bubble themselves are ported.)
 - Inbound image and file download. Agent runs receive text prompts only.
 - Wiki comment targets; `doc`, `docx`, `sheet` and `file` are supported.
 - End-of-meeting summary threading: summaries go to the configured origin chat or owner DM as top-level messages.

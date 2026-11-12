@@ -358,7 +358,7 @@ Rust bridge 暂未实现以下 TypeScript 功能：
 
 - 普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、`/invite` / `/remove`，以及普通消息上的 `allowedChats` 限制。（运行时应用 owner 只用于管理员命令。）
 - `/ws` 命名工作空间、`/resume`、`/timeout`、飞书内 `/ps`、`/exit`、`/reconnect`、`/doctor`。
-- 完整的 `/config` 卡片表单，以及其余展示设置（COT 过程消息、思考内容气泡 / 面板、访问控制和 lark-cli 策略）。
+- 完整的 `/config` 卡片表单；文本子集尚不能修改 COT / 思考展示设置、访问控制和 lark-cli 策略（COT 过程消息与思考气泡本身已移植）。
 - 入站图片和文件下载。agent 目前只收到文本 prompt。
 - Wiki 评论目标；目前支持 `doc`、`docx`、`sheet` 和 `file`。
 - 会议纪要的 thread 归属：纪要会作为顶层消息发到配置的来源聊天或 owner 私聊。

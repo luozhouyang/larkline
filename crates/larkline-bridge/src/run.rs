@@ -104,6 +104,7 @@ use larkline_core::{
     WorkspaceStore,
     config::{ProfileMode, ReasoningDisplay},
 };
+use larkline_lark::cot::{CotClient, CotTransport};
 use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
 use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
 use serde_json::{Value, json};
@@ -112,6 +113,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::{CallbackAuth, CallbackExpected, CallbackTokens};
+use crate::cot::{COT_DEGRADED_NOTICE, CotPlan, CotRun, CotRunParams};
 use crate::media::{
     AttachmentDecision, AttachmentKind, MediaCache, MediaPolicy, NormalizedAttachment,
     to_prompt_attachments,
@@ -122,7 +124,7 @@ use crate::pending::{PendingQueue, QueueLimits};
 use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
-    CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, card_status, card_summary, render_card,
+    Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, card_status, card_summary, render_card,
 };
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
@@ -276,6 +278,10 @@ pub struct Bridge {
     /// In-meeting agent runtime; `Some` only while `extra.meeting.enabled` is
     /// on and [`Bridge::start_meeting`] ran inside a Tokio runtime.
     meeting: StdMutex<Option<MeetingRuntime>>,
+    /// Transport for COT process messages (`im/v1/message_cot`). The default
+    /// wraps the channel's REST client; tests inject a fake so no COT call
+    /// ever reaches the network.
+    cot_transport: Arc<dyn CotTransport>,
 }
 
 /// The running VC-bot manager and the handle that stops its poll task.
@@ -689,6 +695,9 @@ impl Bridge {
         // Attachments share the channel's authenticated OpenAPI transport and
         // live under the profile's `media/` directory.
         let media = MediaCache::for_channel(&paths, &channel);
+        // COT messages reuse the same tenant token cache as every other REST
+        // call; the transport is injectable so tests stay offline.
+        let cot_transport: Arc<dyn CotTransport> = Arc::new(CotClient::new(channel.rest().clone()));
 
         Ok(Self {
             channel,
@@ -715,7 +724,18 @@ impl Bridge {
             next_run_id: AtomicU64::new(1),
             run_generations: StdMutex::new(HashMap::new()),
             meeting: StdMutex::new(None),
+            cot_transport,
         })
+    }
+
+    /// Replace the COT transport.
+    ///
+    /// Production uses the REST-backed [`CotClient`] created in
+    /// [`Bridge::new`]; tests inject a fake so COT publishing never touches
+    /// the network.
+    pub fn with_cot_transport(mut self, transport: Arc<dyn CotTransport>) -> Self {
+        self.cot_transport = transport;
+        self
     }
 
     /// Replace the attachment downloader.
@@ -2007,12 +2027,6 @@ impl Bridge {
             .map(|message| message.message_id.clone())
             .unwrap_or_else(|| first.message_id.clone());
         let started = Instant::now();
-        // Decorate the most recent message of the batch (the TS bridge also
-        // reacts to `lastMsg`) with the "Typing" reaction for as long as the
-        // run is live. Failures are logged and never fail the run; the guard
-        // removes the reaction from `Drop`, which also covers `/stop`.
-        let _working_reaction =
-            WorkingReaction::start(self.channel.rest().clone(), last_message_id.clone());
         // Snapshot the effective cwd for the whole run: session resume/record
         // and the agent process must agree even if `/cd` lands mid-run. Topic
         // scopes get their own cwd entry in the workspace store.
@@ -2027,10 +2041,51 @@ impl Bridge {
         let attachments = self.resolve_attachments(&batch, &profile).await;
         let prompt = self.build_batch_prompt(&batch, &attachments);
         let reply_mode = profile.message_reply();
-        let card_format = CardFormat::for_reply_mode(reply_mode);
         // Idle watchdog for this run (TS `runIdleTimeoutMs`, `/timeout`
         // override first). Resolved once at run start, like TS.
         let idle_minutes = self.run_idle_timeout_minutes(&scope).await;
+
+        // COT process message (TS `cotEnabled || reasoningBubble`). When one is
+        // live it *replaces* the progress card: the bubble already streams the
+        // same text/tool events, so keeping both would duplicate the whole run
+        // (and the card would duplicate reasoning, too).
+        let mut cot = CotRun::prepare(
+            CotPlan::for_profile(&profile),
+            self.cot_transport.clone(),
+            CotRunParams {
+                chat_id: chat_id.clone(),
+                // The bubble inherits this message's thread in a topic; the
+                // triggering message of the batch is always in that thread.
+                origin_message_id: last_message_id.clone(),
+                // TS uses the per-run id (`execution.runId`) in every step/
+                // message id it publishes; a fresh UUID keeps them unique.
+                run_id: format!("run-{}", uuid::Uuid::new_v4()),
+                scope: scope.clone(),
+                input_preview: batch
+                    .last()
+                    .map(|message| message.text.clone())
+                    .unwrap_or_default(),
+            },
+        );
+        // A process bubble is created now; a reasoning-only bubble waits for
+        // the first reasoning event. A rejected create disables the COT path
+        // and the run falls back to the progress card (TS
+        // `fallback-existing-reply`).
+        if let Some(run) = cot.as_mut() {
+            if !run.start().await {
+                cot = None;
+            }
+        }
+        let cot_path = cot.is_some();
+        let card_format = if cot_path {
+            None
+        } else {
+            CardFormat::for_reply_mode(reply_mode)
+        };
+        // The TS bridge skips the typing reaction while a COT bubble is the
+        // progress surface (the bubble itself is the acknowledgement).
+        let _working_reaction = (!cot_path)
+            .then(|| WorkingReaction::start(self.channel.rest().clone(), last_message_id.clone()));
 
         let mut view = RunView::default();
         let mut streaming: Option<StreamingCard> = None;
@@ -2099,13 +2154,18 @@ impl Bridge {
                     message: message.clone(),
                     termination_reason: TerminationReason::Failed,
                 });
+                if let Some(run) = cot.take() {
+                    let _ = run.finish(TerminationReason::Failed, Some(&message)).await;
+                }
+                let cot_final = cot_path.then(|| final_answer_only_view(&view));
+                let final_view = cot_final.as_ref().unwrap_or(&view);
                 self.finalize(
                     &scope,
                     &chat_id,
                     &mut streaming,
                     message_id.as_deref(),
                     Some(&last_message_id),
-                    &view,
+                    final_view,
                     reply_mode,
                     started,
                     false,
@@ -2194,6 +2254,11 @@ impl Bridge {
                     drop(pending);
                     for event in process.finish().await {
                         view.apply(&event);
+                        // The publisher sees the same flushed tail as the view,
+                        // so a final text/tool event still reaches the bubble.
+                        if let Some(run) = cot.as_mut() {
+                            run.observe(&event).await;
+                        }
                     }
                     break;
                 }
@@ -2204,6 +2269,12 @@ impl Bridge {
                         // folding the event (the TS `armOrPauseIdle` order).
                         watchdog.observe(event, tokio::time::Instant::now());
                         view.apply(event);
+                        // A reasoning-only bubble is created on first use; the
+                        // create is bounded by `COT_REQUEST_TIMEOUT` inside the
+                        // publisher, so it cannot pin the event loop for long.
+                        if let Some(run) = cot.as_mut() {
+                            run.observe(event).await;
+                        }
                     }
                     if view.finished {
                         break;
@@ -2246,13 +2317,42 @@ impl Bridge {
                 .await;
         }
 
+        // Every terminal path reaches here: a normal agent finish, `/stop`,
+        // the idle watchdog, the wall-clock cap and EOF-without-terminal all
+        // leave the view terminal, and the COT bubble is completed from it.
+        if let Some(run) = cot.take() {
+            let termination = view.termination.unwrap_or(TerminationReason::Normal);
+            if let Some(reason) = run.finish(termination, view.error.as_deref()).await {
+                // TS `sendCotDegradedNotice`: publishing stopped mid-run, so
+                // explain why the process bubble never completed. The final
+                // answer is still sent below; a notice failure is only logged.
+                tracing::warn!(scope = %scope, reason = %reason, "COT publishing degraded");
+                if let Err(err) = reply::send_markdown(
+                    &self.channel,
+                    &scope,
+                    &chat_id,
+                    Some(&last_message_id),
+                    COT_DEGRADED_NOTICE,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "cannot send the COT degraded notice");
+                }
+            }
+        }
+        // With a COT bubble the process was already published there, so the
+        // final reply carries only the answer text (TS
+        // `finalAnswerOnlyState`): no reasoning/tool duplication.
+        let cot_final = cot_path.then(|| final_answer_only_view(&view));
+        let final_view = cot_final.as_ref().unwrap_or(&view);
+
         self.finalize(
             &scope,
             &chat_id,
             &mut streaming,
             message_id.as_deref(),
             Some(&last_message_id),
-            &view,
+            final_view,
             reply_mode,
             started,
             paused,
@@ -3245,6 +3345,26 @@ fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
     } else {
         body
     }
+}
+
+/// The state a COT run's final reply is rendered from (TS
+/// `finalAnswerOnlyState`).
+///
+/// The COT bubble already streamed the reasoning and every tool call, so the
+/// final answer keeps only the text blocks: reasoning is cleared, tool panels
+/// are dropped and the running footer is removed (the run is terminal anyway).
+fn final_answer_only_view(view: &RunView) -> RunView {
+    let mut final_view = view.clone();
+    final_view.reasoning.clear();
+    final_view.reasoning_active = false;
+    final_view.footer_status = None;
+    final_view.tools.clear();
+    final_view.tool_calls.clear();
+    final_view.tool_errors = 0;
+    final_view
+        .blocks
+        .retain(|block| matches!(block, Block::Text { .. }));
+    final_view
 }
 
 /// Final body for `MessageReplyMode::Markdown`.
@@ -6841,6 +6961,65 @@ mod tests {
         without_operator.operator.open_id = None;
         assert!(bridge.handle_card_action(&without_operator).await.is_none());
         assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[test]
+    fn cot_final_view_keeps_only_the_answer_text() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Thinking {
+            delta: "hidden reasoning".into(),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "tool-1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "pwd" }),
+        });
+        view.apply(&AgentEvent::ToolResult {
+            id: "tool-1".into(),
+            output: "repo".into(),
+            is_error: false,
+        });
+        view.apply(&AgentEvent::Text {
+            delta: "the answer".into(),
+        });
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+
+        // TS `finalAnswerOnlyState`: the COT bubble already showed the
+        // process, so the final reply carries only the answer text.
+        let final_view = final_answer_only_view(&view);
+        assert_eq!(final_view.best_answer(), "the answer");
+        assert!(final_view.reasoning.is_empty());
+        assert!(!final_view.reasoning_active);
+        assert!(final_view.tool_calls.is_empty());
+        assert!(final_view.tools.is_empty());
+        assert!(final_view.footer_status.is_none());
+        assert!(
+            final_view
+                .blocks
+                .iter()
+                .all(|block| matches!(block, Block::Text { .. })),
+            "tool blocks must be dropped: {:?}",
+            final_view.blocks
+        );
+        // The terminal state is preserved so the final reply still reports
+        // interrupts/timeouts.
+        assert_eq!(final_view.terminal(), view.terminal());
+    }
+
+    #[test]
+    fn cot_final_view_preserves_an_interrupted_terminal() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial".into(),
+        });
+        view.mark_interrupted();
+        let final_view = final_answer_only_view(&view);
+        assert_eq!(final_view.terminal(), Terminal::Interrupted);
+        assert_eq!(final_view.best_answer(), "partial");
     }
 
     #[tokio::test]

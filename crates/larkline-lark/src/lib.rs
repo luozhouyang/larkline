@@ -8,6 +8,7 @@
 pub mod cards;
 pub mod client;
 pub mod comments;
+pub mod cot;
 pub mod meeting;
 pub mod qr;
 pub mod reactions;
@@ -16,6 +17,10 @@ pub mod streaming;
 
 pub use cards::{error_card, final_card, running_card};
 pub use client::{Channel, LarkResult, domain_for};
+pub use cot::{
+    COT_CREATE_PATH, COT_UPDATE_PATH, CotClient, CotCompleteReason, CotEvent, CotEventType, CotRef,
+    CotTransport,
+};
 pub use meeting::{EventsPage, JoinResult, MeetingActivityItem, VcBotClient, is_not_in_gray};
 pub use qr::{QrError, RegistrationOptions, RegistrationResult, RegistrationSession};
 pub use rest::{RestClient, RestError, RestResult};

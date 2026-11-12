@@ -101,6 +101,19 @@ Ported:
   has no matching `tool_result`. The 30-minute wall clock remains only as a
   safety net when the watchdog is disabled; `/timeout` persists to
   `sessions.json` and is now consumed by the run flow
+- COT process messages (port of `src/bot/cot.ts`): a typed
+  `im/v1/message_cot` client plus a per-run publisher. `cotMessages`
+  (`off`/`brief`/`detailed`, with the legacy `on`/`simple` values) and
+  `reasoningDisplay` resolve one bubble per run: `brief` publishes summarized
+  tool steps, `detailed` adds tool args and 1200-char output, reasoning deltas
+  are capped at 4000 chars; events are batched at most once per 600 ms window.
+  A process bubble replaces the progress-card stream (no duplicate progress,
+  final answer sent without reasoning/tool panels), while `reasoningDisplay:
+  bubble` with COT off creates a lazily-started reasoning-only bubble. The
+  bubble is completed on finish/interrupt/timeout and every COT failure
+  (create, update, complete, timeout) is logged and never fails the run; a
+  mid-run update failure also sends the TS degraded notice
+  (`COT 过程消息更新失败…`)
 - workspace store per scope (`/cd`, `/pwd`), working reaction, pending queue
   with the 600 ms merge window
 - in-chat commands: `/new`, `/reset`, `/cd`, `/pwd`, `/status`, `/config`,
@@ -157,22 +170,27 @@ primitive so it can be picked up without re-deriving the design.
    run flow now applies the idle watchdog and `/timeout` override; comment and
    meeting runs have their own loops and still use only the 30-minute
    `RUN_TIMEOUT` cap. `agent_stop_grace_ms` is parsed but unused.
-4. **Presentation parity** — no COT process messages and no reasoning bubble.
-   The rich card now matches the TypeScript content model (reasoning panel,
-   per-tool panels, collapse rules, terminal notices, footer status and stop
-   button), but three presentation details are deliberate Rust simplifications:
-   tool inputs/outputs are stored bounded (4k chars) instead of raw; a
-   `final_text` event is folded into the trailing text block so a final-only
-   agent still renders (TS keeps it out of `blocks`); and individual tool panels
-   below the three-call threshold start collapsed (`expanded: false`) exactly as
-   in the TS snapshot. The rich-card terminal timeout notice reports the
-   minutes configured by the idle watchdog (or 30 when the wall-clock safety
-   net fired with the watchdog disabled); an agent-reported timeout without
-   minutes renders `⏱ 0 分钟`. The text renderer
-   honors `reasoningDisplay: inline` only; `auto`, `off` and `bubble` have no
-   COT client behind them. `markdown` mode is a one-element streaming card with
-   tool summaries from the text renderer but no tool panel, footer element or
-   stop button.
+4. **Presentation parity** — COT process messages and the reasoning bubble are
+   ported (see the "Ported" list), so the remaining gap is configuration and
+   edge behavior. The rich card matches the TypeScript content model (reasoning
+   panel, per-tool panels, collapse rules, terminal notices, footer status and
+   stop button), but three presentation details are deliberate Rust
+   simplifications: tool inputs/outputs are stored bounded (4k chars) instead
+   of raw; a `final_text` event is folded into the trailing text block so a
+   final-only agent still renders (TS keeps it out of `blocks`); and individual
+   tool panels below the three-call threshold start collapsed
+   (`expanded: false`) exactly as in the TS snapshot. The rich-card terminal
+   timeout notice reports the minutes configured by the idle watchdog (or 30
+   when the wall-clock safety net fired with the watchdog disabled); an
+   agent-reported timeout without minutes renders `⏱ 0 分钟`. The text renderer
+   honors `reasoningDisplay: inline` only; `auto` is card-only, `off` hides
+   reasoning and `bubble` publishes the reasoning-only COT bubble.
+   `markdown` mode is a one-element streaming card with tool summaries from
+   the text renderer but no tool panel, footer element or stop button. COT
+   gaps: `cotMessages` / `reasoningDisplay` cannot be changed from the in-chat
+   `/config` text subset, and the run-flow wiring is covered through `CotRun`
+   with a fake transport rather than an end-to-end run test (the bridge
+   `Channel` has no injectable transport).
 5. **Attachments** — inbound images and files are not downloaded. `AgentSpec`
    always carries an empty image list, so the agent receives text prompts only.
 6. **Topic-scope edge cases** — topic scoping is implemented from the event's
