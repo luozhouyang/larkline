@@ -95,7 +95,7 @@ use crate::policy;
 use crate::render::RunView;
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
-use crate::text_render::{TextFormat, TextRenderOptions, render_text};
+use crate::text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
@@ -1655,12 +1655,13 @@ impl Bridge {
             text_final_body(&self.live_profile(), view)
         } else {
             // Markdown still uses the card path above; this is only the
-            // message fallback when the card can no longer be updated.
-            let answer = view.best_answer().trim();
+            // message fallback when the card can no longer be updated. Mask
+            // emails for the same tenant-audit reason as the card renderer.
+            let answer = mask_emails(view.best_answer().trim());
             if answer.is_empty() {
                 "（没有输出）".to_string()
             } else {
-                truncate_chars(answer, 4_000)
+                truncate_chars(&answer, 4_000)
             }
         };
         if let Err(err) =
@@ -2163,11 +2164,14 @@ fn build_card(
     started: Instant,
     stop: Option<(&str, &str)>,
 ) -> lark_channel::Card {
-    let answer = view.best_answer().trim();
+    // Feishu's tenant audit rejects cards containing a raw email address, so
+    // mask at this boundary exactly like `renderCard`/`deepMaskEmails` in TS.
+    // Mask before truncating: a cut can then never expose a raw address.
+    let answer = mask_emails(view.best_answer().trim());
     let body = if answer.is_empty() {
         "…".to_string()
     } else {
-        truncate_chars(answer, MAX_CARD_CHARS)
+        truncate_chars(&answer, MAX_CARD_CHARS)
     };
 
     let mut elements = vec![json!({
@@ -2186,7 +2190,7 @@ fn build_card(
             .rev()
             .take(6)
             .rev()
-            .map(|tool| format!("• {tool}"))
+            .map(|tool| format!("• {}", mask_emails(tool)))
             .collect();
         elements.push(json!({
             "tag": "markdown",
@@ -4085,5 +4089,584 @@ mod tests {
 
         assert!(bridge.can_run_admin_command("ou_user").await);
         assert_eq!(source.calls(), 0);
+    }
+
+    // ---- additional card contracts --------------------------------------
+
+    #[test]
+    fn card_payload_masks_raw_emails_end_to_end() {
+        // Port of the TS "renderCard emits no raw email anywhere in the
+        // payload" regression: Feishu's tenant audit rejects a card with an
+        // unmasked address, so the card boundary must deep-mask like
+        // `renderCard` does.
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "mail team@example.org and noreply@example.com".into(),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "git log --author=a@example.net" }),
+        });
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+
+        let card = build_card(&profile(), &view, "完成", Instant::now(), None);
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+
+        assert!(!payload.contains('@'), "{payload}");
+        assert!(payload.contains("team[at]example.org"), "{payload}");
+        assert!(payload.contains("noreply[at]example.com"), "{payload}");
+        assert!(payload.contains("a[at]example.net"), "{payload}");
+        for email in ["team@example.org", "noreply@example.com", "a@example.net"] {
+            assert!(!payload.contains(email), "{email} leaked: {payload}");
+        }
+    }
+
+    #[test]
+    fn card_status_distinguishes_running_done_and_failed() {
+        assert_eq!(card_status(&RunView::default()), "运行中");
+
+        let mut done = RunView::default();
+        done.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        assert_eq!(card_status(&done), "完成");
+        let text = serde_json::to_string(
+            build_card(&profile(), &done, card_status(&done), Instant::now(), None).as_value(),
+        )
+        .unwrap();
+        assert!(text.contains("完成"), "{text}");
+
+        let mut failed = RunView::default();
+        failed.apply(&AgentEvent::Error {
+            message: "boom".into(),
+            termination_reason: TerminationReason::Failed,
+        });
+        assert_eq!(card_status(&failed), "失败");
+        let text = serde_json::to_string(
+            build_card(
+                &profile(),
+                &failed,
+                card_status(&failed),
+                Instant::now(),
+                None,
+            )
+            .as_value(),
+        )
+        .unwrap();
+        assert!(text.contains("失败"), "{text}");
+    }
+
+    #[test]
+    fn card_tool_feed_keeps_the_latest_six_calls_in_order() {
+        let mut view = RunView::default();
+        for index in 1..=7 {
+            view.apply(&AgentEvent::ToolUse {
+                id: format!("t{index}"),
+                name: "Bash".into(),
+                input: json!({ "command": format!("step-{index}") }),
+            });
+        }
+        let card = build_card(&profile(), &view, "运行中", Instant::now(), None);
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+
+        // The oldest call falls out of the six-line window.
+        assert!(!payload.contains("step-1"), "{payload}");
+        let mut previous = 0;
+        for index in 2..=7 {
+            let marker = format!("step-{index}");
+            let position = payload.find(&marker).unwrap_or_else(|| {
+                panic!("{marker} missing from card: {payload}");
+            });
+            assert!(position > previous, "{marker} is out of order: {payload}");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn empty_finished_card_uses_the_placeholder_and_completed_summary() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        let card = build_card(&profile(), &view, card_status(&view), Instant::now(), None);
+
+        assert_eq!(
+            card.as_value()["body"]["elements"][0]["content"],
+            "…",
+            "empty answer should render the placeholder"
+        );
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+        assert!(payload.contains("完成"), "{payload}");
+    }
+
+    #[test]
+    fn card_keeps_local_paths_visible() {
+        // Port of the TS "keeps local paths in user-visible cards and text
+        // fallbacks" contract: cwd is not a redaction boundary.
+        let path = "/Users/example/private/customer/repo/secret.txt";
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: format!("I read {path}"),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: json!({ "file_path": path }),
+        });
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+
+        let payload = serde_json::to_string(
+            build_card(&profile(), &view, "完成", Instant::now(), None).as_value(),
+        )
+        .unwrap();
+        assert!(payload.contains(path), "{payload}");
+    }
+
+    // ---- additional command contracts -----------------------------------
+
+    #[tokio::test]
+    async fn workspace_cwd_creates_missing_directories_and_falls_back_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let default = root.path().join("workspace");
+
+        // A scope override that does not exist yet is created on demand.
+        let nested = root.path().join("client/nested");
+        bridge.workspaces.lock().await.set("oc_1", &nested).unwrap();
+        assert_eq!(bridge.workspace_cwd("oc_1").await, nested);
+        assert!(nested.is_dir());
+
+        // A path replaced by a file cannot be created; the run still gets a
+        // usable directory instead of failing or falling back to $HOME.
+        let occupied = root.path().join("occupied");
+        fs::write(&occupied, "not a directory").unwrap();
+        bridge
+            .workspaces
+            .lock()
+            .await
+            .set("oc_2", &occupied)
+            .unwrap();
+        let cwd = bridge.workspace_cwd("oc_2").await;
+        assert_eq!(cwd, default);
+        assert!(cwd.is_dir());
+    }
+
+    #[tokio::test]
+    async fn cd_command_canonicalizes_and_persists_the_scope_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        // Spaces are legal in a path and must survive the whitespace-split
+        // command parser.
+        let target = root.path().join("client work");
+        fs::create_dir_all(&target).unwrap();
+
+        let text = format!("/cd {}", target.display());
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_1", "user", &text), &text)
+            .await
+            .expect("handled");
+        assert!(reply.contains("已切换 cwd"), "{reply}");
+
+        let canonical = target.canonicalize().unwrap();
+        assert_eq!(
+            bridge
+                .workspaces
+                .lock()
+                .await
+                .cwd_for("oc_1")
+                .map(str::to_string),
+            Some(canonical.to_string_lossy().into_owned())
+        );
+
+        let relative = "/cd relative";
+        let reply = bridge
+            .handle_command(&message("om_2", "ou_1", "user", relative), relative)
+            .await
+            .expect("handled");
+        assert!(reply.contains("绝对路径"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn pwd_command_reports_the_scope_override_then_the_profile_default() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let default = root.path().join("workspace");
+
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_1", "user", "/pwd"), "/pwd")
+            .await
+            .expect("handled");
+        assert_eq!(reply, format!("当前 cwd：{}", default.display()));
+
+        let target = root.path().join("override");
+        bridge.workspaces.lock().await.set("oc_1", &target).unwrap();
+        let reply = bridge
+            .handle_command(&message("om_2", "ou_1", "user", "/pwd"), "/pwd")
+            .await
+            .expect("handled");
+        assert_eq!(reply, format!("当前 cwd：{}", target.display()));
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_implemented_fields_and_active_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let cwd = root.path().join("workspace");
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set("oc_1", "sess-123456789", &cwd.to_string_lossy())
+            .unwrap();
+
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_1", "user", "/status"), "/status")
+            .await
+            .expect("handled");
+        for expected in [
+            "profile: test",
+            "agent: Claude Code",
+            "app id: (未配置)",
+            "tenant: (未配置)",
+            "reply mode: markdown",
+            "session: 可恢复（sess-123…）",
+            "active run: no",
+            "active scopes: (无)",
+        ] {
+            assert!(reply.contains(expected), "{expected} missing: {reply}");
+        }
+        assert!(
+            reply.contains(&format!("cwd: {}", cwd.display())),
+            "{reply}"
+        );
+
+        // Active scopes are sorted and include non-IM run kinds that
+        // `/stop <scope>` can target.
+        let chat_run = tokio::spawn(std::future::pending::<()>());
+        let comment_run = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                "comment:abcdef".to_string(),
+                ActiveRun {
+                    id: 1,
+                    abort: comment_run.abort_handle(),
+                },
+            );
+            active.insert(
+                "oc_1".to_string(),
+                ActiveRun {
+                    id: 2,
+                    abort: chat_run.abort_handle(),
+                },
+            );
+        }
+        let reply = bridge
+            .handle_command(&message("om_2", "ou_1", "user", "/status"), "/status")
+            .await
+            .expect("handled");
+        assert!(reply.contains("active run: yes"), "{reply}");
+        assert!(
+            reply.contains("active scopes: comment:abcdef, oc_1"),
+            "{reply}"
+        );
+        chat_run.abort();
+        comment_run.abort();
+    }
+
+    #[tokio::test]
+    async fn reset_command_clears_only_the_current_scope_session() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let cwd = root.path().join("workspace").to_string_lossy().into_owned();
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set("oc_1", "sess-a", &cwd)
+            .unwrap();
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set("oc_2", "sess-b", &cwd)
+            .unwrap();
+
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_1", "user", "/reset"), "/reset")
+            .await
+            .expect("handled");
+        assert!(reply.contains("新会话"), "{reply}");
+        assert_eq!(bridge.resume_scope_session("oc_1", &cwd).await, None);
+        assert_eq!(
+            bridge.resume_scope_session("oc_2", &cwd).await.as_deref(),
+            Some("sess-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn help_advertises_only_implemented_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_1", "user", "/help"), "/help")
+            .await
+            .expect("handled");
+
+        for command in [
+            "/new", "/reset", "/cd", "/pwd", "/status", "/config", "/stop", "/meeting", "/help",
+        ] {
+            assert!(reply.contains(command), "{command} missing: {reply}");
+        }
+        for command in [
+            "/ws",
+            "/resume",
+            "/timeout",
+            "/ps",
+            "/exit",
+            "/doctor",
+            "/reconnect",
+            "/invite",
+            "/remove",
+        ] {
+            assert!(
+                !reply.contains(command),
+                "{command} is not implemented but is advertised: {reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_commands_are_left_for_the_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+
+        for text in ["/nope", "/ws", "hello"] {
+            assert!(
+                bridge
+                    .handle_command(&message("om_1", "ou_1", "user", text), text)
+                    .await
+                    .is_none(),
+                "{text} should fall through to the agent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_usage_errors_do_not_write_and_show_excludes_access_lists() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let admin = message("om_1", "ou_admin", "user", "");
+
+        for args in [
+            "set messageReply",
+            "set messageReply card extra",
+            "nope",
+            "set unknown x",
+        ] {
+            let reply = bridge.handle_config(&admin, args).await;
+            assert!(
+                reply.contains("用法") || reply.contains("未知配置项"),
+                "{args}: {reply}"
+            );
+        }
+        assert_eq!(
+            bridge.live_profile().message_reply(),
+            MessageReplyMode::Markdown
+        );
+
+        let shown = bridge.handle_config(&admin, "").await;
+        for hidden in ["allowed_users", "allowed_chats", "admins"] {
+            assert!(!shown.contains(hidden), "{hidden} leaked: {shown}");
+        }
+        assert!(shown.contains("messageReply: markdown"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn config_set_text_mode_stays_text_after_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let paths = AppPaths::resolve(root.path(), "test").unwrap();
+        let mut root_config = RootConfig {
+            active_profile: "test".into(),
+            ..RootConfig::default()
+        };
+        root_config.profiles.insert("test".into(), profile.clone());
+        larkline_core::store::save_root(&paths.config_file, &root_config).unwrap();
+        let bridge = test_bridge(root.path(), profile);
+        let admin = message("om_1", "ou_admin", "user", "");
+
+        let saved = bridge.handle_config(&admin, "set messageReply text").await;
+        assert!(saved.starts_with('✓'), "{saved}");
+        assert_eq!(
+            bridge.live_profile().message_reply(),
+            MessageReplyMode::Text,
+            "text must survive the live reload instead of being coerced back to markdown"
+        );
+
+        let persisted = larkline_core::store::load_root(&paths.config_file)
+            .unwrap()
+            .expect("root config");
+        let prefs = persisted
+            .profile("test")
+            .expect("profile")
+            .preferences
+            .clone()
+            .expect("preferences");
+        assert_eq!(prefs.message_reply, Some(MessageReplyMode::Text));
+        assert_eq!(prefs.message_reply_migrated, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stop_command_trims_an_explicit_target() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let bridge = test_bridge(root.path(), profile);
+
+        let text = "/stop   comment:missing  ";
+        let reply = bridge
+            .handle_command(&message("om_1", "ou_admin", "user", text), text)
+            .await
+            .expect("handled");
+        assert_eq!(reply, "未找到正在运行的任务：`comment:missing`。");
+    }
+
+    #[test]
+    fn scope_belongs_to_chat_accepts_chat_and_topic_scopes_only() {
+        assert!(scope_belongs_to_chat("oc_1", "oc_1"));
+        assert!(scope_belongs_to_chat("oc_1:omt_a", "oc_1"));
+        assert!(!scope_belongs_to_chat("oc_1:omt_a", "oc_2"));
+        assert!(!scope_belongs_to_chat("oc_2", "oc_1"));
+        assert!(!scope_belongs_to_chat("oc_10", "oc_1"));
+        assert!(!scope_belongs_to_chat("comment:abcdef", "oc_1"));
+    }
+
+    // ---- additional callback contracts ----------------------------------
+
+    #[tokio::test]
+    async fn legacy_claude_callback_markers_are_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+
+        let event = card_action_event(json!({
+            "__claude_cb": true,
+            "cmd": "stop"
+        }));
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsigned_bridge_button_values_are_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let token = bridge.tokens.sign("oc_1", "stop");
+        // The bridge marker is mandatory; a token alone is not a contract.
+        let event = card_action_event(json!({
+            "action": "stop",
+            "scope": "oc_1",
+            "token": token
+        }));
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn bridge_button_token_is_bound_to_the_action() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let token = bridge.tokens.sign("oc_1", "stop");
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "action": "resume",
+            "scope": "oc_1",
+            "token": token
+        }));
+        assert_eq!(
+            bridge.handle_card_action(&event).await.as_deref(),
+            Some("操作已失效，请重新发起。")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_callback_without_a_token_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": "",
+            "choice": "a"
+        }));
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_callback_without_chat_or_operator_context_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), callback_profile("s3cret"));
+        let token = sign_callback("s3cret", "nonce_no_context");
+
+        let mut without_chat = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": token,
+            "choice": "a"
+        }));
+        without_chat.card_context = None;
+        assert!(bridge.handle_card_action(&without_chat).await.is_none());
+
+        let mut without_operator = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": sign_callback("s3cret", "nonce_no_operator"),
+            "choice": "a"
+        }));
+        without_operator.operator.open_id = None;
+        assert!(bridge.handle_card_action(&without_operator).await.is_none());
+        assert!(take_batch(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_callback_is_dropped_for_a_denied_operator() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = callback_profile("s3cret");
+        profile.access = Some(Access {
+            allowed_users: vec!["ou_allowed".into()],
+            ..Access::default()
+        });
+        let bridge = test_bridge(root.path(), profile);
+        let token = sign_callback("s3cret", "nonce_denied_operator");
+
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "bridge_token": token,
+            "choice": "a"
+        }));
+        assert!(bridge.handle_card_action(&event).await.is_none());
+        assert!(
+            take_batch(&bridge).is_empty(),
+            "a denied click must never be queued for the agent"
+        );
     }
 }

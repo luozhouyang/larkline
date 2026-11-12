@@ -215,4 +215,20 @@ mod tests {
         assert_eq!(reply_route("oc_1:omt_a", None), ReplyRoute::Chat);
         assert_eq!(reply_route("oc_1:omt_a", Some("")), ReplyRoute::Chat);
     }
+
+    #[test]
+    fn topic_thread_ids_may_contain_colons() {
+        // `split_once(':')` keeps everything after the first colon as the
+        // thread id, so a thread id that itself contains a colon still routes
+        // as a threaded reply.
+        assert!(is_topic_scope("oc_1:omt_a:b"));
+        assert_eq!(
+            reply_route("oc_1:omt_a:b", Some("om_trigger")),
+            ReplyRoute::Thread {
+                parent_message_id: "om_trigger"
+            }
+        );
+        // The chat half must still look like a Feishu chat id.
+        assert!(!is_topic_scope("chat_1:omt_a"));
+    }
 }

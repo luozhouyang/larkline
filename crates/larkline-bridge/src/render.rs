@@ -357,6 +357,12 @@ mod tests {
         );
         assert!(interrupted.finished);
 
+        // `done` can itself carry the idle-timeout terminal (the TS
+        // `run-state-schema` contract maps it to `idle_timeout`).
+        let done_timeout = applied(&[done(TerminationReason::Timeout)]);
+        assert_eq!(done_timeout.termination, Some(TerminationReason::Timeout));
+        assert!(done_timeout.finished);
+
         let timed_out = applied(&[AgentEvent::Error {
             message: "run timed out".into(),
             termination_reason: TerminationReason::Timeout,
@@ -377,5 +383,143 @@ mod tests {
 
         assert!(view.best_answer().contains(path));
         assert_eq!(view.tools, vec![format!("Read: {path}")]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Additional fold contracts from the TS run-state / card suite.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn footer_reports_elapsed_tokens_tools_and_failures_in_order() {
+        let view = applied(&[
+            AgentEvent::Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                cached_input_tokens: None,
+                reasoning_output_tokens: None,
+                cost_usd: None,
+            },
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_result("tool-1", "/repo", false),
+            tool_use("tool-2", "Read", json!({ "file_path": "/missing.ts" })),
+            tool_result("tool-2", "ENOENT", true),
+        ]);
+
+        assert_eq!(
+            view.footer(std::time::Duration::from_millis(1_500)),
+            "1.5s · 10 in / 20 out · 2 tool call(s) · 1 failed"
+        );
+        // With no tokens or tools the footer is just the elapsed time.
+        assert_eq!(
+            applied(&[done(TerminationReason::Normal)]).footer(std::time::Duration::from_secs(2)),
+            "2.0s"
+        );
+    }
+
+    #[test]
+    fn tool_lines_truncate_long_details_with_a_single_ellipsis() {
+        let long = "a".repeat(100);
+        let view = applied(&[tool_use("tool-1", "Bash", json!({ "command": long }))]);
+
+        assert_eq!(view.tools, vec![format!("Bash: {}…", "a".repeat(80))]);
+    }
+
+    #[test]
+    fn tool_lines_prefer_command_then_path_then_file_path_then_the_name() {
+        let command = applied(&[tool_use(
+            "tool-1",
+            "Bash",
+            json!({ "command": "pwd", "path": "/p", "file_path": "/f" }),
+        )]);
+        assert_eq!(command.tools, vec!["Bash: pwd"]);
+
+        let path = applied(&[tool_use(
+            "tool-1",
+            "Read",
+            json!({ "path": "/p", "file_path": "/f" }),
+        )]);
+        assert_eq!(path.tools, vec!["Read: /p"]);
+
+        let file_path = applied(&[tool_use("tool-1", "Read", json!({ "file_path": "/f" }))]);
+        assert_eq!(file_path.tools, vec!["Read: /f"]);
+
+        let name_only = applied(&[tool_use("tool-1", "TodoWrite", json!({ "todos": [] }))]);
+        assert_eq!(name_only.tools, vec!["TodoWrite"]);
+    }
+
+    #[test]
+    fn system_and_done_events_keep_both_id_flavours() {
+        let system = applied(&[AgentEvent::System {
+            session_id: Some("sess-1".into()),
+            thread_id: Some("thread-1".into()),
+            cwd: None,
+            model: None,
+        }]);
+        assert_eq!(system.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(system.thread_id.as_deref(), Some("thread-1"));
+        // A System event is informational; it must not finish the view.
+        assert!(!system.finished);
+        assert_eq!(system.session_key(), Some("sess-1"));
+
+        let mut with_ids = applied(&[done(TerminationReason::Normal)]);
+        with_ids.apply(&AgentEvent::System {
+            session_id: None,
+            thread_id: Some("thread-only".into()),
+            cwd: None,
+            model: None,
+        });
+        assert_eq!(with_ids.session_key(), Some("thread-only"));
+    }
+
+    #[test]
+    fn session_key_prefers_the_session_id_over_the_thread_id() {
+        let view = applied(&[AgentEvent::System {
+            session_id: Some("sess".into()),
+            thread_id: Some("thread".into()),
+            cwd: None,
+            model: None,
+        }]);
+        assert_eq!(view.session_key(), Some("sess"));
+
+        let thread_only = applied(&[AgentEvent::System {
+            session_id: None,
+            thread_id: Some("thread".into()),
+            cwd: None,
+            model: None,
+        }]);
+        assert_eq!(thread_only.session_key(), Some("thread"));
+    }
+
+    #[test]
+    fn an_error_overrides_a_final_answer_for_the_visible_answer() {
+        let view = applied(&[
+            AgentEvent::FinalText {
+                content: "answer".into(),
+            },
+            AgentEvent::Error {
+                message: "boom".into(),
+                termination_reason: TerminationReason::Failed,
+            },
+        ]);
+
+        assert_eq!(view.final_answer.as_deref(), Some("answer"));
+        assert_eq!(view.best_answer(), "boom");
+        assert_eq!(view.error.as_deref(), Some("boom"));
+        assert_eq!(view.termination, Some(TerminationReason::Failed));
+        assert!(view.finished);
+    }
+
+    #[test]
+    fn usage_with_missing_numbers_is_zero() {
+        let view = applied(&[AgentEvent::Usage {
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_output_tokens: None,
+            cost_usd: None,
+        }]);
+        assert_eq!(view.input_tokens, 0);
+        assert_eq!(view.output_tokens, 0);
+        assert_eq!(view.footer(std::time::Duration::ZERO), "0.0s");
     }
 }

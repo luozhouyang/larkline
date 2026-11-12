@@ -793,4 +793,170 @@ mod tests {
         assert!(!rendered.contains('@'));
         assert!(rendered.contains("team[at]example.org"));
     }
+
+    // ---------------------------------------------------------------------
+    // Additional behaviour contracts from the TS text-renderer suite.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn uses_the_configured_idle_timeout_minutes_in_the_notice() {
+        // `markIdleTimeout(state, 10)` in the TS snapshot test.
+        let view = applied(&[text("partial"), done(TerminationReason::Timeout)]);
+        let rendered = render_text(
+            &view,
+            TextRenderOptions {
+                idle_timeout_minutes: 10,
+                ..TextRenderOptions::default()
+            },
+        );
+
+        assert_eq!(rendered, "partial\n\n_⏱ 10 分钟无响应,已自动终止_");
+    }
+
+    #[test]
+    fn orders_reasoning_answer_tools_then_the_running_footer() {
+        let view = applied(&[
+            thinking("plan"),
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_result("tool-1", "/repo", false),
+            text("Answer"),
+        ]);
+        let rendered = render_text(&view, TextRenderOptions::default().with_reasoning(true));
+
+        assert_eq!(
+            rendered,
+            "🧠 **思考过程**\n> plan\n\nAnswer\n\n> **Bash** — pwd\n\n_✍️ 正在输出…_"
+        );
+        let sections = [
+            "🧠 **思考过程**",
+            "Answer",
+            "> **Bash** — pwd",
+            "_✍️ 正在输出…_",
+        ];
+        let mut previous = 0;
+        for section in sections {
+            let position = rendered.find(section).expect(section);
+            assert!(position >= previous, "{section} is out of order");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn keeps_every_tool_summary_in_call_order() {
+        let view = applied(&[
+            text("done"),
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_use("tool-2", "Read", json!({ "file_path": "/repo/a.ts" })),
+            tool_use("tool-3", "Edit", json!({ "file_path": "/repo/a.ts" })),
+            done(TerminationReason::Normal),
+        ]);
+
+        assert_eq!(
+            render_text(&view, TextRenderOptions::default()),
+            "done\n\n> **Bash** — pwd\n\n> **Read** — /repo/a.ts\n\n> **Edit** — /repo/a.ts"
+        );
+    }
+
+    #[test]
+    fn renders_tool_lines_for_a_finished_tool_only_run() {
+        let view = applied(&[
+            tool_use("tool-1", "Bash", json!({ "command": "pwd" })),
+            tool_result("tool-1", "/repo", false),
+            done(TerminationReason::Normal),
+        ]);
+
+        assert_eq!(
+            render_text(&view, TextRenderOptions::default()),
+            "> **Bash** — pwd"
+        );
+    }
+
+    #[test]
+    fn truncates_on_character_boundaries_not_bytes() {
+        let view = applied(&[text("你好世界再见"), done(TerminationReason::Normal)]);
+        let rendered = render_text(
+            &view,
+            TextRenderOptions {
+                max_chars: 4,
+                ..TextRenderOptions::default()
+            },
+        );
+
+        assert_eq!(rendered, "你好世界\n\n…（内容过长已截断）");
+        assert!(!rendered.contains("再见"));
+    }
+
+    #[test]
+    fn masks_emails_before_truncating_so_a_cut_never_leaks_an_address() {
+        let view = applied(&[text("x@example.com"), done(TerminationReason::Normal)]);
+        let rendered = render_text(
+            &view,
+            TextRenderOptions {
+                max_chars: 3,
+                ..TextRenderOptions::default()
+            },
+        );
+
+        // Masking first turns `x@example.com` into `x[at]example.com`; the
+        // retained prefix therefore cannot end in a raw `@`.
+        assert_eq!(rendered, "x[a\n\n…（内容过长已截断）");
+        assert!(!rendered.contains('@'));
+    }
+
+    #[test]
+    fn plain_mode_terminal_notices_have_no_markdown_markup() {
+        let interrupted = applied(&[text("partial"), done(TerminationReason::Interrupted)]);
+        assert_eq!(
+            render_text(&interrupted, TextRenderOptions::plain()),
+            "partial\n\n⏹ 已被中断"
+        );
+
+        let timed_out = applied(&[
+            text("partial"),
+            error("run timed out", TerminationReason::Timeout),
+        ]);
+        assert_eq!(
+            render_text(
+                &timed_out,
+                TextRenderOptions {
+                    idle_timeout_minutes: 15,
+                    ..TextRenderOptions::plain()
+                }
+            ),
+            "partial\n\n⏱ 15 分钟无响应,已自动终止"
+        );
+
+        let failed = applied(&[error("process failed", TerminationReason::Failed)]);
+        assert_eq!(
+            render_text(&failed, TextRenderOptions::plain()),
+            "⚠️ agent 失败:process failed"
+        );
+    }
+
+    #[test]
+    fn interrupted_and_timed_out_win_over_the_error_message() {
+        // TS run-state maps an `error` event with these reasons to the
+        // interrupted / idle_timeout terminal, hiding `errorMsg`.
+        let interrupted = applied(&[
+            text("partial"),
+            error("boom", TerminationReason::Interrupted),
+        ]);
+        assert_eq!(
+            render_text(&interrupted, TextRenderOptions::default()),
+            "partial\n\n_⏹ 已被中断_"
+        );
+
+        let timed_out = applied(&[text("partial"), error("boom", TerminationReason::Timeout)]);
+        assert_eq!(
+            render_text(
+                &timed_out,
+                TextRenderOptions {
+                    idle_timeout_minutes: 3,
+                    ..TextRenderOptions::default()
+                }
+            ),
+            "partial\n\n_⏱ 3 分钟无响应,已自动终止_"
+        );
+        assert!(!render_text(&timed_out, TextRenderOptions::default()).contains("boom"));
+    }
 }
