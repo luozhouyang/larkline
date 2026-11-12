@@ -27,7 +27,7 @@
 //! half to be a Feishu chat id (`oc_…`).
 
 use lark_channel::Card;
-use lark_channel::message::MessageId;
+use lark_channel::message::{MessageId, Recipient};
 use larkline_lark::{Channel, StreamingCard};
 
 /// Where one outbound reply should go.
@@ -98,6 +98,56 @@ pub(crate) async fn send_text(
                         "thread reply failed; falling back to a top-level message"
                     );
                     channel.send_text(chat_id, text).await
+                }
+            }
+        }
+    }
+}
+
+/// Send a native markdown (`post`) reply through the route selected by
+/// [`reply_route`].
+///
+/// `MessageReplyMode::Markdown` uses this for its final answer; a threaded
+/// reply that the API rejects falls back to a top-level chat message, mirroring
+/// [`send_text`].
+pub(crate) async fn send_markdown(
+    channel: &Channel,
+    scope: &str,
+    chat_id: &str,
+    source_message_id: Option<&str>,
+    markdown: impl Into<String>,
+) -> larkline_lark::LarkResult<MessageId> {
+    let markdown = markdown.into();
+    match reply_route(scope, source_message_id) {
+        ReplyRoute::Chat => {
+            channel
+                .sender()
+                .markdown_message(Recipient::Chat(chat_id.to_owned()), markdown)
+                .send()
+                .await
+        }
+        ReplyRoute::Thread { parent_message_id } => {
+            let parent = MessageId(parent_message_id.to_owned());
+            match channel
+                .sender()
+                .markdown_reply(parent, markdown.clone())
+                .reply_in_thread(true)
+                .send()
+                .await
+            {
+                Ok(id) => Ok(id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        chat = %chat_id,
+                        parent = %parent_message_id,
+                        "thread markdown reply failed; falling back to a top-level message"
+                    );
+                    channel
+                        .sender()
+                        .markdown_message(Recipient::Chat(chat_id.to_owned()), markdown)
+                        .send()
+                        .await
                 }
             }
         }

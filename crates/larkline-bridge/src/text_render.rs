@@ -19,13 +19,13 @@ use crate::render::RunView;
 /// TS `DEFAULT_REASONING_MAX_CHARS` in `text-renderer.ts`.
 pub const DEFAULT_REASONING_MAX_CHARS: usize = 3_000;
 
-/// Default cap for one IM text message. Feishu rejects very large text
-/// payloads; the previous Rust text fallback also used 4000 characters.
+/// Sanity cap for one rendered message.
 ///
-/// The TS text renderer has no overall cap (it relies on the caller/SDK), so
-/// this is a Rust-side guard. The suffix matches the bridge's existing
-/// [`crate::run`] truncation notice.
-pub const DEFAULT_TEXT_MAX_CHARS: usize = 4_000;
+/// This is deliberately far above the old 4000-character bridge cap: a run's
+/// final answer is delivered whole. It only guards against a runaway agent
+/// producing an unbounded string (and a payload the IM API would reject); the
+/// TypeScript renderer itself has no cap.
+pub const DEFAULT_TEXT_MAX_CHARS: usize = 100_000;
 
 const TRUNCATION_SUFFIX: &str = "\n\n…（内容过长已截断）";
 
@@ -110,6 +110,20 @@ impl TextRenderOptions {
 /// as the answer; like TS, it is rendered as a terminal notice after the
 /// partial answer.
 pub fn render_text(view: &RunView, opts: TextRenderOptions) -> String {
+    render_text_impl(view, opts, true)
+}
+
+/// Like [`render_text`], but **without** the running status footer.
+///
+/// The TS card-lifetime pause frame renders the run state with `footer: null`
+/// so a paused card does not claim the process is still updating. Terminal
+/// notices are still rendered; it is only the "正在思考/调用工具/输出" line
+/// that is dropped.
+pub fn render_text_without_footer(view: &RunView, opts: TextRenderOptions) -> String {
+    render_text_impl(view, opts, false)
+}
+
+fn render_text_impl(view: &RunView, opts: TextRenderOptions, include_footer: bool) -> String {
     let markdown = opts.format == TextFormat::Markdown;
     let mut parts: Vec<String> = Vec::new();
 
@@ -137,8 +151,10 @@ pub fn render_text(view: &RunView, opts: TextRenderOptions) -> String {
 
     if let Some(notice) = terminal_notice(view, opts.idle_timeout_minutes, markdown) {
         parts.push(notice);
-    } else if let Some(footer) = footer_line(view, markdown) {
-        parts.push(footer);
+    } else if include_footer {
+        if let Some(footer) = footer_line(view, markdown) {
+            parts.push(footer);
+        }
     }
 
     // Masking happens before truncation so a cut can never expose a partial
@@ -711,6 +727,40 @@ mod tests {
         assert_eq!(
             render_text(&applied(&[text("Answer")]), TextRenderOptions::default()),
             "Answer\n\n_✍️ 正在输出…_"
+        );
+    }
+
+    #[test]
+    fn keeps_a_long_final_answer_whole() {
+        // The old bridge capped replies at 4000 characters. The final answer
+        // must now be delivered in full (only a 100k sanity cap remains).
+        let answer = "a".repeat(9_000);
+        let view = applied(&[text(&answer), done(TerminationReason::Normal)]);
+
+        assert_eq!(render_text(&view, TextRenderOptions::default()), answer);
+    }
+
+    #[test]
+    fn include_footer_false_drops_the_running_status_but_keeps_terminal_notices() {
+        let running = applied(&[text("partial")]);
+        assert_eq!(
+            render_text_without_footer(&running, TextRenderOptions::default()),
+            "partial"
+        );
+
+        let interrupted = applied(&[text("partial"), done(TerminationReason::Interrupted)]);
+        assert_eq!(
+            render_text_without_footer(&interrupted, TextRenderOptions::default()),
+            "partial\n\n_⏹ 已被中断_"
+        );
+    }
+
+    #[test]
+    fn interrupted_text_reply_keeps_the_partial_answer() {
+        let view = applied(&[text("partial answer"), done(TerminationReason::Interrupted)]);
+        assert_eq!(
+            render_text(&view, TextRenderOptions::plain()),
+            "partial answer\n\n⏹ 已被中断"
         );
     }
 

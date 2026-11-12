@@ -61,19 +61,28 @@ Ported:
 - bridge system prompt extraction, executable discovery
 - `lark-channel` wiring: send text/card, update card, tenant-token REST client
 - run flow: inbound message -> policy -> debounced queue -> CardKit streaming
-  card -> agent process -> event translation -> throttled updates -> session
-  persistence
+  progress message (`card` = rich card, `markdown` = one-element streaming
+  markdown card, `text` = final message only) -> agent process -> event
+  translation -> throttled updates -> session persistence; at the 8.5-minute
+  card safe age the progress frame is paused once (streaming off, no button,
+  pause note) and the full answer is sent separately when the run finishes
 - session store (resume only from the same cwd), stable per-scope sessions
 - topic scoping: sessions, workspace overrides, pending queues and live runs
   use `chatId:threadId` for topic-group messages (port of `src/bot/scope.ts`);
   replies go back inside the triggering topic
 - agent process runner: stdin prompt, stderr drain, kill-on-drop, 30 minute cap
-- `/stop` aborts the run and drops its queued batch, via command or card button;
-  `/stop <scope>` (admin) also aborts comment and meeting runs by their ids
+- `/stop` cooperatively interrupts the run and drops its queued batch, via
+  command or card button: the agent child is killed, the partial answer is
+  kept and the card is finalized with `⏹ 已被中断` (no live button); a 5-second
+  abort watchdog covers a hung finalize. `/stop <scope>` (admin) also aborts
+  comment and meeting runs by their ids
 - workspace store per scope (`/cd`, `/pwd`), working reaction, pending queue
   with the 600 ms merge window
 - in-chat commands: `/new`, `/reset`, `/cd`, `/pwd`, `/status`, `/config`,
-  `/meeting`, `/stop`, `/stop <scope>`, `/help`
+  `/meeting`, `/stop`, `/stop <scope>`, `/help`; `/cd` (admin) expands `~`,
+  interrupts the live run and resets the session; `/new` interrupts before
+  clearing, and a per-scope run generation stops a finishing run from
+  re-saving the cleared session
 - global agent concurrency cap: port of `src/bot/process-pool.ts` backed by
   `preferences.maxConcurrentRuns` (default 10, clamped 1-50), enforced across
   IM, comment and meeting runs and resizable at runtime with
@@ -121,7 +130,9 @@ primitive so it can be picked up without re-deriving the design.
    parsed but unused.
 4. **Presentation parity** — no COT process messages, no card thinking panel
    and no reasoning bubble. The text renderer honors `reasoningDisplay: inline`
-   only; `auto`, `off` and `bubble` have no COT client behind them.
+   only; `auto`, `off` and `bubble` have no COT client behind them. `markdown`
+   mode is a one-element streaming card with tool summaries from the text
+   renderer but no tool panel, footer element or stop button.
 5. **Attachments** — inbound images and files are not downloaded. `AgentSpec`
    always carries an empty image list, so the agent receives text prompts only.
 6. **Topic-scope edge cases** — topic scoping is implemented from the event's

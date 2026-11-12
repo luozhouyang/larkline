@@ -84,6 +84,27 @@ impl RunView {
         }
     }
 
+    /// Mark a still-running view as interrupted.
+    ///
+    /// This is the cooperative-stop equivalent of the agent reporting
+    /// `terminationReason: interrupted`: the partial answer is preserved and
+    /// no error is recorded (an error would replace the answer in
+    /// [`RunView::best_answer`] and render a "失败" card). A view that already
+    /// reached a terminal state keeps that real terminal, mirroring the TS
+    /// `markInterrupted` guard.
+    pub fn mark_interrupted(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.termination = Some(TerminationReason::Interrupted);
+        self.finished = true;
+    }
+
+    /// Whether the run ended because the user stopped it.
+    pub fn is_interrupted(&self) -> bool {
+        self.termination == Some(TerminationReason::Interrupted)
+    }
+
     /// The text to show as the answer.
     pub fn best_answer(&self) -> &str {
         if let Some(error) = &self.error {
@@ -241,6 +262,13 @@ mod tests {
         AgentEvent::Done {
             session_id: None,
             thread_id: None,
+            termination_reason: reason,
+        }
+    }
+
+    fn error(message: &str, reason: TerminationReason) -> AgentEvent {
+        AgentEvent::Error {
+            message: message.into(),
             termination_reason: reason,
         }
     }
@@ -507,6 +535,29 @@ mod tests {
         assert_eq!(view.error.as_deref(), Some("boom"));
         assert_eq!(view.termination, Some(TerminationReason::Failed));
         assert!(view.finished);
+    }
+
+    #[test]
+    fn mark_interrupted_keeps_the_partial_answer_and_a_real_terminal_wins() {
+        let mut partial = applied(&[text("partial answer")]);
+        partial.mark_interrupted();
+        assert_eq!(partial.best_answer(), "partial answer");
+        assert_eq!(partial.termination, Some(TerminationReason::Interrupted));
+        assert!(partial.is_interrupted());
+        assert!(partial.finished);
+
+        // A normal completion that already landed is authoritative.
+        let mut done = applied(&[text("answer"), done(TerminationReason::Normal)]);
+        done.mark_interrupted();
+        assert_eq!(done.termination, Some(TerminationReason::Normal));
+        assert!(!done.is_interrupted());
+        assert_eq!(done.best_answer(), "answer");
+
+        // An error terminal is not overwritten either.
+        let mut failed = applied(&[error("boom", TerminationReason::Failed)]);
+        failed.mark_interrupted();
+        assert_eq!(failed.termination, Some(TerminationReason::Failed));
+        assert_eq!(failed.best_answer(), "boom");
     }
 
     #[test]

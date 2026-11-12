@@ -1,18 +1,20 @@
 //! In-chat commands that the Rust bridge previously did not implement.
 //!
-//! This module is a port of the missing handlers in `src/commands/index.ts`.
-//! The existing Rust commands (`/new`, `/reset`, `/cd`, `/pwd`, `/status`,
-//! `/config`, `/stop`, `/meeting`, `/help`) stay in [`crate::run`]; this module
-//! owns the commands that were missing from the port:
+//! This module is a port of the handlers in `src/commands/index.ts` that need
+//! the command dispatcher (admin gating / session resets), plus the commands
+//! that were missing from the original port. `/pwd`, `/status`, `/config`,
+//! `/stop`, `/meeting` and `/help` stay in [`crate::run`].
 //!
 //! | command | TypeScript handler | Rust behaviour |
 //! | --- | --- | --- |
 //! | `/account` | `handleAccount` | current app/profile; credential changes are guidance only (no CardKit form) |
+//! | `/cd` | `handleCd` | admin-only; expands `~`, interrupts the live run, resets the scope session |
 //! | `/doc` | `handleDoc` | exact TS reply |
 //! | `/doctor` | `handleDoctor` | in-process self-check summary; no agent echo probe |
 //! | `/exit` | `handleExit` | CLI guidance (`larkline kill` / `larkline stop`); never fakes a shutdown |
 //! | `/invite` | `handleInvite` | access-list mutation under the config lock; `all group` is guidance only |
 //! | `/ps` | `handlePs` | live run scopes and queued batches from bridge state |
+//! | `/new`, `/reset` | `handleNew` | interrupts the live run, bumps the scope session generation, clears the session |
 //! | `/reconnect` | `handleReconnect` | guidance (the SDK exposes no reconnect handle) |
 //! | `/remove` | `handleRemove` | access-list mutation under the config lock |
 //! | `/resume` | `handleResume` | `/resume use <id>` (and `/resume <id>`) persist a session for the scope |
@@ -30,8 +32,9 @@
 //!
 //! The TypeScript dispatcher marks `/account`, `/config`, `/ps`, `/exit`,
 //! `/reconnect`, `/doctor`, `/cd`, `/ws`, `/invite`, `/remove` and `/meeting`
-//! as admin commands. The already-ported handlers keep their own gates; this
-//! module gates its admin-only commands with the same
+//! as admin commands. The handlers that stayed in `run.rs` keep their own
+//! gates; this module gates its admin-only commands (including `/cd`) with the
+//! same
 //! [`crate::owner::can_run_admin_command`] check used by `/meeting` and
 //! `/config set` (configured admins, the legacy allowed-users fallback while
 //! the admin list is empty, and the runtime app owner). `/timeout` is open to
@@ -153,6 +156,8 @@ pub enum CommandEffect {
         session_id: String,
         cwd: String,
     },
+    /// `/new` / `/reset` interrupted the live run and cleared the session.
+    SessionReset { scope: String },
     /// `/timeout …` wrote (`Some`) or cleared (`None`) an override.
     TimeoutOverride { scope: String, minutes: Option<u64> },
     /// `/ws use` moved a scope to another cwd and reset its session.
@@ -204,10 +209,12 @@ pub async fn handle(
 
     let outcome = match canonical {
         "/account" => handle_account(bridge, args).await,
+        "/cd" => handle_cd(bridge, message, args).await,
         "/doc" => CommandOutcome::reply(DOC_REPLY),
         "/doctor" => handle_doctor(bridge, message).await,
         "/exit" => handle_exit(args),
         "/invite" => handle_invite(bridge, message, args).await,
+        "/new" | "/reset" => handle_new(bridge, message).await,
         "/ps" => handle_ps(bridge),
         "/reconnect" => handle_reconnect(args),
         "/remove" => handle_remove(bridge, message, args).await,
@@ -224,13 +231,16 @@ fn is_owned_command(command: &str) -> bool {
     matches!(
         command,
         "/account"
+            | "/cd"
             | "/doc"
             | "/doctor"
             | "/exit"
             | "/invite"
+            | "/new"
             | "/ps"
             | "/reconnect"
             | "/remove"
+            | "/reset"
             | "/resume"
             | "/timeout"
             | "/ws"
@@ -241,8 +251,72 @@ fn is_owned_command(command: &str) -> bool {
 fn is_admin_command(command: &str) -> bool {
     matches!(
         command,
-        "/account" | "/doctor" | "/exit" | "/invite" | "/ps" | "/reconnect" | "/remove" | "/ws"
+        "/account"
+            | "/cd"
+            | "/doctor"
+            | "/exit"
+            | "/invite"
+            | "/ps"
+            | "/reconnect"
+            | "/remove"
+            | "/ws"
     )
+}
+
+// ---------------------------------------------------------------------------
+// /cd and /new
+// ---------------------------------------------------------------------------
+
+/// `/cd <absolute|~/subpath>`: admin-gated cwd change that resets the session.
+///
+/// Port of the TS `handleCd`: validate first (never interrupt on a bad path),
+/// interrupt the live run, persist the scope cwd, clear the session, then reply
+/// with the TS text including "session 已重置".
+async fn handle_cd(
+    bridge: &Arc<Bridge>,
+    message: &NormalizedMessage,
+    args: &str,
+) -> CommandOutcome {
+    let scope = scope_key(message);
+    let path = match validate_cd_target(args) {
+        Ok(path) => path,
+        Err(reply) => return CommandOutcome::reply(reply),
+    };
+    bridge.interrupt_scope(&scope);
+    if let Err(err) = bridge.workspace_store().lock().await.set(&scope, &path) {
+        return CommandOutcome::reply(format!("保存工作目录失败：{err}"));
+    }
+    let mut reply = format!("✓ 已切换 cwd 到 `{}`\n（session 已重置）", path.display());
+    if let Err(err) = bridge.reset_scope_session(&scope).await {
+        reply.push_str(&format!("\n⚠️ session 重置失败：{err}"));
+    }
+    CommandOutcome::applied(
+        reply,
+        CommandEffect::WorkspaceCwd {
+            scope,
+            cwd: path.display().to_string(),
+        },
+    )
+}
+
+/// `/new` / `/reset`: interrupt the live run before clearing the session.
+///
+/// The run generation is bumped before the clear, so the finishing run cannot
+/// save the session it just lost (`save_scope_session_if_current`).
+async fn handle_new(bridge: &Arc<Bridge>, message: &NormalizedMessage) -> CommandOutcome {
+    let scope = scope_key(message);
+    let was_running = bridge.interrupt_scope(&scope);
+    match bridge.reset_scope_session(&scope).await {
+        Ok(()) => CommandOutcome::applied(
+            if was_running {
+                "已中断当前任务并开始新会话。"
+            } else {
+                "已开始新会话。"
+            },
+            CommandEffect::SessionReset { scope },
+        ),
+        Err(err) => CommandOutcome::reply(format!("重置失败：{err}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1066,9 @@ async fn apply_resume(
     // the resumed one. Queued messages stay queued (TS interrupts the run
     // without cancelling its pending batch).
     bridge.interrupt_scope(&scope);
+    // Any finishing run from before this resume must not overwrite the
+    // explicitly chosen session.
+    bridge.bump_scope_generation(&scope);
     if let Err(err) = bridge.sessions.lock().await.set(&scope, &session_id, &cwd) {
         return CommandOutcome::reply(format!("保存会话失败：{err}"));
     }
@@ -1406,7 +1483,7 @@ async fn use_workspace(
         "✓ 已切换到 `{name}` ({})\n（session 已重置）",
         canonical.display()
     );
-    if let Err(err) = bridge.sessions.lock().await.clear(&scope) {
+    if let Err(err) = bridge.reset_scope_session(&scope).await {
         return CommandOutcome::applied(
             format!("{reply}\n⚠️ session 重置失败：{err}"),
             CommandEffect::WorkspaceCwd {
@@ -1516,6 +1593,7 @@ fn scoped_workspace_key(profile: &str, owner: Option<&str>, scope: &str, name: &
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
     use std::time::Duration;
 
@@ -2201,6 +2279,127 @@ mod tests {
         )
         .await;
         assert_eq!(outcome.reply, RESUME_APPLIED_REPLY);
+    }
+
+    #[tokio::test]
+    async fn cd_is_admin_gated_and_resets_the_scope_session() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), admin_profile());
+        let cwd = root.path().join("old-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let target = root.path().join("new-cwd");
+        fs::create_dir_all(&target).unwrap();
+        let old_cwd = cwd.to_string_lossy().into_owned();
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set("oc_1", "sess-old", &old_cwd)
+            .unwrap();
+
+        // A live run is interrupted before the cwd/session swap.
+        let live = bridge.spawn_tracked("oc_1", std::future::pending::<()>());
+        let text = format!("/cd {}", target.display());
+        let outcome = dispatch(&bridge, &group(&text), &text).await;
+
+        let canonical = target.canonicalize().unwrap();
+        assert!(
+            outcome.reply.contains("session 已重置"),
+            "{}",
+            outcome.reply
+        );
+        assert!(
+            outcome
+                .reply
+                .contains(&format!("`{}`", canonical.display())),
+            "{}",
+            outcome.reply
+        );
+        match outcome.effect {
+            CommandEffect::WorkspaceCwd { ref scope, ref cwd } => {
+                assert_eq!(scope, "oc_1");
+                assert_eq!(cwd, &canonical.to_string_lossy());
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+        assert_eq!(
+            bridge
+                .workspace_store()
+                .lock()
+                .await
+                .cwd_for("oc_1")
+                .map(str::to_string),
+            Some(canonical.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .resume_for("oc_1", &canonical.to_string_lossy()),
+            None,
+            "the cwd swap must reset the session"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), live)
+            .await
+            .expect("interrupted run finishes")
+            .expect_err("interrupt aborts a tracked run");
+        assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cd_denies_non_admins_before_touching_state() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("admin-only");
+        fs::create_dir_all(&target).unwrap();
+        assert_admin_denied(root.path(), &format!("/cd {}", target.display())).await;
+    }
+
+    #[tokio::test]
+    async fn new_interrupts_the_run_and_a_late_save_cannot_resurrect_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), plain_profile());
+        let cwd = root.path().join("new-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        bridge
+            .sessions
+            .lock()
+            .await
+            .set("oc_1", "sess-live", &cwd)
+            .unwrap();
+        let generation = bridge.scope_generation("oc_1");
+
+        let live = bridge.spawn_tracked("oc_1", std::future::pending::<()>());
+        let outcome = dispatch(&bridge, &group("/new"), "/new").await;
+        assert_eq!(outcome.reply, "已中断当前任务并开始新会话。");
+        assert!(matches!(
+            outcome.effect,
+            CommandEffect::SessionReset { ref scope } if scope == "oc_1"
+        ));
+        let error = tokio::time::timeout(Duration::from_secs(2), live)
+            .await
+            .expect("interrupted run finishes")
+            .expect_err("interrupt aborts a tracked run");
+        assert!(error.is_cancelled());
+        assert_eq!(bridge.sessions.lock().await.resume_for("oc_1", &cwd), None);
+
+        // A run that started before `/new` finishes later: its save is
+        // rejected because the scope generation moved on.
+        assert!(
+            !bridge
+                .save_scope_session_if_current("oc_1", "sess-late", &cwd, generation)
+                .await
+        );
+        assert_eq!(
+            bridge.sessions.lock().await.resume_for("oc_1", &cwd),
+            None,
+            "a finished run must not resurrect the cleared session"
+        );
+
+        // No live run: the plain TS reply.
+        let idle = dispatch(&bridge, &group("/new"), "/new").await;
+        assert_eq!(idle.reply, "已开始新会话。");
     }
 
     #[tokio::test]

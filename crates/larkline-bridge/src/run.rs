@@ -13,7 +13,10 @@
 //! messages arriving inside it merge into one agent run. While that run is
 //! live the scope is blocked, so later messages keep accumulating instead of
 //! spawning a competing agent; when the run ends the window re-arms and the
-//! next batch starts. `/stop` aborts the live run and drops the queued batch.
+//! next batch starts. `/stop` interrupts the live run and drops the queued
+//! batch. The run flow itself (`run_batch`) is cooperative: the stop signal,
+//! the 30-minute deadline and the 8.5-minute progress-card pause are all waited
+//! on with `tokio::select!`, and an interrupt always reaches `finalize`.
 //!
 //! ## `/stop` targeting
 //!
@@ -32,11 +35,13 @@
 //!   calls the same `stop_scope`, so it aborts the same runs (IM runs have the
 //!   only cards; comment/meeting runs have no stop button of their own).
 //!
-//! The abort path is shared: the task handle is aborted, the run guard removes
-//! the `active` entry, the future drops its global run permit, the agent child
-//! is killed by `kill_on_drop`, and the working reaction is removed by its
-//! guard. Comment and meeting runs acquire their permit inside the run future,
-//! so cancellation releases it just like normal completion.
+//! IM runs are interrupted cooperatively: `stop_scope` sets the run's
+//! [`RunInterrupt`], the loop kills the agent child, keeps the partial answer,
+//! finalizes the progress card with `⏹ 已被中断` and the run guard then removes
+//! the `active` entry and releases the global permit. A 5-second abort watchdog
+//! covers a hung finalize. Comment and meeting runs keep the immediate abort
+//! path (their own loops own the agent); their guard and permit cleanup is
+//! unchanged.
 //!
 //! A second, global limit caps how many agent runs may be live at once across
 //! every scope ([`crate::run_limit`], the port of `src/bot/process-pool.ts`).
@@ -48,7 +53,7 @@
 //! with a bounded wait instead. Per-scope serialization is unchanged: one run
 //! per scope, always.
 //!
-//! `/config set` and `/meeting` use a shared admin gate
+//! `/config set`, `/cd`, `/ws` and `/meeting` use a shared admin gate
 //! ([`crate::owner::can_run_admin_command`]): configured admins (or the legacy
 //! allowed-users fallback) plus the runtime app owner resolved from
 //! `application/v6/applications/<app_id>`. The owner lookup fails closed for
@@ -61,7 +66,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -95,7 +102,9 @@ use crate::policy;
 use crate::render::RunView;
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
-use crate::text_render::{TextFormat, TextRenderOptions, mask_emails, render_text};
+use crate::text_render::{
+    TextFormat, TextRenderOptions, mask_emails, render_text, render_text_without_footer,
+};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
@@ -110,11 +119,29 @@ pub(crate) const RUN_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// User-visible result when [`RUN_SLOT_WAIT`] expires.
 pub(crate) const RUN_SLOT_TIMEOUT_REPLY: &str =
     "⏳ 当前并发任务已达上限，等待空闲运行槽超时，请稍后重试。";
-/// Cards over this many characters are truncated (CardKit caps JSON size).
-const MAX_CARD_CHARS: usize = 8_000;
+/// Sanity cap for the markdown element rendered into a card.
+///
+/// This is **not** the old 8000-character display cap: the full answer is
+/// rendered, and the cap only guards CardKit's ~30KB card/element payload for a
+/// runaway agent. 100k characters is a last-resort sanity guard, not a display
+/// limit; normal answers (tens of thousands of characters) fit.
+const MAX_CARD_ELEMENT_CHARS: usize = 100_000;
 /// Quiet window before a batch of messages starts a run. The TypeScript bridge
 /// uses the same 600ms (`DEBOUNCE_MS` in `src/bot/channel.ts`).
 const DEBOUNCE: Duration = Duration::from_millis(600);
+/// Last-resort abort if a cooperatively interrupted run has not finished its
+/// finalize within this window. Normal `/stop` always goes through finalize;
+/// this only covers a hung agent kill or card write.
+#[cfg(not(test))]
+const STOP_WATCHDOG: Duration = Duration::from_secs(5);
+/// Unit tests must not sleep for the production watchdog window; the behaviour
+/// (abort only while the same run is still registered) is identical.
+#[cfg(test)]
+const STOP_WATCHDOG: Duration = Duration::from_millis(50);
+/// Final frame written when a progress card reaches [`CARD_SAFE_AGE`] while the
+/// run is still live (port of TS `STREAM_CARD_PAUSE_NOTE`). The answer is then
+/// delivered as a separate message/card when the run finishes.
+const STREAM_PAUSED_NOTE: &str = "⏳ 任务仍在运行，过程消息已停止更新；完成后会单独发送最终答案。";
 /// Upper bound on messages queued per scope.
 ///
 /// The TypeScript queue is unbounded; this is a Rust-only memory guard for a
@@ -215,6 +242,11 @@ pub struct Bridge {
     /// Id for the next run; guards [`Bridge::finish_run`] against a late guard
     /// from an aborted run clearing its successor's block.
     next_run_id: AtomicU64,
+    /// Per-scope session generation. `/new`, `/cd` and other session resets
+    /// bump it, and a finishing run only persists its session when the
+    /// generation it started with is still current. This stops a slow run from
+    /// resurrecting the session `/new` just cleared.
+    run_generations: StdMutex<HashMap<String, u64>>,
     /// In-meeting agent runtime; `Some` only while `extra.meeting.enabled` is
     /// on and [`Bridge::start_meeting`] ran inside a Tokio runtime.
     meeting: StdMutex<Option<MeetingRuntime>>,
@@ -237,6 +269,147 @@ struct MeetingRuntime {
 struct ActiveRun {
     id: u64,
     abort: AbortHandle,
+    /// Cooperative stop signal for runs driven by [`Bridge::run_batch`].
+    ///
+    /// `None` for tracked runs (comment / meeting) that own their own loop and
+    /// cancellation semantics; those keep the historic immediate abort.
+    interrupt: Option<Arc<RunInterrupt>>,
+}
+
+/// Per-run cooperative stop signal.
+///
+/// `/stop` and the card stop button flip the flag and wake the run loop, so
+/// the run can kill its agent child, keep the partial answer and run
+/// [`Bridge::finalize`] (terminal card / partial text). The abort handle stays
+/// as a watchdog for a finalize that does not make progress.
+#[derive(Debug, Default)]
+struct RunInterrupt {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl RunInterrupt {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        // `notify_one` stores a permit when the run loop has not registered a
+        // waiter yet, so a stop that races the wait preamble can never be lost
+        // (`notify_waiters` would only wake already-registered waiters).
+        self.notify.notify_one();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Resolve once an interrupt was requested (including before this call).
+    async fn wait(&self) {
+        let notified = self.notify.notified();
+        if self.is_requested() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// How the progress message is rendered for a reply mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardFormat {
+    /// Full interactive card: answer, tool panel, footer and stop button.
+    Rich,
+    /// Lightweight streaming markdown card: one markdown element, no controls.
+    Markdown,
+}
+
+impl CardFormat {
+    fn for_reply_mode(mode: MessageReplyMode) -> Option<Self> {
+        match mode {
+            MessageReplyMode::Card => Some(Self::Rich),
+            MessageReplyMode::Markdown => Some(Self::Markdown),
+            MessageReplyMode::Text => None,
+        }
+    }
+}
+
+/// One tick of the agent run loop.
+#[derive(Debug)]
+enum LoopTick {
+    /// A batch of translated agent events.
+    Events(Vec<AgentEvent>),
+    /// The agent closed stdout.
+    Eof,
+    /// The user asked to stop the run.
+    Interrupted,
+    /// The 8.5-minute progress-card safe age elapsed.
+    PauseElapsed,
+    /// [`RUN_TIMEOUT`] elapsed.
+    TimedOut,
+}
+
+/// The agent event source the run loop drains.
+///
+/// [`AgentProcess`] is the production implementation; tests use a fake source
+/// to exercise the cooperative interrupt and pause decisions without an agent
+/// binary or a network.
+#[async_trait]
+trait EventSource: Send {
+    async fn next_events(&mut self) -> Option<Vec<AgentEvent>>;
+}
+
+#[async_trait]
+impl EventSource for AgentProcess {
+    async fn next_events(&mut self) -> Option<Vec<AgentEvent>> {
+        AgentProcess::next_events(self).await
+    }
+}
+
+/// Wait for the next event while honouring interrupt, run deadline and the
+/// progress-card pause deadline.
+///
+/// `pending` is the pinned `next_events()` future, created by the caller and
+/// kept across pause ticks. It must not be recreated when the pause timer wins:
+/// dropping a partially-read line would lose part of a JSON event at the
+/// 8.5-minute boundary.
+///
+/// `pause_deadline` is `None` once the pause frame was written, so a paused run
+/// never writes a second frame. `biased` makes a pending stop win over a stream
+/// event that arrived in the same poll.
+async fn next_tick(
+    pending: &mut Pin<Box<dyn Future<Output = Option<Vec<AgentEvent>>> + Send + '_>>,
+    interrupt: &RunInterrupt,
+    deadline: tokio::time::Instant,
+    pause_deadline: Option<tokio::time::Instant>,
+) -> LoopTick {
+    if interrupt.is_requested() {
+        return LoopTick::Interrupted;
+    }
+    let events = async {
+        match tokio::time::timeout_at(deadline, &mut *pending).await {
+            Err(_) => LoopTick::TimedOut,
+            Ok(None) => LoopTick::Eof,
+            Ok(Some(events)) => LoopTick::Events(events),
+        }
+    };
+    match pause_deadline {
+        Some(pause_at) => {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => LoopTick::Interrupted,
+                _ = tokio::time::sleep_until(pause_at) => LoopTick::PauseElapsed,
+                tick = events => tick,
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => LoopTick::Interrupted,
+                tick = events => tick,
+            }
+        }
+    }
 }
 
 /// A batch that owns a global run slot and may be spawned.
@@ -368,6 +541,7 @@ impl Bridge {
             pending_wakeup: Notify::new(),
             pending_driver_started: AtomicBool::new(false),
             next_run_id: AtomicU64::new(1),
+            run_generations: StdMutex::new(HashMap::new()),
             meeting: StdMutex::new(None),
         })
     }
@@ -525,11 +699,14 @@ impl Bridge {
         lock(&self.pending).queued_scopes()
     }
 
-    /// Abort the run registered under `scope`, without touching its pending
+    /// Interrupt the run registered under `scope`, without touching its pending
     /// queue. `/resume` uses this: the next message should start in the
     /// resumed session, but messages already queued in this scope stay.
-    pub(crate) fn interrupt_scope(&self, scope: &str) -> bool {
-        self.abort_run(scope)
+    ///
+    /// Cooperative for IM runs (they finalize the current card); comment and
+    /// meeting runs keep their immediate abort.
+    pub(crate) fn interrupt_scope(self: &Arc<Self>, scope: &str) -> bool {
+        self.request_stop(scope).0
     }
 
     /// Last-known runtime-owner cache state, without triggering a lookup.
@@ -890,6 +1067,12 @@ impl Bridge {
         let (start, ready) = tokio::sync::oneshot::channel();
         let bridge = Arc::clone(self);
         let task_scope = scope.clone();
+        let interrupt = RunInterrupt::new();
+        let run_interrupt = Arc::clone(&interrupt);
+        // Snapshot the session generation while the run is still atomically
+        // registered: a `/new` that lands after this point bumps the
+        // generation and the finishing run must not re-save its session.
+        let generation = self.scope_generation(&scope);
         let handle = tokio::spawn(async move {
             let _ = ready.await;
             let _guard = RunGuard {
@@ -898,7 +1081,7 @@ impl Bridge {
                 id,
                 permit: Some(permit),
             };
-            if let Err(err) = bridge.run_batch(batch).await {
+            if let Err(err) = bridge.run_batch(batch, run_interrupt, generation).await {
                 tracing::error!(error = %err, "agent run failed");
             }
         });
@@ -910,6 +1093,7 @@ impl Bridge {
             ActiveRun {
                 id,
                 abort: handle.abort_handle(),
+                interrupt: Some(interrupt),
             },
         );
         drop(active);
@@ -954,6 +1138,9 @@ impl Bridge {
             ActiveRun {
                 id,
                 abort: handle.abort_handle(),
+                // Comment/meeting runs own their agent loop and keep the
+                // historic immediate abort; there is no shared loop to signal.
+                interrupt: None,
             },
         ) {
             // Callers serialize per scope (the comment guard / meeting map),
@@ -992,17 +1179,95 @@ impl Bridge {
         self.pending_wakeup.notify_one();
     }
 
-    /// Abort a live run. The caller must hold the pending lock (lock order is
-    /// pending -> active).
-    fn abort_run(&self, scope: &str) -> bool {
-        let mut active = lock(&self.active);
-        match active.remove(scope) {
-            Some(run) => {
-                run.abort.abort();
-                true
+    /// Abort or cooperatively interrupt a live run.
+    ///
+    /// Runs driven by [`Bridge::run_batch`] carry a [`RunInterrupt`]: the flag
+    /// is set and the run loop finalizes normally. Comment/meeting runs have no
+    /// shared loop, so they keep the immediate abort semantics.
+    ///
+    /// The caller must hold the pending lock (lock order is pending -> active)
+    /// when it also wants the queue cleanup to be atomic with registration.
+    /// Returns `(stopped, cooperative)`.
+    fn request_stop(self: &Arc<Self>, scope: &str) -> (bool, bool) {
+        let active = lock(&self.active);
+        let Some((id, interrupt)) = active
+            .get(scope)
+            .filter(|run| !run.abort.is_finished())
+            .map(|run| (run.id, run.interrupt.clone()))
+        else {
+            return (false, false);
+        };
+        drop(active);
+        match interrupt {
+            Some(signal) => {
+                signal.request();
+                self.spawn_stop_watchdog(scope.to_string(), id);
+                (true, true)
             }
-            None => false,
+            None => {
+                let mut active = lock(&self.active);
+                // Re-check the id: a run may have finished and a successor
+                // registered between the decision above and this lock.
+                if active.get(scope).is_some_and(|run| run.id == id) {
+                    if let Some(run) = active.remove(scope) {
+                        run.abort.abort();
+                    }
+                }
+                (true, false)
+            }
         }
+    }
+
+    /// Last-resort abort for a cooperative stop.
+    ///
+    /// Fires only when the same run is still registered after
+    /// [`STOP_WATCHDOG`] — a normal stop has already been removed by its
+    /// [`RunGuard`] and must not be touched. This exists for a hung agent kill
+    /// or card write during `finalize`, not for the normal path.
+    fn spawn_stop_watchdog(self: &Arc<Self>, scope: String, id: u64) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(scope, "no tokio runtime to arm the stop watchdog");
+            return;
+        };
+        let bridge = Arc::clone(self);
+        runtime.spawn(async move {
+            tokio::time::sleep(STOP_WATCHDOG).await;
+            let active = lock(&bridge.active);
+            if let Some(run) = active.get(&scope) {
+                if run.id == id && !run.abort.is_finished() {
+                    tracing::warn!(
+                        scope,
+                        run_id = id,
+                        "cooperative stop did not finalize in time; aborting the run"
+                    );
+                    run.abort.abort();
+                }
+            }
+        });
+    }
+
+    /// Scope-level session generation, bumped by `/new`, `/cd` and other
+    /// session resets. A run captures it at claim time and only saves a session
+    /// while the generation is unchanged.
+    pub(crate) fn scope_generation(&self, scope: &str) -> u64 {
+        lock(&self.run_generations).get(scope).copied().unwrap_or(0)
+    }
+
+    /// Invalidate session saves from runs that started before a reset.
+    pub(crate) fn bump_scope_generation(&self, scope: &str) {
+        let mut generations = lock(&self.run_generations);
+        let next = generations.get(scope).copied().unwrap_or(0) + 1;
+        generations.insert(scope.to_string(), next);
+    }
+
+    /// Clear the scope's session and invalidate any in-flight run's save.
+    pub(crate) async fn reset_scope_session(&self, scope: &str) -> Result<(), String> {
+        self.bump_scope_generation(scope);
+        self.sessions
+            .lock()
+            .await
+            .clear(scope)
+            .map_err(|err| err.to_string())
     }
 
     /// `/stop` and the card stop button: abort the run, drop its queued
@@ -1012,13 +1277,19 @@ impl Bridge {
     /// under its chat/topic scope, a comment run under `comment:<hash>`, or a
     /// meeting run under `meeting:<id>`. The pending-queue cleanup is a no-op
     /// for scopes that have no queue.
-    pub(crate) fn stop_scope(&self, scope: &str) -> (bool, usize) {
+    pub(crate) fn stop_scope(self: &Arc<Self>, scope: &str) -> (bool, usize) {
         // Holding the pending lock makes stop atomic with respect to a driver
         // that is registering a new batch (same lock order as `start_due_batch`).
         let mut pending = lock(&self.pending);
-        let stopped = self.abort_run(scope);
+        let (stopped, cooperative) = self.request_stop(scope);
         let dropped = pending.cancel(scope).len();
-        pending.unblock(scope, Instant::now());
+        // A cooperative run keeps the scope blocked until its `finalize` ends
+        // (`RunGuard::finish_run` unblocks it). Unblocking here would let a new
+        // batch replace the active entry while the stopped run is still
+        // finalizing, which would also disarm its last-resort watchdog.
+        if !cooperative {
+            pending.unblock(scope, Instant::now());
+        }
         drop(pending);
         self.pending_wakeup.notify_one();
         (stopped, dropped)
@@ -1117,19 +1388,14 @@ impl Bridge {
                     format!("未找到正在运行的任务：`{target}`。")
                 })
             }
-            "/new" | "/reset" => match self.sessions.lock().await.clear(&scope) {
-                Ok(()) => Some("已开启新会话。".to_string()),
-                Err(err) => Some(format!("重置失败：{err}")),
-            },
-            "/cd" => Some(self.handle_cd(&scope, args).await),
             "/pwd" => Some(self.handle_pwd(&scope).await),
             "/status" => Some(self.handle_status(&scope).await),
             "/meeting" => Some(self.handle_meeting_command(message, args).await),
             "/config" => Some(self.handle_config(message, args).await),
             "/help" => Some(
                 "可用命令：\n\
-                 /new 或 /reset 开启新会话\n\
-                 /cd <绝对路径> 切换工作目录\n\
+                 /new 或 /reset 中断当前任务并开启新会话\n\
+                 /cd <绝对路径|~/子路径> 切换工作目录（需管理员，会重置 session）\n\
                  /pwd 显示当前工作目录\n\
                  /ws [list|save <name>|use <name>|remove <name>] 命名工作目录别名（/work 同义，需管理员）\n\
                  /resume [use <session-id>] 查看/恢复会话\n\
@@ -1155,18 +1421,6 @@ impl Bridge {
     }
 
     /// `/cd <absolute path>`: canonicalize and persist a per-scope cwd.
-    async fn handle_cd(&self, scope: &str, args: &str) -> String {
-        let path = match validate_cd_target(args) {
-            Ok(path) => path,
-            Err(reply) => return reply,
-        };
-        let mut workspaces = self.workspaces.lock().await;
-        match workspaces.set(scope, &path) {
-            Ok(()) => format!("✓ 已切换 cwd 到 {}", path.display()),
-            Err(err) => format!("保存工作目录失败：{err}"),
-        }
-    }
-
     /// `/pwd`: the effective cwd for this scope.
     async fn handle_pwd(&self, scope: &str) -> String {
         let workspaces = self.workspaces.lock().await;
@@ -1497,13 +1751,47 @@ impl Bridge {
     }
 
     /// Persist the agent's session id under the run scope.
+    #[cfg(test)]
     async fn save_scope_session(&self, scope: &str, session_key: &str, cwd: &str) {
         if let Err(err) = self.sessions.lock().await.set(scope, session_key, cwd) {
             tracing::warn!(error = %err, "cannot persist session");
         }
     }
 
-    async fn run_batch(self: Arc<Self>, batch: Vec<NormalizedMessage>) -> anyhow::Result<()> {
+    /// Persist a run's session only while its scope generation is current.
+    ///
+    /// `/new` (and `/cd`, `/ws use`, `/resume`) bumps the generation so a run
+    /// that was already streaming when the user reset the session cannot write
+    /// it back afterwards. Returns whether the session was saved.
+    pub(crate) async fn save_scope_session_if_current(
+        &self,
+        scope: &str,
+        session_key: &str,
+        cwd: &str,
+        generation: u64,
+    ) -> bool {
+        if self.scope_generation(scope) != generation {
+            tracing::info!(
+                scope,
+                generation,
+                current = self.scope_generation(scope),
+                "dropping a session save from a run superseded by a session reset"
+            );
+            return false;
+        }
+        if let Err(err) = self.sessions.lock().await.set(scope, session_key, cwd) {
+            tracing::warn!(error = %err, "cannot persist session");
+            return false;
+        }
+        true
+    }
+
+    async fn run_batch(
+        self: Arc<Self>,
+        batch: Vec<NormalizedMessage>,
+        interrupt: Arc<RunInterrupt>,
+        generation: u64,
+    ) -> anyhow::Result<()> {
         let Some(first) = batch.first() else {
             return Ok(());
         };
@@ -1533,13 +1821,13 @@ impl Bridge {
         let prompt = build_agent_prompt(&context, &batch_user_input(&batch));
         let profile = self.live_profile();
         let reply_mode = profile.message_reply();
-        let use_card = reply_mode != MessageReplyMode::Text;
+        let card_format = CardFormat::for_reply_mode(reply_mode);
 
         let mut view = RunView::default();
         let mut streaming: Option<StreamingCard> = None;
         let mut message_id: Option<String> = None;
-        if use_card {
-            let card = build_card(&profile, &view, "启动中", started, None);
+        if let Some(format) = card_format {
+            let card = self.initial_card(&scope, &profile, &view, started, format);
             // Prefer a CardKit 2.0 streaming entity: every later update is one
             // whole-card PUT with its own sequence. If either the entity or the
             // reference message cannot be created, the plain message path below
@@ -1610,6 +1898,7 @@ impl Bridge {
                     &view,
                     reply_mode,
                     started,
+                    false,
                 )
                 .await;
                 return Err(err);
@@ -1617,10 +1906,30 @@ impl Bridge {
         };
 
         let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        // CardKit closes a streaming entity around ten minutes; pause the
+        // progress card at the crate's safe age and deliver the answer
+        // separately when the run finishes.
+        let pause_deadline =
+            card_format.map(|_| tokio::time::Instant::from_std(started + CARD_SAFE_AGE));
+        let mut paused = false;
         let mut last_update = Instant::now();
+        // Pinned read future, kept alive across pause ticks so an in-flight
+        // line is never cancelled mid-read (see `next_tick`).
+        let mut pending = EventSource::next_events(&mut process);
         loop {
-            match tokio::time::timeout_at(deadline, process.next_events()).await {
-                Err(_) => {
+            let pause_at = if paused { None } else { pause_deadline };
+            match next_tick(&mut pending, &interrupt, deadline, pause_at).await {
+                LoopTick::Interrupted => {
+                    // Cooperative stop: drop the read (and its borrow) before
+                    // killing the child. The partial answer stays in `view`
+                    // and the run still goes through `finalize`.
+                    drop(pending);
+                    process.kill().await;
+                    view.mark_interrupted();
+                    break;
+                }
+                LoopTick::TimedOut => {
+                    drop(pending);
                     process.kill().await;
                     view.apply(&AgentEvent::Error {
                         message: "运行超时（30 分钟），已终止。".to_string(),
@@ -1628,36 +1937,73 @@ impl Bridge {
                     });
                     break;
                 }
-                Ok(None) => {
+                LoopTick::PauseElapsed => {
+                    paused = true;
+                    if let Some(format) = card_format {
+                        self.pause_progress(
+                            &scope,
+                            &mut streaming,
+                            message_id.as_deref(),
+                            &view,
+                            started,
+                            format,
+                        )
+                        .await;
+                    }
+                    last_update = Instant::now();
+                    // `pending` is untouched and is awaited again next tick.
+                }
+                LoopTick::Eof => {
+                    drop(pending);
                     for event in process.finish().await {
                         view.apply(&event);
                     }
                     break;
                 }
-                Ok(Some(events)) => {
+                LoopTick::Events(events) => {
+                    drop(pending);
                     for event in &events {
                         view.apply(event);
                     }
                     if view.finished {
                         break;
                     }
-                    if use_card && last_update.elapsed() >= CARD_UPDATE_INTERVAL {
-                        self.refresh_card(
-                            &scope,
-                            &mut streaming,
-                            message_id.as_deref(),
-                            &view,
-                            started,
-                        )
-                        .await;
-                        last_update = Instant::now();
+                    if let Some(format) = card_format {
+                        if !paused && last_update.elapsed() >= CARD_UPDATE_INTERVAL {
+                            self.refresh_card(
+                                &scope,
+                                &mut streaming,
+                                message_id.as_deref(),
+                                &view,
+                                started,
+                                format,
+                            )
+                            .await;
+                            last_update = Instant::now();
+                        }
                     }
+                    pending = EventSource::next_events(&mut process);
                 }
             }
         }
 
+        // EOF without a protocol terminal is still a normal finish (TS
+        // `finalizeIfRunning`); an interrupted/timed-out view already has its
+        // terminal and must keep it.
+        if !view.finished {
+            view.apply(&AgentEvent::Done {
+                session_id: None,
+                thread_id: None,
+                termination_reason: TerminationReason::Normal,
+            });
+        }
+
         if let Some(key) = view.session_key().map(str::to_string) {
-            self.save_scope_session(&scope, &key, &cwd_str).await;
+            // Saves from runs that started before a `/new` (or another session
+            // reset) are dropped, so a slow finish cannot resurrect the session
+            // the user just cleared.
+            self.save_scope_session_if_current(&scope, &key, &cwd_str, generation)
+                .await;
         }
 
         self.finalize(
@@ -1669,6 +2015,7 @@ impl Bridge {
             &view,
             reply_mode,
             started,
+            paused,
         )
         .await;
         Ok(())
@@ -1687,58 +2034,156 @@ impl Bridge {
         view: &RunView,
         reply_mode: MessageReplyMode,
         started: Instant,
+        paused: bool,
     ) {
-        let use_card = reply_mode != MessageReplyMode::Text;
-        if use_card {
+        let profile = self.live_profile();
+        // Text mode has no progress message at all: post the full rendered
+        // answer (including terminal notices such as "⏹ 已被中断").
+        if reply_mode == MessageReplyMode::Text {
+            let body = text_final_body(&profile, view);
+            if let Err(err) =
+                reply::send_text(&self.channel, scope, chat_id, source_message_id, body).await
+            {
+                tracing::warn!(error = %err, chat = %chat_id, "cannot send final answer");
+            }
+            return;
+        }
+
+        let format = CardFormat::for_reply_mode(reply_mode).expect("card reply mode");
+        // The card became a paused frame at the safe age: it must not be
+        // updated again, and the answer goes out as its own message/card.
+        if !paused {
             if let Some(handle) = streaming.as_mut() {
-                // The final frame is a whole-card PUT with streaming mode off
-                // and no stop button (build_card omits the button when `stop`
-                // is None). set_card applies the CARD_SAFE_AGE guard; when the
-                // window is gone or the card is dead the answer goes out as a
-                // separate message instead.
-                let card = self.final_card(view, started);
-                match handle.set_card(&card).await {
-                    Ok(true) => return,
-                    Ok(false) => {
-                        tracing::debug!(
-                            "streaming card window closed; sending the answer as a message"
-                        );
+                match format {
+                    CardFormat::Markdown => {
+                        let body = markdown_final_body(&profile, view);
+                        match handle.finish(&body).await {
+                            Ok(true) => return,
+                            Ok(false) => {
+                                tracing::debug!(
+                                    "streaming markdown window closed; trying the message-level final frame"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "final streaming markdown update failed; trying the message-level final frame"
+                                );
+                            }
+                        }
+                        if self
+                            .update_card(scope, message_id, view, started, format)
+                            .await
+                        {
+                            return;
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "final streaming card update failed; sending the answer as a message"
-                        );
+                    CardFormat::Rich => {
+                        // Whole-card PUT with streaming mode off and no stop
+                        // button (build_card omits the button when `stop` is
+                        // None). set_card applies the CARD_SAFE_AGE guard.
+                        let card = self.final_card(view, started);
+                        match handle.set_card(&card).await {
+                            Ok(true) => return,
+                            Ok(false) => {
+                                tracing::debug!(
+                                    "streaming card window closed; trying the message-level final frame"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "final streaming card update failed; trying the message-level final frame"
+                                );
+                            }
+                        }
+                        if self
+                            .update_card(scope, message_id, view, started, format)
+                            .await
+                        {
+                            return;
+                        }
                     }
                 }
             } else if started.elapsed() < CARD_SAFE_AGE {
-                if let Some(message_id) = message_id {
-                    self.update_card(scope, Some(message_id), view, started)
-                        .await;
+                if self
+                    .update_card(scope, message_id, view, started, format)
+                    .await
+                {
                     return;
                 }
             }
         }
-        let body = if reply_mode == MessageReplyMode::Text {
-            // Text replies get the full TS renderer: final answer selection,
-            // reasoning/tool summaries according to the profile, terminal
-            // notices, email masking and the IM length guard.
-            text_final_body(&self.live_profile(), view)
-        } else {
-            // Markdown still uses the card path above; this is only the
-            // message fallback when the card can no longer be updated. Mask
-            // emails for the same tenant-audit reason as the card renderer.
-            let answer = mask_emails(view.best_answer().trim());
-            if answer.is_empty() {
-                "（没有输出）".to_string()
-            } else {
-                truncate_chars(&answer, 4_000)
+
+        match format {
+            CardFormat::Markdown => {
+                // Full answer, no 4k bridge cap; markdown keeps the TS text
+                // renderer's formatting (reasoning/tools per profile).
+                let body = markdown_final_body(&profile, view);
+                if let Err(err) =
+                    reply::send_markdown(&self.channel, scope, chat_id, source_message_id, body)
+                        .await
+                {
+                    tracing::warn!(error = %err, chat = %chat_id, "cannot send final markdown answer");
+                }
             }
-        };
-        if let Err(err) =
-            reply::send_text(&self.channel, scope, chat_id, source_message_id, body).await
-        {
-            tracing::warn!(error = %err, chat = %chat_id, "cannot send final answer");
+            CardFormat::Rich => {
+                // Post-expiry (or card-dead) delivery: the paused/failed card
+                // keeps its note, and the complete answer goes out as a fresh
+                // card. A card send failure falls back to markdown rather than
+                // losing the answer.
+                let card = self.final_card(view, started);
+                match reply::send_card(&self.channel, scope, chat_id, source_message_id, &card)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            chat = %chat_id,
+                            "cannot send final card; falling back to a markdown message"
+                        );
+                        let body = markdown_final_body(&profile, view);
+                        if let Err(err) = reply::send_markdown(
+                            &self.channel,
+                            scope,
+                            chat_id,
+                            source_message_id,
+                            body,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %err, chat = %chat_id, "cannot send final answer");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The progress card created before the agent starts.
+    fn initial_card(
+        &self,
+        scope: &str,
+        profile: &ProfileConfig,
+        view: &RunView,
+        started: Instant,
+        format: CardFormat,
+    ) -> lark_channel::Card {
+        match format {
+            // The rich card is interactive from the first frame: a live run
+            // always has its signed stop button (TS renders it while running).
+            CardFormat::Rich => {
+                let token = (!view.finished).then(|| self.tokens.sign(scope, "stop"));
+                build_card(
+                    profile,
+                    view,
+                    "启动中",
+                    started,
+                    token.as_deref().map(|token| (scope, token)),
+                )
+            }
+            CardFormat::Markdown => build_markdown_card(profile, view, false),
         }
     }
 
@@ -1755,11 +2200,14 @@ impl Bridge {
         message_id: Option<&str>,
         view: &RunView,
         started: Instant,
+        format: CardFormat,
     ) {
         if let Some(handle) = streaming.as_mut() {
             if handle.is_live() {
-                let card = larkline_lark::enable_streaming(self.live_card(scope, view, started))
-                    .expect("builder-produced run card is valid");
+                let card = larkline_lark::enable_streaming(
+                    self.live_card_for(scope, view, started, format),
+                )
+                .expect("builder-produced run card is valid");
                 match handle.set_card(&card).await {
                     Ok(true) => return,
                     Ok(false) => {
@@ -1777,28 +2225,87 @@ impl Bridge {
             }
         }
         if started.elapsed() < CARD_SAFE_AGE {
-            self.update_card(scope, message_id, view, started).await;
+            self.update_card(scope, message_id, view, started, format)
+                .await;
         }
     }
 
-    /// Card for a running frame (streaming mode stays on, signed stop button).
+    /// Write the one-time paused frame at [`CARD_SAFE_AGE`].
     ///
-    /// The stop token is bound to the run scope, not just the chat, so the
-    /// button in a topic run aborts that topic's run and leaves sibling topics
-    /// alone.
-    fn live_card(&self, scope: &str, view: &RunView, started: Instant) -> lark_channel::Card {
-        let token = if view.finished {
-            None
-        } else {
-            Some(self.tokens.sign(scope, "stop"))
+    /// The run continues; after this frame the progress message is never
+    /// touched again, and the full answer is sent separately by `finalize`.
+    async fn pause_progress(
+        &self,
+        scope: &str,
+        streaming: &mut Option<StreamingCard>,
+        message_id: Option<&str>,
+        view: &RunView,
+        started: Instant,
+        format: CardFormat,
+    ) {
+        let profile = self.live_profile();
+        let card = match format {
+            CardFormat::Rich => paused_rich_card(&profile, view, started),
+            CardFormat::Markdown => build_markdown_card(&profile, view, true),
         };
-        build_card(
-            &self.live_profile(),
-            view,
-            card_status(view),
-            started,
-            token.as_deref().map(|token| (scope, token)),
-        )
+        let mut written = false;
+        if let Some(handle) = streaming.as_mut() {
+            match handle.set_card(&card).await {
+                Ok(true) => written = true,
+                Ok(false) => tracing::debug!(
+                    "streaming card window closed before the pause frame was written"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "paused card update failed; trying the message-level update"
+                ),
+            }
+        }
+        if !written {
+            if let Some(message_id) = message_id {
+                if let Err(err) = self.channel.update_card_message(message_id, &card).await {
+                    tracing::warn!(error = %err, "paused message-card update failed");
+                }
+            }
+        }
+        tracing::info!(
+            scope,
+            format = ?format,
+            "progress card paused at the card safe age"
+        );
+    }
+
+    /// Card for a running frame.
+    ///
+    /// The rich card carries a signed stop button whose token is bound to the
+    /// run scope (not just the chat), so a topic run's button aborts that
+    /// topic and leaves sibling topics alone. The markdown card is a single
+    /// markdown element and intentionally has no controls.
+    fn live_card_for(
+        &self,
+        scope: &str,
+        view: &RunView,
+        started: Instant,
+        format: CardFormat,
+    ) -> lark_channel::Card {
+        let profile = self.live_profile();
+        match format {
+            CardFormat::Rich => {
+                let token = if view.finished {
+                    None
+                } else {
+                    Some(self.tokens.sign(scope, "stop"))
+                };
+                build_card(
+                    &profile,
+                    view,
+                    card_status(view),
+                    started,
+                    token.as_deref().map(|token| (scope, token)),
+                )
+            }
+            CardFormat::Markdown => build_markdown_card(&profile, view, false),
+        }
     }
 
     /// Card for the last frame (streaming mode off, no stop button).
@@ -1812,13 +2319,18 @@ impl Bridge {
         message_id: Option<&str>,
         view: &RunView,
         started: Instant,
-    ) {
+        format: CardFormat,
+    ) -> bool {
         let Some(message_id) = message_id else {
-            return;
+            return false;
         };
-        let card = self.live_card(scope, view, started);
-        if let Err(err) = self.channel.update_card_message(message_id, &card).await {
-            tracing::warn!(error = %err, "card update failed");
+        let card = self.live_card_for(scope, view, started, format);
+        match self.channel.update_card_message(message_id, &card).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "card update failed");
+                false
+            }
         }
     }
 
@@ -2227,7 +2739,12 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Build the card for the current view.
+/// Build the rich card for the current view.
+///
+/// Mirrors the TS `renderCard` shape the port can express: answer, optional
+/// tool panel, terminal note, optional signed stop button and a status footer.
+/// The final/paused frames explicitly set `streaming_mode: false`; the live
+/// CardKit path re-enables streaming with `enable_streaming`.
 fn build_card(
     profile: &ProfileConfig,
     view: &RunView,
@@ -2239,19 +2756,17 @@ fn build_card(
     // mask at this boundary exactly like `renderCard`/`deepMaskEmails` in TS.
     // Mask before truncating: a cut can then never expose a raw address.
     let answer = mask_emails(view.best_answer().trim());
-    let body = if answer.is_empty() {
-        "…".to_string()
-    } else {
-        truncate_chars(&answer, MAX_CARD_CHARS)
-    };
 
-    let mut elements = vec![json!({
-        "tag": "markdown",
-        "content": body,
-        // Stable id so CardKit can also stream just the answer element later;
-        // the run flow currently uses whole-card updates.
-        "element_id": STREAMING_ELEMENT_ID,
-    })];
+    let mut elements = Vec::new();
+    if !answer.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": truncate_chars(&answer, MAX_CARD_ELEMENT_CHARS),
+            // Stable id so CardKit can also stream just the answer element later;
+            // the run flow currently uses whole-card updates.
+            "element_id": STREAMING_ELEMENT_ID,
+        }));
+    }
     // `/config set showToolCalls false` hides the tool feed from cards, like
     // the TypeScript card renderer.
     if profile.show_tool_calls() && !view.tools.is_empty() {
@@ -2267,6 +2782,14 @@ fn build_card(
             "tag": "markdown",
             "content": format!("**工具**\n{}", tools.join("\n"))
         }));
+    }
+    // TS terminal notes: interruptions get an explicit marker instead of
+    // freezing on the last running frame, and an empty clean finish gets the
+    // "no content" note (the old bridge used a bare "…" placeholder).
+    if view.is_interrupted() {
+        elements.push(notation("_⏹ 已被中断_"));
+    } else if view.finished && answer.is_empty() {
+        elements.push(notation("_（未返回内容）_"));
     }
     if let Some((scope, token)) = stop {
         elements.push(json!({
@@ -2297,28 +2820,138 @@ fn build_card(
         }]
     }));
 
-    let summary = if answer.is_empty() {
-        format!("{} · {}", profile.agent_kind.display_name(), status)
-    } else {
-        truncate_chars(answer.lines().next().unwrap_or_default(), 80)
-    };
+    let summary = card_summary(view, status);
     let value = json!({
         "schema": "2.0",
-        "config": { "update_multi": true, "summary": { "content": summary } },
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": summary }
+        },
         "body": { "elements": elements }
     });
     lark_channel::Card::from_value(value).expect("run card is valid")
 }
 
+/// Lightweight markdown progress card (`MessageReplyMode::Markdown`).
+///
+/// A single markdown element rendered by [`render_text`]: no tool panel, no
+/// footer element and no stop button. `paused` renders the one-time 8.5-minute
+/// pause frame (footer removed, pause note appended) and finalizes streaming.
+fn build_markdown_card(
+    profile: &ProfileConfig,
+    view: &RunView,
+    paused: bool,
+) -> lark_channel::Card {
+    let options = markdown_render_options(profile);
+    let mut body = if paused {
+        render_text_without_footer(view, options)
+    } else {
+        render_text(view, options)
+    };
+    if paused {
+        body = append_pause_note(body);
+    }
+    if body.trim().is_empty() {
+        body = "（没有输出）".to_string();
+    }
+    let body = truncate_chars(&body, MAX_CARD_ELEMENT_CHARS);
+    let summary = if paused {
+        "仍在运行".to_string()
+    } else {
+        card_summary(view, card_status(view))
+    };
+    let value = json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": summary }
+        },
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": body,
+                "element_id": STREAMING_ELEMENT_ID,
+            }]
+        }
+    });
+    lark_channel::Card::from_value(value).expect("markdown run card is valid")
+}
+
+/// The one-time paused frame for the rich card.
+fn paused_rich_card(
+    profile: &ProfileConfig,
+    view: &RunView,
+    started: Instant,
+) -> lark_channel::Card {
+    let mut value = build_card(profile, view, card_status(view), started, None).into_value();
+    if let Some(config) = value["config"].as_object_mut() {
+        config.insert("streaming_mode".to_string(), Value::Bool(false));
+        config.insert("summary".to_string(), json!({ "content": "仍在运行" }));
+    }
+    if let Some(elements) = value["body"]["elements"].as_array_mut() {
+        // A live stop button would outlive the paused frame; build_card was
+        // called without one, but keep the filter explicit like the TS code.
+        elements.retain(|element| element["tag"] != "button");
+        elements.push(json!({
+            "tag": "markdown",
+            "content": STREAM_PAUSED_NOTE,
+            "text_size": "notation"
+        }));
+    }
+    lark_channel::Card::from_value(value).expect("paused run card is valid")
+}
+
+/// A notation-sized markdown note element.
+fn notation(content: impl Into<String>) -> Value {
+    json!({
+        "tag": "markdown",
+        "content": content.into(),
+        "text_size": "notation"
+    })
+}
+
+fn append_pause_note(body: String) -> String {
+    if body.trim().is_empty() {
+        STREAM_PAUSED_NOTE.to_string()
+    } else {
+        format!("{body}\n\n{STREAM_PAUSED_NOTE}")
+    }
+}
+
 /// One-line status for the card footer.
 fn card_status(view: &RunView) -> &'static str {
-    if view.error.is_some() {
-        "失败"
-    } else if view.finished {
-        "完成"
-    } else {
-        "运行中"
+    match view.termination {
+        Some(TerminationReason::Interrupted) => "已中断",
+        Some(TerminationReason::Timeout) => "已超时",
+        _ if view.error.is_some() => "失败",
+        _ if view.finished => "完成",
+        _ => "运行中",
     }
+}
+
+/// Preview summary text (TS `summaryText`): a terminal status once finished,
+/// never a stale "运行中".
+fn card_summary(view: &RunView, status: &str) -> String {
+    match view.termination {
+        Some(TerminationReason::Interrupted) => "已中断".to_string(),
+        Some(TerminationReason::Timeout) => "已超时".to_string(),
+        _ if view.error.is_some() => "出错".to_string(),
+        _ if view.finished => "已完成".to_string(),
+        _ => status.to_string(),
+    }
+}
+
+/// Whether the profile shows inline reasoning outside the card panel.
+fn inline_reasoning(profile: &ProfileConfig) -> bool {
+    matches!(
+        profile
+            .preferences
+            .as_ref()
+            .and_then(|prefs| prefs.reasoning_display),
+        Some(ReasoningDisplay::Inline)
+    )
 }
 
 /// Map the profile's reply preferences onto text-renderer options.
@@ -2328,17 +2961,20 @@ fn card_status(view: &RunView) -> &'static str {
 /// only `inline` is included; `auto` is card-only, `off` disables it, and
 /// `bubble` is streamed through the COT client instead.
 fn text_render_options(profile: &ProfileConfig) -> TextRenderOptions {
-    let reasoning = matches!(
-        profile
-            .preferences
-            .as_ref()
-            .and_then(|prefs| prefs.reasoning_display),
-        Some(ReasoningDisplay::Inline)
-    );
     TextRenderOptions {
         format: TextFormat::Plain,
         show_tool_calls: profile.show_tool_calls(),
-        reasoning,
+        reasoning: inline_reasoning(profile),
+        ..TextRenderOptions::default()
+    }
+}
+
+/// Markdown options for `MessageReplyMode::Markdown` progress cards.
+fn markdown_render_options(profile: &ProfileConfig) -> TextRenderOptions {
+    TextRenderOptions {
+        format: TextFormat::Markdown,
+        show_tool_calls: profile.show_tool_calls(),
+        reasoning: inline_reasoning(profile),
         ..TextRenderOptions::default()
     }
 }
@@ -2346,6 +2982,16 @@ fn text_render_options(profile: &ProfileConfig) -> TextRenderOptions {
 /// Final body for `MessageReplyMode::Text`.
 fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
     let body = render_text(view, text_render_options(profile));
+    if body.trim().is_empty() {
+        "（没有输出）".to_string()
+    } else {
+        body
+    }
+}
+
+/// Final body for `MessageReplyMode::Markdown`.
+fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
+    let body = render_text(view, markdown_render_options(profile));
     if body.trim().is_empty() {
         "（没有输出）".to_string()
     } else {
@@ -2381,22 +3027,81 @@ pub(crate) fn profile_default_workspace(profile: &ProfileConfig) -> Option<PathB
 
 /// Validate and canonicalize a `/cd` argument.
 ///
-/// Only absolute paths are accepted; the path must exist and be a directory.
+/// Accepts an absolute path or the TS-style `~` / `~/<subpath>` form (expanded
+/// with the current user's home). The path must exist and be a directory.
 /// Returns the canonical path (symlinks and `..` resolved) on success, or a
 /// user-facing message on failure.
 pub(crate) fn validate_cd_target(input: &str) -> Result<PathBuf, String> {
+    validate_cd_target_with_home(input, home_directory().as_deref())
+}
+
+/// The current user's home directory for `~` expansion.
+fn home_directory() -> Option<PathBuf> {
+    fn non_empty(value: std::ffi::OsString) -> Option<PathBuf> {
+        let path = PathBuf::from(value);
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE").and_then(non_empty) {
+            return Some(profile);
+        }
+        if let (Some(drive), Some(tail)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            return Some(PathBuf::from(drive).join(tail));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").and_then(non_empty)
+    }
+}
+
+/// Expand a leading `~` / `~/…` with an explicitly supplied home directory.
+///
+/// Pure so the tilde contract is testable without mutating `HOME`; the real
+/// `/cd` path calls [`validate_cd_target`], which uses [`home_directory`].
+pub(crate) fn expand_tilde_with_home(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法定位用户主目录，请使用绝对路径。".to_string());
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        let Some(home) = home else {
+            return Err("无法定位用户主目录，请使用绝对路径。".to_string());
+        };
+        return Ok(home.join(rest));
+    }
+    if input.starts_with('~') {
+        return Err(format!(
+            "请使用绝对路径，或 `~/xxx` 表示 home 下的子路径：`{input}`"
+        ));
+    }
+    Ok(PathBuf::from(input))
+}
+
+/// [`validate_cd_target`] with an explicit home, for tests.
+pub(crate) fn validate_cd_target_with_home(
+    input: &str,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("用法：`/cd <绝对路径>`".to_string());
+        return Err("用法：`/cd <绝对路径>` 或 `/cd ~/子路径`".to_string());
     }
-    if !Path::new(input).is_absolute() {
+    let expanded = expand_tilde_with_home(input, home)?;
+    if !expanded.is_absolute() {
         return Err(format!(
-            "请使用绝对路径：`{input}`（例如 `/Users/me/project`）"
+            "请使用绝对路径，或 `~/xxx` 表示 home 下的子路径：`{input}`"
         ));
     }
 
-    let canonical =
-        fs::canonicalize(input).map_err(|_| format!("工作目录不存在或不可访问：`{input}`"))?;
+    let canonical = fs::canonicalize(&expanded)
+        .map_err(|_| format!("工作目录不存在或不可访问：`{}`", expanded.display()))?;
     if !canonical.is_dir() {
         return Err(format!("路径不是目录：`{}`", canonical.display()));
     }
@@ -2779,6 +3484,338 @@ mod tests {
         assert_eq!(state.finish(), None);
     }
 
+    /// Event source that never produces an event; used to prove a pending
+    /// agent read is preempted by the cooperative interrupt / pause timer.
+    struct PendingSource;
+
+    #[async_trait]
+    impl EventSource for PendingSource {
+        async fn next_events(&mut self) -> Option<Vec<AgentEvent>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_requested_before_the_wait_is_not_lost() {
+        let interrupt = RunInterrupt::new();
+        interrupt.request();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), interrupt.wait())
+                .await
+                .is_ok(),
+            "a request that races the wait preamble must still wake the loop"
+        );
+        assert!(interrupt.is_requested());
+    }
+
+    #[tokio::test]
+    async fn cooperative_interrupt_keeps_the_partial_answer_and_a_terminal_card() {
+        let interrupt = RunInterrupt::new();
+        let signal = Arc::clone(&interrupt);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal.request();
+        });
+
+        let mut source = PendingSource;
+        let mut pending = EventSource::next_events(&mut source);
+        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        let tick = next_tick(&mut pending, &interrupt, deadline, None).await;
+        assert!(
+            matches!(tick, LoopTick::Interrupted),
+            "a pending agent read must yield to the stop signal"
+        );
+
+        // What the run loop does after the tick: keep the streamed text, mark
+        // the terminal, then render the final card.
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial answer".into(),
+        });
+        view.mark_interrupted();
+        assert_eq!(view.best_answer(), "partial answer");
+
+        let card = build_card(&profile(), &view, card_status(&view), Instant::now(), None);
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+        assert!(payload.contains("partial answer"), "{payload}");
+        assert!(payload.contains("⏹ 已被中断"), "{payload}");
+        assert!(!payload.contains("运行中"), "stale running card: {payload}");
+        assert!(
+            !payload.contains("__bridge_cb"),
+            "live button left: {payload}"
+        );
+        assert_eq!(card.as_value()["config"]["summary"]["content"], "已中断");
+        assert_eq!(card_status(&view), "已中断");
+    }
+
+    #[tokio::test]
+    async fn stop_button_requests_a_cooperative_interrupt_instead_of_aborting() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile();
+        profile.access = Some(Access {
+            admins: vec!["ou_admin".into()],
+            ..Access::default()
+        });
+        let bridge = test_bridge(root.path(), profile);
+        let scope = "oc_1";
+        let interrupt = RunInterrupt::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                scope.to_string(),
+                ActiveRun {
+                    id: 42,
+                    abort: task.abort_handle(),
+                    interrupt: Some(Arc::clone(&interrupt)),
+                },
+            );
+        }
+
+        let event = card_action_event(json!({
+            "__bridge_cb": true,
+            "action": "stop",
+            "scope": scope,
+            "token": bridge.tokens.sign(scope, "stop"),
+        }));
+        assert_eq!(
+            bridge.handle_card_action(&event).await.as_deref(),
+            Some("已停止当前任务。")
+        );
+        assert!(
+            interrupt.is_requested(),
+            "the stop button must signal the run, not silently abort it"
+        );
+        assert!(
+            bridge.is_scope_active(scope),
+            "the run stays registered until its finalize completes"
+        );
+
+        // The run loop finishes finalize and its guard releases the scope.
+        bridge.finish_run(scope, 42);
+        assert!(!bridge.is_scope_active(scope));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_command_signals_a_cooperative_run() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope = "oc_1";
+        let interrupt = RunInterrupt::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                scope.to_string(),
+                ActiveRun {
+                    id: 7,
+                    abort: task.abort_handle(),
+                    interrupt: Some(Arc::clone(&interrupt)),
+                },
+            );
+        }
+
+        let text = "/stop";
+        let reply = bridge
+            .handle_command(&message("om_stop", "ou_1", "user", text), text)
+            .await
+            .expect("handled");
+        assert_eq!(reply, "已停止当前任务。");
+        assert!(interrupt.is_requested());
+        assert!(
+            bridge.is_scope_active(scope),
+            "the cooperative run finalizes before its guard releases the scope"
+        );
+        bridge.finish_run(scope, 7);
+        assert!(!bridge.is_scope_active(scope));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_watchdog_aborts_a_run_whose_finalize_hangs() {
+        let root = tempfile::tempdir().unwrap();
+        let bridge = test_bridge(root.path(), profile());
+        let scope = "oc_1".to_string();
+        let interrupt = RunInterrupt::new();
+
+        let bridge_task = Arc::clone(&bridge);
+        let task_scope = scope.clone();
+        let hung = tokio::spawn(async move {
+            let _guard = RunGuard {
+                bridge: bridge_task,
+                scope: task_scope,
+                id: 9,
+                permit: None,
+            };
+            std::future::pending::<()>().await;
+        });
+        {
+            let mut active = lock(&bridge.active);
+            active.insert(
+                scope.clone(),
+                ActiveRun {
+                    id: 9,
+                    abort: hung.abort_handle(),
+                    interrupt: Some(Arc::clone(&interrupt)),
+                },
+            );
+        }
+
+        assert!(bridge.stop_scope(&scope).0);
+        assert!(interrupt.is_requested());
+        assert!(bridge.is_scope_active(&scope));
+
+        let error = tokio::time::timeout(Duration::from_secs(5), hung)
+            .await
+            .expect("watchdog aborts the hung run")
+            .expect_err("watchdog abort yields JoinError");
+        assert!(error.is_cancelled());
+        assert!(
+            !bridge.is_scope_active(&scope),
+            "the run guard must clear the scope after the watchdog abort"
+        );
+    }
+
+    #[test]
+    fn markdown_mode_card_is_a_single_markdown_element_without_controls() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Thinking {
+            delta: "inline reasoning".into(),
+        });
+        view.apply(&AgentEvent::Text {
+            delta: "answer".into(),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "pwd" }),
+        });
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        let mut profile = profile();
+        profile
+            .preferences
+            .get_or_insert_with(Preferences::default)
+            .reasoning_display = Some(ReasoningDisplay::Inline);
+
+        let card = build_markdown_card(&profile, &view, false);
+        let value = card.as_value();
+        let elements = value["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1, "only the markdown element: {value}");
+        assert_eq!(elements[0]["tag"], "markdown");
+        assert_eq!(elements[0]["element_id"], STREAMING_ELEMENT_ID);
+        assert_eq!(value["config"]["streaming_mode"], false);
+
+        let payload = serde_json::to_string(value).unwrap();
+        assert!(payload.contains("answer"), "{payload}");
+        assert!(payload.contains("inline reasoning"), "{payload}");
+        assert!(!payload.contains("__bridge_cb"), "{payload}");
+        assert!(!payload.contains("\"tag\":\"button\""), "{payload}");
+        // No rich-card tool panel / footer note elements.
+        assert!(!payload.contains("**工具**"), "{payload}");
+        assert!(!payload.contains("\"tag\":\"note\""), "{payload}");
+    }
+
+    #[test]
+    fn card_mode_keeps_the_tools_footer_and_signed_stop_button() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "answer".into(),
+        });
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "pwd" }),
+        });
+        let card = build_card(
+            &profile(),
+            &view,
+            card_status(&view),
+            Instant::now(),
+            Some(("oc_1", "deadbeef")),
+        );
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+        assert!(payload.contains("**工具**"), "{payload}");
+        assert!(payload.contains("\"tag\":\"note\""), "{payload}");
+        assert!(payload.contains("__bridge_cb"), "{payload}");
+        assert!(payload.contains("deadbeef"), "{payload}");
+        assert!(payload.contains("停止"), "{payload}");
+    }
+
+    #[test]
+    fn paused_progress_frames_are_final_and_carry_the_pause_note_once() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial answer".into(),
+        });
+
+        let markdown = build_markdown_card(&profile(), &view, true);
+        let payload = serde_json::to_string(markdown.as_value()).unwrap();
+        assert_eq!(markdown.as_value()["config"]["streaming_mode"], false);
+        assert_eq!(
+            markdown.as_value()["config"]["summary"]["content"],
+            "仍在运行"
+        );
+        assert!(payload.contains("partial answer"), "{payload}");
+        assert!(payload.contains(STREAM_PAUSED_NOTE), "{payload}");
+        assert!(!payload.contains("正在输出"), "{payload}");
+        assert!(!payload.contains("__bridge_cb"), "{payload}");
+        assert!(!payload.contains("\"tag\":\"button\""), "{payload}");
+        assert_eq!(payload.matches(STREAM_PAUSED_NOTE).count(), 1);
+
+        let rich = paused_rich_card(&profile(), &view, Instant::now());
+        let payload = serde_json::to_string(rich.as_value()).unwrap();
+        assert_eq!(rich.as_value()["config"]["streaming_mode"], false);
+        assert_eq!(rich.as_value()["config"]["summary"]["content"], "仍在运行");
+        assert!(payload.contains("partial answer"), "{payload}");
+        assert!(payload.contains(STREAM_PAUSED_NOTE), "{payload}");
+        assert!(!payload.contains("__bridge_cb"), "{payload}");
+        assert!(!payload.contains("\"tag\":\"button\""), "{payload}");
+        assert_eq!(payload.matches(STREAM_PAUSED_NOTE).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn expiry_pause_tick_fires_once_then_the_loop_stops_pausing() {
+        let interrupt = RunInterrupt::new();
+        let mut source = PendingSource;
+        let mut pending = EventSource::next_events(&mut source);
+        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        let already_due = tokio::time::Instant::now();
+
+        assert!(matches!(
+            next_tick(&mut pending, &interrupt, deadline, Some(already_due)).await,
+            LoopTick::PauseElapsed
+        ));
+        // The run loop passes `None` once paused, so no second pause frame can
+        // be produced while the run keeps streaming.
+        let after_pause = tokio::time::timeout(
+            Duration::from_millis(30),
+            next_tick(&mut pending, &interrupt, deadline, None),
+        )
+        .await;
+        assert!(
+            after_pause.is_err(),
+            "a paused loop must not emit another pause tick"
+        );
+    }
+
+    #[test]
+    fn interrupted_text_mode_keeps_the_partial_answer() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial answer".into(),
+        });
+        view.mark_interrupted();
+        assert_eq!(
+            text_final_body(&profile(), &view),
+            "partial answer\n\n⏹ 已被中断"
+        );
+    }
+
     #[test]
     fn card_contains_answer_tools_and_footer() {
         let mut view = RunView::default();
@@ -2804,9 +3841,13 @@ mod tests {
 
     #[test]
     fn run_card_exposes_the_streaming_element_and_safe_window() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "hello".into(),
+        });
         let card = build_card(
             &profile(),
-            &RunView::default(),
+            &view,
             "运行中",
             Instant::now(),
             Some(("oc_1", "deadbeef")),
@@ -2869,14 +3910,25 @@ mod tests {
     }
 
     #[test]
-    fn huge_answers_are_truncated() {
+    fn huge_answers_are_kept_whole() {
+        // Regression for the old 8000-char card cap: a long answer must render
+        // in full (the only remaining cap is a 100k CardKit sanity guard).
+        let answer = "x".repeat(9_000);
         let mut view = RunView::default();
         view.apply(&AgentEvent::Text {
-            delta: "x".repeat(MAX_CARD_CHARS + 100),
+            delta: answer.clone(),
         });
-        let card = build_card(&profile(), &view, "完成", Instant::now(), None);
+        view.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        let card = build_card(&profile(), &view, card_status(&view), Instant::now(), None);
         let text = serde_json::to_string(card.as_value()).unwrap();
-        assert!(text.contains("已截断"));
+        assert!(text.contains(&answer), "answer was truncated: {text}");
+        assert!(!text.contains("内容过长已截断"), "{text}");
+        assert_eq!(text_final_body(&profile(), &view), answer);
+        assert_eq!(markdown_final_body(&profile(), &view), answer);
     }
 
     #[test]
@@ -3056,10 +4108,40 @@ mod tests {
             let err = validate_cd_target(input).unwrap_err();
             assert!(err.contains("用法"), "{err}");
         }
-        for input in ["relative/path", "~/work", "../work"] {
+        for input in ["relative/path", "../work", "~user/work"] {
             let err = validate_cd_target(input).unwrap_err();
             assert!(err.contains("绝对路径"), "{err}");
         }
+        // A bare `~` with no home available is a distinct, actionable error.
+        let err = validate_cd_target_with_home("~", None).unwrap_err();
+        assert!(err.contains("主目录"), "{err}");
+    }
+
+    #[test]
+    fn validate_cd_target_expands_tilde_against_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let work = home.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        assert_eq!(
+            validate_cd_target_with_home("~", Some(&home)).unwrap(),
+            home.canonicalize().unwrap()
+        );
+        assert_eq!(
+            validate_cd_target_with_home("~/work", Some(&home)).unwrap(),
+            work.canonicalize().unwrap()
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/client work", Some(&home)).unwrap(),
+            home.join("client work")
+        );
+
+        // Only the `~` / `~/…` forms are accepted, matching TS.
+        let err = validate_cd_target_with_home("~user/work", Some(&home)).unwrap_err();
+        assert!(err.contains("绝对路径"), "{err}");
+        let err = validate_cd_target_with_home("~/missing", Some(&home)).unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
     }
 
     #[test]
@@ -3601,6 +4683,8 @@ mod tests {
                 ActiveRun {
                     id: 1,
                     abort: handle_a.abort_handle(),
+
+                    interrupt: None,
                 },
             );
             active.insert(
@@ -3608,6 +4692,8 @@ mod tests {
                 ActiveRun {
                     id: 2,
                     abort: handle_b.abort_handle(),
+
+                    interrupt: None,
                 },
             );
         }
@@ -3668,6 +4754,8 @@ mod tests {
                 ActiveRun {
                     id: 1,
                     abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+
+                    interrupt: None,
                 },
             );
             active.insert(
@@ -3675,6 +4763,8 @@ mod tests {
                 ActiveRun {
                     id: 2,
                     abort: handle_b.abort_handle(),
+
+                    interrupt: None,
                 },
             );
         }
@@ -4047,6 +5137,8 @@ mod tests {
             ActiveRun {
                 id: 7,
                 abort: handle.abort_handle(),
+
+                interrupt: None,
             },
         );
 
@@ -4261,7 +5353,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_finished_card_uses_the_placeholder_and_completed_summary() {
+    fn empty_finished_card_uses_the_ts_no_content_note() {
         let mut view = RunView::default();
         view.apply(&AgentEvent::Done {
             session_id: None,
@@ -4270,11 +5362,13 @@ mod tests {
         });
         let card = build_card(&profile(), &view, card_status(&view), Instant::now(), None);
 
+        // TS `renderCard` renders `_（未返回内容）_`, not the old bare "…".
         assert_eq!(
             card.as_value()["body"]["elements"][0]["content"],
-            "…",
-            "empty answer should render the placeholder"
+            "_（未返回内容）_"
         );
+        assert_ne!(card.as_value()["body"]["elements"][0]["content"], "…");
+        assert_eq!(card.as_value()["config"]["summary"]["content"], "已完成");
         let payload = serde_json::to_string(card.as_value()).unwrap();
         assert!(payload.contains("完成"), "{payload}");
     }
@@ -4338,7 +5432,13 @@ mod tests {
     #[tokio::test]
     async fn cd_command_canonicalizes_and_persists_the_scope_directory() {
         let root = tempfile::tempdir().unwrap();
-        let bridge = test_bridge(root.path(), profile());
+        // `/cd` is an admin command (same gate as `/config set`/`/ws`).
+        let mut admin = profile();
+        admin.access = Some(Access {
+            admins: vec!["ou_1".into()],
+            ..Access::default()
+        });
+        let bridge = test_bridge(root.path(), admin);
         // Spaces are legal in a path and must survive the whitespace-split
         // command parser.
         let target = root.path().join("client work");
@@ -4435,6 +5535,8 @@ mod tests {
                 ActiveRun {
                     id: 1,
                     abort: comment_run.abort_handle(),
+
+                    interrupt: None,
                 },
             );
             active.insert(
@@ -4442,6 +5544,8 @@ mod tests {
                 ActiveRun {
                     id: 2,
                     abort: chat_run.abort_handle(),
+
+                    interrupt: None,
                 },
             );
         }
@@ -4489,7 +5593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_advertises_only_implemented_commands() {
+    async fn help_advertises_parity_commands_and_admin_notes() {
         let root = tempfile::tempdir().unwrap();
         let bridge = test_bridge(root.path(), profile());
         let reply = bridge
@@ -4522,6 +5626,11 @@ mod tests {
         ] {
             assert!(reply.contains(command), "{command} missing: {reply}");
         }
+        // The parity fixes are visible in the help text too: `/cd` is
+        // admin-gated, supports `~`, and resets the session; `/new` interrupts.
+        assert!(reply.contains("/cd <绝对路径|~/子路径>"), "{reply}");
+        assert!(reply.contains("会重置 session"), "{reply}");
+        assert!(reply.contains("中断当前任务并开启新会话"), "{reply}");
     }
 
     #[tokio::test]
