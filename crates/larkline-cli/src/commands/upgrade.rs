@@ -35,13 +35,13 @@ pub async fn execute(args: &UpgradeArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !newer && args.version.is_none() {
+    if !newer && args.target_version.is_none() {
         println!("\nalready up to date");
         return Ok(());
     }
 
     let target = args
-        .version
+        .target_version
         .clone()
         .unwrap_or_else(|| latest.trim_start_matches('v').to_string());
 
@@ -53,22 +53,28 @@ pub async fn execute(args: &UpgradeArgs) -> anyhow::Result<()> {
 }
 
 async fn latest_tag() -> anyhow::Result<String> {
+    // Use the release redirect instead of the GitHub API: unauthenticated
+    // api.github.com calls are rate limited (HTTP 403) on shared networks.
     let response = reqwest::Client::new()
-        .get(format!(
-            "https://api.github.com/repos/{REPO}/releases/latest"
-        ))
+        .get(format!("https://github.com/{REPO}/releases/latest"))
         .header(USER_AGENT, format!("larkline/{}", larkline_core::VERSION))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("cannot reach github: {e}"))?;
     if !response.status().is_success() {
-        bail!("github api returned {}", response.status());
+        bail!("github returned {}", response.status());
     }
-    let body: serde_json::Value = response.json().await?;
-    body.get("tag_name")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("release response has no tag_name"))
+    // Redirects are followed, so the final URL ends with the tag.
+    let tag = response
+        .url()
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default()
+        .to_string();
+    if tag.is_empty() || tag == "releases" || tag == "latest" {
+        bail!("no published release found");
+    }
+    Ok(tag)
 }
 
 /// Compare `vA.B.C` strings. Returns `None` when either side is unparseable.

@@ -199,5 +199,5 @@ pub struct UpgradeArgs {
 
     /// Pin a specific version instead of the latest release.
     #[arg(long = "target-version")]
-    pub version: Option<String>,
+    pub target_version: Option<String>,
 }
