@@ -57,6 +57,12 @@ Ported and tested:
 - OS daemon lifecycle (`start`/`stop`/`restart`/`status`/`unregister`) with
   launchd, systemd --user and schtasks renderers, plus `ps`/`kill` over the
   shared process registry
+- workspace store per chat (`/cd`, `/pwd`, `/status`), pending queue with the
+  600 ms merge window, working reaction, CardKit entity streaming
+- file-comment mentions (`drive.notice.comment_add_v1`) with in-thread replies
+- in-meeting VC bot: poll/push sessions, transcript stabilization, `/meeting`
+  commands, IM/meeting replies and end-of-meeting summaries
+- QR onboarding (`larkline onboard`)
 - signed card callbacks: running cards carry a HMAC-signed ⏹ button; clicks
   are verified per chat and abort the run (agent-rendered callbacks are not
   forwarded yet)
