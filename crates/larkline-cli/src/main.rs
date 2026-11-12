@@ -35,6 +35,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let ctx = AppContext::load(&cli)?;
             commands::doctor::execute(&ctx)
         }
+        Commands::Onboard(args) => commands::onboard::execute(&cli, args).await,
         Commands::Profile(args) => commands::profile::execute(&cli, args),
         Commands::Secrets(args) => commands::secrets::execute(&cli, args),
         Commands::Upgrade(args) => commands::upgrade::execute(args).await,

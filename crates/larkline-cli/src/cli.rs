@@ -38,6 +38,8 @@ pub enum Commands {
     Run(RunArgs),
     /// Check config, credentials, keystore and agent binaries.
     Doctor,
+    /// Create a profile by scanning a QR code (app registration device flow).
+    Onboard(OnboardArgs),
     /// Manage profiles.
     Profile(ProfileArgs),
     /// Manage the encrypted secret keystore.
@@ -97,6 +99,23 @@ pub enum ProfileCommand {
     },
     /// Print one profile as JSON.
     Show { name: Option<String> },
+}
+
+#[derive(Debug, Args)]
+pub struct OnboardArgs {
+    /// Profile name (defaults to a free name such as `bot`).
+    #[arg(long)]
+    pub name: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = AgentArg::Claude)]
+    pub agent: AgentArg,
+
+    #[arg(long, value_enum, default_value_t = TenantArg::Feishu)]
+    pub tenant: TenantArg,
+
+    /// Create the profile without making it active.
+    #[arg(long)]
+    pub no_use: bool,
 }
 
 #[derive(Debug, Args)]
