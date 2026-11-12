@@ -1,17 +1,26 @@
-//! Run flow: policy -> card -> agent -> card updates -> session.
+//! Run flow: policy -> queue -> card -> agent -> card updates -> session.
 //!
 //! Working directories are per chat: `/cd` persists an override in the
 //! workspace store, and every run snapshots the effective cwd before spawning
 //! the agent. Changing the cwd mid-run therefore never moves an already
 //! running agent; the next message picks up the new directory.
 //!
-//! Deliberately sequential per chat. A second message while a run is live gets
-//! a short "still working" reply instead of spawning a competing agent;
-//! `/stop` aborts the task, which drops the child (kill-on-drop).
+//! Every chat is also a debounce scope (see [`crate::pending`], a port of
+//! `src/bot/pending-queue.ts`): a message opens a 600ms quiet window and
+//! messages arriving inside it merge into one agent run. While that run is
+//! live the scope is blocked, so later messages keep accumulating instead of
+//! spawning a competing agent; when the run ends the window re-arms and the
+//! next batch starts. `/stop` aborts the live run and drops the queued batch.
+//!
+//! The TypeScript keepalive watchdog is **not** started here: its decisions
+//! need a WebSocket connection status and a force-reconnect hook that
+//! `larkline-lark` does not expose yet. See
+//! [`crate::keepalive::KEEPALIVE_GAPS`] for the typed gap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -27,11 +36,12 @@ use larkline_core::{
 use larkline_lark::reactions::{TYPING, add_reaction, remove_reaction};
 use larkline_lark::{CARD_SAFE_AGE, Channel, RestClient, STREAMING_ELEMENT_ID, StreamingCard};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::agent_runner::{AgentProcess, AgentSpec};
 use crate::callback::CallbackTokens;
+use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
 use crate::render::RunView;
 
@@ -42,6 +52,16 @@ const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(900);
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Cards over this many characters are truncated (CardKit caps JSON size).
 const MAX_CARD_CHARS: usize = 8_000;
+/// Quiet window before a batch of messages starts a run. The TypeScript bridge
+/// uses the same 600ms (`DEBOUNCE_MS` in `src/bot/channel.ts`).
+const DEBOUNCE: Duration = Duration::from_millis(600);
+/// Upper bound on messages queued per chat.
+///
+/// The TypeScript queue is unbounded; this is a Rust-only memory guard for a
+/// bridge whose runs may last up to [`RUN_TIMEOUT`]. On overflow the oldest
+/// message is dropped (the newest user intent survives) and a warning is
+/// logged; [`QueueLimits::unbounded`] restores exact TS semantics.
+const MAX_PENDING_PER_SCOPE: usize = 100;
 
 pub struct Bridge {
     pub channel: Channel,
@@ -53,7 +73,37 @@ pub struct Bridge {
     tokens: CallbackTokens,
     sessions: Mutex<SessionStore>,
     workspaces: Mutex<WorkspaceStore>,
-    active: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Live run per chat. A run keeps its chat's pending scope blocked.
+    active: StdMutex<HashMap<String, ActiveRun>>,
+    /// Debounced per-chat message queue (pure structure; no timers inside).
+    pending: StdMutex<PendingQueue<NormalizedMessage>>,
+    /// Wakes the queue driver when a batch is armed, cancelled or unblocked.
+    pending_wakeup: Notify,
+    /// Whether the queue driver task has been spawned (lazily, on first push).
+    pending_driver_started: AtomicBool,
+    /// Id for the next run; guards [`Bridge::finish_run`] against a late guard
+    /// from an aborted run clearing its successor's block.
+    next_run_id: AtomicU64,
+}
+
+/// One live agent run owned by a chat.
+struct ActiveRun {
+    id: u64,
+    handle: JoinHandle<()>,
+}
+
+/// Clears the queue block when a run ends, including an abort (`/stop`) that
+/// never reaches the end of the spawned future.
+struct RunGuard {
+    bridge: Arc<Bridge>,
+    scope: String,
+    id: u64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.bridge.finish_run(&self.scope, self.id);
+    }
 }
 
 impl Bridge {
@@ -91,7 +141,14 @@ impl Bridge {
             tokens: CallbackTokens::new(),
             sessions: Mutex::new(sessions),
             workspaces: Mutex::new(workspaces),
-            active: Mutex::new(HashMap::new()),
+            active: StdMutex::new(HashMap::new()),
+            pending: StdMutex::new(PendingQueue::with_limits(
+                DEBOUNCE,
+                QueueLimits::per_scope(MAX_PENDING_PER_SCOPE),
+            )),
+            pending_wakeup: Notify::new(),
+            pending_driver_started: AtomicBool::new(false),
+            next_run_id: AtomicU64::new(1),
         })
     }
 
@@ -109,29 +166,175 @@ impl Bridge {
         }
 
         if let Some(reply) = self.handle_command(&message, &text).await {
+            // Commands bypass the debounce queue and drop anything that was
+            // waiting for this chat (TS: `pending.cancel(scope)`).
+            self.discard_pending(&message.chat_id);
             let _ = self.channel.send_text(&message.chat_id, reply).await;
             return;
         }
 
-        let chat_id = message.chat_id.clone();
-        let mut active = self.active.lock().await;
-        active.retain(|_, handle| !handle.is_finished());
-        if active.contains_key(&chat_id) {
-            drop(active);
-            let _ = self
-                .channel
-                .send_text(&chat_id, "上一条消息还在处理中，发送 /stop 可以中断。")
-                .await;
+        self.enqueue(message);
+    }
+
+    /// Queue a message for its chat and make sure the debounce driver runs.
+    fn enqueue(self: &Arc<Self>, message: NormalizedMessage) {
+        // Scope = chat id: the Rust bridge has no per-topic session split yet.
+        // `PendingQueue` accepts any scope string, so a topic scope is a
+        // one-line change once sessions/active learn about threads (the TS
+        // bridge uses `chatId:threadId` for topic groups).
+        let scope = message.chat_id.clone();
+        let outcome = {
+            let mut pending = lock(&self.pending);
+            pending.push(&scope, message, Instant::now())
+        };
+        if outcome.dropped > 0 {
+            tracing::warn!(
+                chat = %scope,
+                queued = outcome.queued,
+                dropped = outcome.dropped,
+                "pending queue full; dropped the oldest queued message"
+            );
+        }
+        tracing::debug!(chat = %scope, queued = outcome.queued, "message queued");
+        self.ensure_pending_driver();
+        self.pending_wakeup.notify_one();
+    }
+
+    /// Start the one queue driver task on first use.
+    fn ensure_pending_driver(self: &Arc<Self>) {
+        if self.pending_driver_started.swap(true, Ordering::AcqRel) {
             return;
         }
-
         let bridge = Arc::clone(self);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(bridge.pending_driver());
+            }
+            Err(_) => {
+                self.pending_driver_started.store(false, Ordering::Release);
+                tracing::warn!("no tokio runtime available to start the pending queue driver");
+            }
+        }
+    }
+
+    /// Sleep until the earliest quiet window ends, then start every due batch.
+    async fn pending_driver(self: Arc<Self>) {
+        loop {
+            let deadline = lock(&self.pending).next_deadline();
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                        _ = self.pending_wakeup.notified() => {}
+                    }
+                }
+                None => self.pending_wakeup.notified().await,
+            }
+
+            let now = Instant::now();
+            while self.start_due_batch(now) {}
+        }
+    }
+
+    /// Take the next due batch and spawn its run, atomically with respect to
+    /// `/stop`.
+    ///
+    /// The pending lock is held until the run is registered in `active`, so a
+    /// concurrent stop either sees no run at all (and the batch stays queued)
+    /// or sees the registered run and aborts it. `take_due` marks the scope
+    /// blocked while it is still under the same lock.
+    fn start_due_batch(self: &Arc<Self>, now: Instant) -> bool {
+        let mut pending = lock(&self.pending);
+        let Some((scope, batch)) = pending.take_due(now) else {
+            return false;
+        };
+
+        let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        // The task waits until it is registered before doing any work, so a
+        // run that finishes immediately cannot strand its block.
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let bridge = Arc::clone(self);
+        let task_scope = scope.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = bridge.run_agent(message).await {
+            let _ = ready.await;
+            let _guard = RunGuard {
+                bridge: Arc::clone(&bridge),
+                scope: task_scope,
+                id,
+            };
+            if let Err(err) = bridge.run_batch(batch).await {
                 tracing::error!(error = %err, "agent run failed");
             }
         });
-        active.insert(chat_id, handle);
+
+        let mut active = lock(&self.active);
+        active.retain(|_, run| !run.handle.is_finished());
+        active.insert(scope, ActiveRun { id, handle });
+        drop(active);
+        drop(pending);
+        let _ = start.send(());
+        true
+    }
+
+    /// Run finished (or was aborted): release its chat for the next batch.
+    ///
+    /// Only the run that still owns the chat may unblock it, so a guard from
+    /// a delayed abort can never clear its successor's block.
+    fn finish_run(&self, scope: &str, id: u64) {
+        let mut pending = lock(&self.pending);
+        let owns = {
+            let mut active = lock(&self.active);
+            match active.get(scope) {
+                Some(run) if run.id == id => {
+                    active.remove(scope);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !owns {
+            return;
+        }
+        pending.unblock(scope, Instant::now());
+        drop(pending);
+        self.pending_wakeup.notify_one();
+    }
+
+    /// Abort a live run. The caller must hold the pending lock (lock order is
+    /// pending -> active).
+    fn abort_run(&self, scope: &str) -> bool {
+        let mut active = lock(&self.active);
+        match active.remove(scope) {
+            Some(run) => {
+                run.handle.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `/stop` and the card stop button: abort the run, drop its queued
+    /// follow-up batch, and clear the block so the chat can be used again.
+    fn stop_scope(&self, scope: &str) -> (bool, usize) {
+        // Holding the pending lock makes stop atomic with respect to a driver
+        // that is registering a new batch (same lock order as `start_due_batch`).
+        let mut pending = lock(&self.pending);
+        let stopped = self.abort_run(scope);
+        let dropped = pending.cancel(scope).len();
+        pending.unblock(scope, Instant::now());
+        drop(pending);
+        self.pending_wakeup.notify_one();
+        (stopped, dropped)
+    }
+
+    /// Drop the chat's queued batch (any handled command does this).
+    fn discard_pending(&self, scope: &str) -> usize {
+        let dropped = {
+            let mut pending = lock(&self.pending);
+            pending.cancel(scope).len()
+        };
+        self.pending_wakeup.notify_one();
+        dropped
     }
 
     async fn handle_command(&self, message: &NormalizedMessage, text: &str) -> Option<String> {
@@ -139,14 +342,12 @@ impl Bridge {
         let args = text.get(command.len()..).unwrap_or_default().trim();
         match command {
             "/stop" => {
-                let mut active = self.active.lock().await;
-                match active.remove(&message.chat_id) {
-                    Some(handle) => {
-                        handle.abort();
-                        Some("已停止当前任务。".to_string())
-                    }
-                    None => Some("当前没有正在运行的任务。".to_string()),
-                }
+                let (stopped, _dropped) = self.stop_scope(&message.chat_id);
+                Some(if stopped {
+                    "已停止当前任务。".to_string()
+                } else {
+                    "当前没有正在运行的任务。".to_string()
+                })
             }
             "/new" | "/reset" => match self.sessions.lock().await.clear(&message.chat_id) {
                 Ok(()) => Some("已开启新会话。".to_string()),
@@ -252,14 +453,14 @@ impl Bridge {
 
         match action_name {
             "stop" => {
-                let mut active = self.active.lock().await;
-                match active.remove(scope) {
-                    Some(handle) => {
-                        handle.abort();
-                        Some("已停止当前任务。".to_string())
-                    }
-                    None => Some("当前没有正在运行的任务。".to_string()),
-                }
+                // The stop button is the card equivalent of `/stop`: abort the
+                // run and drop the batch queued while it was live.
+                let (stopped, _dropped) = self.stop_scope(scope);
+                Some(if stopped {
+                    "已停止当前任务。".to_string()
+                } else {
+                    "当前没有正在运行的任务。".to_string()
+                })
             }
             _ => None,
         }
@@ -301,15 +502,22 @@ impl Bridge {
         }
     }
 
-    async fn run_agent(self: Arc<Self>, message: NormalizedMessage) -> anyhow::Result<()> {
+    async fn run_batch(self: Arc<Self>, batch: Vec<NormalizedMessage>) -> anyhow::Result<()> {
+        let Some(first) = batch.first() else {
+            return Ok(());
+        };
+        let chat_id = first.chat_id.clone();
+        let last_message_id = batch
+            .last()
+            .map(|message| message.message_id.clone())
+            .unwrap_or_else(|| first.message_id.clone());
         let started = Instant::now();
-        // Decorate the triggering message with the "Typing" reaction for as
-        // long as the run is live. Failures are logged and never fail the run;
-        // the guard removes the reaction from `Drop`, which also covers
-        // `/stop` aborting this task.
+        // Decorate the most recent message of the batch (the TS bridge also
+        // reacts to `lastMsg`) with the "Typing" reaction for as long as the
+        // run is live. Failures are logged and never fail the run; the guard
+        // removes the reaction from `Drop`, which also covers `/stop`.
         let _working_reaction =
-            WorkingReaction::start(self.channel.rest().clone(), message.message_id.clone());
-        let chat_id = message.chat_id.clone();
+            WorkingReaction::start(self.channel.rest().clone(), last_message_id);
         // Snapshot the effective cwd for the whole run: session resume/record
         // and the agent process must agree even if `/cd` lands mid-run.
         let cwd = self.workspace_cwd(&chat_id).await;
@@ -319,8 +527,8 @@ impl Bridge {
             sessions.resume_for(&chat_id, &cwd_str).map(str::to_string)
         };
 
-        let context = self.prompt_context(&message);
-        let prompt = build_agent_prompt(&context, message.text.trim());
+        let context = self.prompt_context(&batch);
+        let prompt = build_agent_prompt(&context, &batch_user_input(&batch));
         let use_card = self.profile.message_reply() != MessageReplyMode::Text;
 
         let mut view = RunView::default();
@@ -570,31 +778,28 @@ impl Bridge {
         }
     }
 
-    fn prompt_context(&self, message: &NormalizedMessage) -> PromptContext {
-        let chat_type = match message.chat_type {
+    /// Prompt context for a debounced batch: identity from the first message,
+    /// mentions merged across the batch, and every message id recorded.
+    fn prompt_context(&self, batch: &[NormalizedMessage]) -> PromptContext {
+        let first = &batch[0];
+        let chat_type = match first.chat_type {
             MessageChatType::P2p => "p2p",
             MessageChatType::Group => "group",
             MessageChatType::Unknown => "unknown",
         };
-        let sender_type = match message.sender.sender_type {
+        let sender_type = match first.sender.sender_type {
             MessageSenderType::User => "user",
             MessageSenderType::Bot => "bot",
             MessageSenderType::Unknown => "unknown",
         };
-        let mentions: Vec<PromptMention> = message
-            .mentions
-            .iter()
-            .map(|mention| PromptMention {
-                open_id: Some(mention.open_id.clone()).filter(|id| !id.is_empty()),
-                name: mention.name.clone(),
-                is_bot: Some(mention.mentioned_type == MessageSenderType::Bot),
-            })
-            .collect();
+        let mentions = merge_mentions(batch);
 
         PromptContext {
-            chat_id: message.chat_id.clone(),
+            chat_id: first.chat_id.clone(),
             chat_type: chat_type.to_string(),
-            sender_id: message.sender_id.clone(),
+            sender_id: first.sender_id.clone(),
+            // `NormalizedMessage` carries no display name (the TS SDK enriches
+            // it); the bridge prompt gets the open id only.
             sender_name: None,
             sender_type: Some(sender_type.to_string()),
             bot_open_id: self.bot_open_id.clone(),
@@ -603,11 +808,89 @@ impl Bridge {
             } else {
                 Some(mentions)
             },
-            thread_id: message.thread_id.clone(),
-            message_ids: Some(vec![message.message_id.clone()]),
+            thread_id: first.thread_id.clone(),
+            message_ids: Some(
+                batch
+                    .iter()
+                    .map(|message| message.message_id.clone())
+                    .collect(),
+            ),
             source: "im".to_string(),
         }
     }
+}
+
+/// Join a batch's text into the `<user_input>` body.
+///
+/// Mirrors the TS `buildPrompt`: single-message batches stay verbatim; merged
+/// batches prefix each non-empty segment with `[sender]:` so the agent can tell
+/// who said what, and segments are separated by a blank line.
+fn batch_user_input(batch: &[NormalizedMessage]) -> String {
+    let annotate = batch.len() > 1;
+    let texts: Vec<String> = batch
+        .iter()
+        .filter_map(|message| {
+            let text = message.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(if annotate {
+                format!("{} {text}", sender_annotation(message))
+            } else {
+                text.to_string()
+            })
+        })
+        .collect();
+
+    if texts.is_empty() {
+        // Also the TS fallback; the bridge drops empty-text messages at intake,
+        // so this mainly keeps the helper total.
+        "（对方发来一条没有正文的消息——通常是只 @ 了你的唤醒（ping）。请简短回应。）".to_string()
+    } else {
+        texts.join("\n\n")
+    }
+}
+
+/// `[name (type)]:` prefix used when a batch merges several senders.
+///
+/// The Rust `NormalizedMessage` has no `senderName`, so the sender open id is
+/// the stable label.
+fn sender_annotation(message: &NormalizedMessage) -> String {
+    let name = message.sender_id.as_str();
+    match message.sender.sender_type {
+        MessageSenderType::User => format!("[{name} (user)]:"),
+        MessageSenderType::Bot => format!("[{name} (bot)]:"),
+        MessageSenderType::Unknown => format!("[{name}]:"),
+    }
+}
+
+/// Merge mentions from every message in the batch, deduplicating like the TS
+/// `mergeMentions` (by `open_id`, else by `name:key`).
+fn merge_mentions(batch: &[NormalizedMessage]) -> Vec<PromptMention> {
+    let mut seen = HashSet::new();
+    let mut mentions = Vec::new();
+    for message in batch {
+        for mention in &message.mentions {
+            let key = if mention.open_id.is_empty() {
+                format!(
+                    "{}:{}",
+                    mention.name.as_deref().unwrap_or_default(),
+                    mention.key
+                )
+            } else {
+                mention.open_id.clone()
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            mentions.push(PromptMention {
+                open_id: Some(mention.open_id.clone()).filter(|id| !id.is_empty()),
+                name: mention.name.clone(),
+                is_bot: Some(mention.mentioned_type == MessageSenderType::Bot),
+            });
+        }
+    }
+    mentions
 }
 
 /// Lifecycle of the "working" reaction on the triggering message.
@@ -682,7 +965,7 @@ impl ReactionState {
 ///
 /// [`WorkingReaction::start`] launches the add without delaying the run; the
 /// id is remembered in shared state. Dropping the guard ends the decoration,
-/// so every exit path of [`Bridge::run_agent`] — success, error, timeout and
+/// so every exit path of [`Bridge::run_batch`] — success, error, timeout and
 /// task abort — is covered. `Drop` cannot await, so the delete is detached:
 /// it is best-effort, and a process exit before it runs can leave the
 /// reaction behind.
@@ -773,6 +1056,13 @@ impl Drop for WorkingReaction {
 /// Lock the reaction state, recovering the guard if a panic poisoned it.
 fn lock_state(state: &StdMutex<ReactionState>) -> std::sync::MutexGuard<'_, ReactionState> {
     state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Lock a queue/map, recovering the guard if a panic poisoned it.
+fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -958,6 +1248,84 @@ mod tests {
             agent_kind: AgentKind::Claude,
             ..ProfileConfig::default()
         }
+    }
+
+    /// Minimal `NormalizedMessage` fixture for queue/prompt-merge tests.
+    fn message(id: &str, sender_id: &str, sender_type: &str, text: &str) -> NormalizedMessage {
+        serde_json::from_value(json!({
+            "message_id": id,
+            "chat_id": "oc_1",
+            "chat_type": "group",
+            "sender_id": sender_id,
+            "sender": { "open_id": sender_id, "sender_type": sender_type },
+            "text": text,
+        }))
+        .expect("normalized message fixture")
+    }
+
+    #[test]
+    fn single_message_batches_keep_the_text_verbatim() {
+        let batch = vec![message("om_1", "ou_1", "user", "  hello  ")];
+        assert_eq!(batch_user_input(&batch), "hello");
+    }
+
+    #[test]
+    fn merged_batches_annotate_each_sender_and_join_with_blank_lines() {
+        let batch = vec![
+            message("om_1", "ou_1", "user", "first"),
+            message("om_2", "ou_2", "bot", " second "),
+        ];
+        assert_eq!(
+            batch_user_input(&batch),
+            "[ou_1 (user)]: first\n\n[ou_2 (bot)]: second"
+        );
+    }
+
+    #[test]
+    fn unknown_sender_types_use_the_plain_annotation() {
+        let batch = vec![
+            message("om_1", "ou_1", "user", "a"),
+            message("om_2", "ou_2", "unknown", "b"),
+        ];
+        assert_eq!(batch_user_input(&batch), "[ou_1 (user)]: a\n\n[ou_2]: b");
+    }
+
+    #[test]
+    fn merge_mentions_deduplicates_by_open_id_and_keeps_order() {
+        let mut first = message("om_1", "ou_1", "user", "a");
+        first.mentions = vec![
+            serde_json::from_value(json!({
+                "key": "@_user_1",
+                "open_id": "ou_bot",
+                "name": "Bot",
+                "mentioned_type": "bot"
+            }))
+            .unwrap(),
+        ];
+        let mut second = message("om_2", "ou_2", "user", "b");
+        second.mentions = vec![
+            serde_json::from_value(json!({
+                "key": "@_user_2",
+                "open_id": "ou_bot",
+                "name": "Bot",
+                "mentioned_type": "bot"
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "key": "@_user_3",
+                "open_id": "ou_other",
+                "name": "Other",
+                "mentioned_type": "user"
+            }))
+            .unwrap(),
+        ];
+
+        let mentions = merge_mentions(&[first, second]);
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(mentions[0].open_id.as_deref(), Some("ou_bot"));
+        assert_eq!(mentions[0].is_bot, Some(true));
+        assert_eq!(mentions[1].open_id.as_deref(), Some("ou_other"));
+        assert_eq!(mentions[1].is_bot, Some(false));
     }
 
     #[test]

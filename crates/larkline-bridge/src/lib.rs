@@ -6,8 +6,11 @@
 
 pub mod agent_runner;
 pub mod callback;
+pub mod keepalive;
+pub mod pending;
 pub mod policy;
 pub mod render;
 pub mod run;
 
+pub use pending::{PendingQueue, PushOutcome, QueueLimits};
 pub use run::Bridge;
