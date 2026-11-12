@@ -99,12 +99,12 @@ use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingMan
 use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
 use crate::policy;
-use crate::render::RunView;
+use crate::render::{
+    CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, card_status, card_summary, render_card,
+};
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
-use crate::text_render::{
-    TextFormat, TextRenderOptions, mask_emails, render_text, render_text_without_footer,
-};
+use crate::text_render::{TextFormat, TextRenderOptions, render_text, render_text_without_footer};
 
 /// Card updates are throttled; Feishu rate-limits card writes and a token
 /// stream would otherwise produce dozens of updates per second.
@@ -119,13 +119,6 @@ pub(crate) const RUN_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// User-visible result when [`RUN_SLOT_WAIT`] expires.
 pub(crate) const RUN_SLOT_TIMEOUT_REPLY: &str =
     "⏳ 当前并发任务已达上限，等待空闲运行槽超时，请稍后重试。";
-/// Sanity cap for the markdown element rendered into a card.
-///
-/// This is **not** the old 8000-character display cap: the full answer is
-/// rendered, and the cap only guards CardKit's ~30KB card/element payload for a
-/// runaway agent. 100k characters is a last-resort sanity guard, not a display
-/// limit; normal answers (tens of thousands of characters) fit.
-const MAX_CARD_ELEMENT_CHARS: usize = 100_000;
 /// Quiet window before a batch of messages starts a run. The TypeScript bridge
 /// uses the same 600ms (`DEBOUNCE_MS` in `src/bot/channel.ts`).
 const DEBOUNCE: Duration = Duration::from_millis(600);
@@ -1935,6 +1928,10 @@ impl Bridge {
                         message: "运行超时（30 分钟），已终止。".to_string(),
                         termination_reason: TerminationReason::Timeout,
                     });
+                    // The rich-card terminal notice reports the deadline in
+                    // minutes (TS `idleTimeoutMinutes`); text/markdown replies
+                    // keep using the error message above.
+                    view.idle_timeout_minutes = Some(RUN_TIMEOUT.as_secs() / 60);
                     break;
                 }
                 LoopTick::PauseElapsed => {
@@ -2741,10 +2738,12 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Build the rich card for the current view.
 ///
-/// Mirrors the TS `renderCard` shape the port can express: answer, optional
-/// tool panel, terminal note, optional signed stop button and a status footer.
-/// The final/paused frames explicitly set `streaming_mode: false`; the live
-/// CardKit path re-enables streaming with `enable_streaming`.
+/// Thin adapter around [`render::render_card`]: it maps the profile preferences
+/// and the bridge's signed stop token onto [`CardRenderOptions`] and appends the
+/// bridge-only metadata note (agent · status · elapsed/tokens). The 30KB
+/// degradation policy and every panel/collapse rule live in the renderer; the
+/// final/paused frames keep `streaming_mode: false`, and the live CardKit path
+/// re-enables streaming with `enable_streaming`.
 fn build_card(
     profile: &ProfileConfig,
     view: &RunView,
@@ -2752,84 +2751,29 @@ fn build_card(
     started: Instant,
     stop: Option<(&str, &str)>,
 ) -> lark_channel::Card {
-    // Feishu's tenant audit rejects cards containing a raw email address, so
-    // mask at this boundary exactly like `renderCard`/`deepMaskEmails` in TS.
-    // Mask before truncating: a cut can then never expose a raw address.
-    let answer = mask_emails(view.best_answer().trim());
-
-    let mut elements = Vec::new();
-    if !answer.is_empty() {
-        elements.push(json!({
-            "tag": "markdown",
-            "content": truncate_chars(&answer, MAX_CARD_ELEMENT_CHARS),
-            // Stable id so CardKit can also stream just the answer element later;
-            // the run flow currently uses whole-card updates.
-            "element_id": STREAMING_ELEMENT_ID,
-        }));
-    }
-    // `/config set showToolCalls false` hides the tool feed from cards, like
-    // the TypeScript card renderer.
-    if profile.show_tool_calls() && !view.tools.is_empty() {
-        let tools: Vec<String> = view
-            .tools
-            .iter()
-            .rev()
-            .take(6)
-            .rev()
-            .map(|tool| format!("• {}", mask_emails(tool)))
-            .collect();
-        elements.push(json!({
-            "tag": "markdown",
-            "content": format!("**工具**\n{}", tools.join("\n"))
-        }));
-    }
-    // TS terminal notes: interruptions get an explicit marker instead of
-    // freezing on the last running frame, and an empty clean finish gets the
-    // "no content" note (the old bridge used a bare "…" placeholder).
-    if view.is_interrupted() {
-        elements.push(notation("_⏹ 已被中断_"));
-    } else if view.finished && answer.is_empty() {
-        elements.push(notation("_（未返回内容）_"));
-    }
-    if let Some((scope, token)) = stop {
-        elements.push(json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "⏹ 停止" },
-            "type": "danger",
-            "behaviors": [{
-                "type": "callback",
-                "value": {
-                    "__bridge_cb": true,
-                    "action": "stop",
-                    "scope": scope,
-                    "token": token
-                }
-            }]
-        }));
-    }
-    elements.push(json!({
-        "tag": "note",
-        "elements": [{
-            "tag": "plain_text",
-            "content": format!(
-                "{} · {} · {}",
-                profile.agent_kind.display_name(),
-                status,
-                view.footer(started.elapsed())
-            )
-        }]
-    }));
-
-    let summary = card_summary(view, status);
-    let value = json!({
-        "schema": "2.0",
-        "config": {
-            "update_multi": true,
-            "streaming_mode": false,
-            "summary": { "content": summary }
-        },
-        "body": { "elements": elements }
-    });
+    let options = CardRenderOptions {
+        reasoning: card_reasoning(profile),
+        tool_panels: profile.show_tool_calls(),
+        metadata_note: Some(format!(
+            "{} · {} · {}",
+            profile.agent_kind.display_name(),
+            status,
+            view.footer(started.elapsed())
+        )),
+        stop_value: stop.map(|(scope, token)| {
+            json!({
+                "__bridge_cb": true,
+                "action": "stop",
+                "scope": scope,
+                "token": token
+            })
+        }),
+        // Stable id so CardKit can also stream just the answer element later;
+        // the run flow currently uses whole-card updates.
+        answer_element_id: Some(STREAMING_ELEMENT_ID.to_string()),
+        ..CardRenderOptions::default()
+    };
+    let value = render_card(view, &options);
     lark_channel::Card::from_value(value).expect("run card is valid")
 }
 
@@ -2855,11 +2799,11 @@ fn build_markdown_card(
     if body.trim().is_empty() {
         body = "（没有输出）".to_string();
     }
-    let body = truncate_chars(&body, MAX_CARD_ELEMENT_CHARS);
+    let body = truncate_chars(&body, MAX_CARD_TEXT_CHARS);
     let summary = if paused {
         "仍在运行".to_string()
     } else {
-        card_summary(view, card_status(view))
+        card_summary(view).to_string()
     };
     let value = json!({
         "schema": "2.0",
@@ -2885,7 +2829,13 @@ fn paused_rich_card(
     view: &RunView,
     started: Instant,
 ) -> lark_channel::Card {
-    let mut value = build_card(profile, view, card_status(view), started, None).into_value();
+    // The TS pause frame renders with `footer: null` so a paused card never
+    // claims the process is still updating: clone the view without the status
+    // phrase instead of teaching `build_card` about paused frames.
+    let mut paused_view = view.clone();
+    paused_view.footer_status = None;
+    let mut value =
+        build_card(profile, &paused_view, card_status(view), started, None).into_value();
     if let Some(config) = value["config"].as_object_mut() {
         config.insert("streaming_mode".to_string(), Value::Bool(false));
         config.insert("summary".to_string(), json!({ "content": "仍在运行" }));
@@ -2903,15 +2853,6 @@ fn paused_rich_card(
     lark_channel::Card::from_value(value).expect("paused run card is valid")
 }
 
-/// A notation-sized markdown note element.
-fn notation(content: impl Into<String>) -> Value {
-    json!({
-        "tag": "markdown",
-        "content": content.into(),
-        "text_size": "notation"
-    })
-}
-
 fn append_pause_note(body: String) -> String {
     if body.trim().is_empty() {
         STREAM_PAUSED_NOTE.to_string()
@@ -2920,27 +2861,19 @@ fn append_pause_note(body: String) -> String {
     }
 }
 
-/// One-line status for the card footer.
-fn card_status(view: &RunView) -> &'static str {
-    match view.termination {
-        Some(TerminationReason::Interrupted) => "已中断",
-        Some(TerminationReason::Timeout) => "已超时",
-        _ if view.error.is_some() => "失败",
-        _ if view.finished => "完成",
-        _ => "运行中",
-    }
-}
-
-/// Preview summary text (TS `summaryText`): a terminal status once finished,
-/// never a stale "运行中".
-fn card_summary(view: &RunView, status: &str) -> String {
-    match view.termination {
-        Some(TerminationReason::Interrupted) => "已中断".to_string(),
-        Some(TerminationReason::Timeout) => "已超时".to_string(),
-        _ if view.error.is_some() => "出错".to_string(),
-        _ if view.finished => "已完成".to_string(),
-        _ => status.to_string(),
-    }
+/// Whether the rich card renders the reasoning panel.
+///
+/// Mirrors the TS `showCardReasoning = reasoningDisplay === 'auto' || 'inline'`:
+/// the default (`None`, i.e. auto) and `inline` show the panel, `off` and
+/// `bubble` (COT stream) do not.
+fn card_reasoning(profile: &ProfileConfig) -> bool {
+    matches!(
+        profile
+            .preferences
+            .as_ref()
+            .and_then(|prefs| prefs.reasoning_display),
+        None | Some(ReasoningDisplay::Auto) | Some(ReasoningDisplay::Inline)
+    )
 }
 
 /// Whether the profile shows inline reasoning outside the card panel.
@@ -3721,7 +3654,7 @@ mod tests {
     }
 
     #[test]
-    fn card_mode_keeps_the_tools_footer_and_signed_stop_button() {
+    fn card_mode_keeps_the_tool_panel_status_footer_and_signed_stop_button() {
         let mut view = RunView::default();
         view.apply(&AgentEvent::Text {
             delta: "answer".into(),
@@ -3739,11 +3672,23 @@ mod tests {
             Some(("oc_1", "deadbeef")),
         );
         let payload = serde_json::to_string(card.as_value()).unwrap();
-        assert!(payload.contains("**工具**"), "{payload}");
+        // The flat 6-line "**工具**" block is gone: each tool call is a panel.
+        assert!(!payload.contains("**工具**"), "{payload}");
+        assert!(
+            payload.contains("\"tag\":\"collapsible_panel\""),
+            "{payload}"
+        );
+        assert!(payload.contains("⏳ **Bash** — pwd"), "{payload}");
+        // The live footer phrase precedes the bridge metadata note and button.
+        assert!(payload.contains("🧰 正在调用工具"), "{payload}");
         assert!(payload.contains("\"tag\":\"note\""), "{payload}");
         assert!(payload.contains("__bridge_cb"), "{payload}");
         assert!(payload.contains("deadbeef"), "{payload}");
-        assert!(payload.contains("停止"), "{payload}");
+        assert!(payload.contains("⏹ 终止"), "{payload}");
+        let phrase = payload.find("🧰 正在调用工具").unwrap();
+        let meta = payload.find("Claude Code").unwrap();
+        let button = payload.find("⏹ 终止").unwrap();
+        assert!(phrase < meta && meta < button, "{payload}");
     }
 
     #[test]
@@ -3876,7 +3821,7 @@ mod tests {
         let text = serde_json::to_string(card.as_value()).unwrap();
         assert!(text.contains("__bridge_cb"));
         assert!(text.contains("deadbeef"));
-        assert!(text.contains("停止"));
+        assert!(text.contains("⏹ 终止"));
 
         let finished = build_card(&profile(), &view, "完成", Instant::now(), None);
         let text = serde_json::to_string(finished.as_value()).unwrap();
@@ -3884,8 +3829,11 @@ mod tests {
     }
 
     #[test]
-    fn show_tool_calls_false_hides_the_tools_block() {
+    fn show_tool_calls_false_hides_only_the_tool_panels() {
         let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "the answer".into(),
+        });
         view.apply(&AgentEvent::ToolUse {
             id: "t1".into(),
             name: "Bash".into(),
@@ -3895,18 +3843,22 @@ mod tests {
             build_card(&profile(), &view, "运行中", Instant::now(), None).as_value(),
         )
         .unwrap();
-        assert!(shown.contains("Bash"));
+        assert!(shown.contains("Bash"), "{shown}");
+        assert!(shown.contains("the answer"), "{shown}");
 
         let mut hidden = profile();
         hidden
             .preferences
             .get_or_insert_with(Preferences::default)
             .show_tool_calls = Some(false);
-        let shown = serde_json::to_string(
+        let hidden_payload = serde_json::to_string(
             build_card(&hidden, &view, "运行中", Instant::now(), None).as_value(),
         )
         .unwrap();
-        assert!(!shown.contains("Bash"));
+        assert!(!hidden_payload.contains("Bash"), "{hidden_payload}");
+        // Hiding tools must not hide the answer or the stop/footer plumbing.
+        assert!(hidden_payload.contains("the answer"), "{hidden_payload}");
+        assert!(hidden_payload.contains("正在调用工具"), "{hidden_payload}");
     }
 
     #[test]
@@ -5299,19 +5251,20 @@ mod tests {
             thread_id: None,
             termination_reason: TerminationReason::Normal,
         });
-        assert_eq!(card_status(&done), "完成");
+        assert_eq!(card_status(&done), "已完成");
         let text = serde_json::to_string(
             build_card(&profile(), &done, card_status(&done), Instant::now(), None).as_value(),
         )
         .unwrap();
-        assert!(text.contains("完成"), "{text}");
+        assert!(text.contains("已完成"), "{text}");
+        assert!(text.contains("_（未返回内容）_"), "{text}");
 
         let mut failed = RunView::default();
         failed.apply(&AgentEvent::Error {
             message: "boom".into(),
             termination_reason: TerminationReason::Failed,
         });
-        assert_eq!(card_status(&failed), "失败");
+        assert_eq!(card_status(&failed), "出错");
         let text = serde_json::to_string(
             build_card(
                 &profile(),
@@ -5323,33 +5276,187 @@ mod tests {
             .as_value(),
         )
         .unwrap();
-        assert!(text.contains("失败"), "{text}");
+        assert!(text.contains("出错"), "{text}");
+        assert!(text.contains("⚠️ agent 失败：boom"), "{text}");
     }
 
     #[test]
-    fn card_tool_feed_keeps_the_latest_six_calls_in_order() {
-        let mut view = RunView::default();
-        for index in 1..=7 {
-            view.apply(&AgentEvent::ToolUse {
+    fn card_tool_groups_follow_the_ts_collapse_rule() {
+        // Fewer than three calls: one panel each, no summary.
+        let mut two = RunView::default();
+        for (index, name, input) in [
+            ("t1", "Bash", json!({ "command": "pwd" })),
+            ("t2", "Read", json!({ "file_path": "/a.ts" })),
+        ] {
+            two.apply(&AgentEvent::ToolUse {
+                id: index.into(),
+                name: name.into(),
+                input,
+            });
+            two.apply(&AgentEvent::ToolResult {
+                id: index.into(),
+                output: "ok".into(),
+                is_error: false,
+            });
+        }
+        let payload = serde_json::to_string(
+            build_card(&profile(), &two, "运行中", Instant::now(), None).as_value(),
+        )
+        .unwrap();
+        assert!(!payload.contains("个工具调用"), "{payload}");
+        assert!(payload.contains("✅ **Bash** — pwd"), "{payload}");
+        assert!(payload.contains("✅ **Read** — /a.ts"), "{payload}");
+        assert_eq!(
+            payload.matches("\"tag\":\"collapsible_panel\"").count(),
+            2,
+            "{payload}"
+        );
+
+        // Three or more while running: prior calls collapse into the summary,
+        // the latest stays expanded with its body.
+        let mut four = RunView::default();
+        for index in 1..=4 {
+            four.apply(&AgentEvent::ToolUse {
                 id: format!("t{index}"),
                 name: "Bash".into(),
                 input: json!({ "command": format!("step-{index}") }),
             });
         }
-        let card = build_card(&profile(), &view, "运行中", Instant::now(), None);
-        let payload = serde_json::to_string(card.as_value()).unwrap();
+        let payload = serde_json::to_string(
+            build_card(&profile(), &four, "运行中", Instant::now(), None).as_value(),
+        )
+        .unwrap();
+        assert!(payload.contains("☕ **3 个工具调用**"), "{payload}");
+        assert!(payload.contains("⏳ **Bash** — step-4"), "{payload}");
+        assert_eq!(
+            payload.matches("\"tag\":\"collapsible_panel\"").count(),
+            2,
+            "{payload}"
+        );
+        // Only the latest panel keeps a body.
+        assert_eq!(payload.matches("**Command**").count(), 1, "{payload}");
+        assert!(
+            payload.contains("step-1"),
+            "summary keeps headers: {payload}"
+        );
 
-        // The oldest call falls out of the six-line window.
-        assert!(!payload.contains("step-1"), "{payload}");
-        let mut previous = 0;
-        for index in 2..=7 {
-            let marker = format!("step-{index}");
-            let position = payload.find(&marker).unwrap_or_else(|| {
-                panic!("{marker} missing from card: {payload}");
-            });
-            assert!(position > previous, "{marker} is out of order: {payload}");
-            previous = position;
+        // A finished run collapses every call into one summary.
+        four.apply(&AgentEvent::Done {
+            session_id: None,
+            thread_id: None,
+            termination_reason: TerminationReason::Normal,
+        });
+        let payload = serde_json::to_string(
+            build_card(&profile(), &four, card_status(&four), Instant::now(), None).as_value(),
+        )
+        .unwrap();
+        assert!(
+            payload.contains("☕ **4 个工具调用（已结束）**"),
+            "{payload}"
+        );
+        assert_eq!(
+            payload.matches("\"tag\":\"collapsible_panel\"").count(),
+            1,
+            "{payload}"
+        );
+        assert!(!payload.contains("\"expanded\":true"), "{payload}");
+    }
+
+    #[test]
+    fn rich_card_reasoning_panel_follows_the_profile() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Thinking {
+            delta: "checking options".into(),
+        });
+
+        for display in [
+            None,
+            Some(ReasoningDisplay::Auto),
+            Some(ReasoningDisplay::Inline),
+        ] {
+            let mut configured = profile();
+            configured
+                .preferences
+                .get_or_insert_with(Preferences::default)
+                .reasoning_display = display;
+            let payload = serde_json::to_string(
+                build_card(&configured, &view, "运行中", Instant::now(), None).as_value(),
+            )
+            .unwrap();
+            assert!(payload.contains("🧠 **思考中**"), "{display:?}: {payload}");
+            assert!(
+                payload.contains("checking options"),
+                "{display:?}: {payload}"
+            );
         }
+
+        for display in [ReasoningDisplay::Off, ReasoningDisplay::Bubble] {
+            let mut configured = profile();
+            configured
+                .preferences
+                .get_or_insert_with(Preferences::default)
+                .reasoning_display = Some(display);
+            let payload = serde_json::to_string(
+                build_card(&configured, &view, "运行中", Instant::now(), None).as_value(),
+            )
+            .unwrap();
+            assert!(
+                !payload.contains("🧠 **"),
+                "{display:?} rendered the panel: {payload}"
+            );
+            assert!(
+                !payload.contains("checking options"),
+                "{display:?}: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_card_timeout_notice_reports_minutes_and_has_no_stop_button() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::Text {
+            delta: "partial".into(),
+        });
+        view.mark_idle_timeout(15);
+        let card = build_card(
+            &profile(),
+            &view,
+            card_status(&view),
+            Instant::now(),
+            Some(("oc_1", "deadbeef")),
+        );
+        let payload = serde_json::to_string(card.as_value()).unwrap();
+        assert!(
+            payload.contains("_⏱ 15 分钟无响应,已自动终止_"),
+            "{payload}"
+        );
+        assert_eq!(card.as_value()["config"]["summary"]["content"], "已超时");
+        assert!(!payload.contains("__bridge_cb"), "{payload}");
+        assert!(!payload.contains("正在输出"), "{payload}");
+
+        // The run loop's 30-minute deadline applies an Error event and pins
+        // the minutes, so the card explains the wall-clock kill.
+        let mut deadline = RunView::default();
+        deadline.apply(&AgentEvent::Error {
+            message: "运行超时（30 分钟），已终止。".into(),
+            termination_reason: TerminationReason::Timeout,
+        });
+        deadline.idle_timeout_minutes = Some(RUN_TIMEOUT.as_secs() / 60);
+        let payload = serde_json::to_string(
+            build_card(
+                &profile(),
+                &deadline,
+                card_status(&deadline),
+                Instant::now(),
+                None,
+            )
+            .as_value(),
+        )
+        .unwrap();
+        assert!(
+            payload.contains("_⏱ 30 分钟无响应,已自动终止_"),
+            "{payload}"
+        );
     }
 
     #[test]

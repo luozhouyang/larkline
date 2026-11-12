@@ -66,6 +66,21 @@ Ported:
   translation -> throttled updates -> session persistence; at the 8.5-minute
   card safe age the progress frame is paused once (streaming off, no button,
   pause note) and the full answer is sent separately when the run finishes
+- rich card content model (port of `src/card/run-renderer.ts` and
+  `src/card/tool-render.ts`): reasoning panel (open while thinking, 3000-char
+  body), one collapsible panel per tool call (✅/❌/⏳ header, red error border,
+  input/output markdown with the 80/600/1200/2500-char caps), header-only
+  "☕ N 个工具调用" summary once a group reaches three calls (running keeps the
+  latest expanded; finished runs collapse all), terminal notices
+  (`⏹ 已被中断`, `⏱ N 分钟无响应`, `⚠️ agent 失败：…`, `（未返回内容）`), the
+  live footer phrase (`🧠 正在思考` / `🧰 正在调用工具` / `✍️ 正在输出`) and the
+  signed stop button (`⏹ 终止`) after it
+- rich card size policy: the serialized card is measured after email masking
+  and kept under Feishu's 30KB limit by degrading in value order — tool bodies
+  collapse to headers, the reasoning body shrinks then disappears, tool groups
+  disappear, the bridge metadata note and live footer phrase drop, and the
+  answer markdown is truncated last with a visible suffix; terminal notices,
+  the summary label and the stop button are never dropped
 - session store (resume only from the same cwd), stable per-scope sessions
 - topic scoping: sessions, workspace overrides, pending queues and live runs
   use `chatId:threadId` for topic-group messages (port of `src/bot/scope.ts`);
@@ -128,11 +143,21 @@ primitive so it can be picked up without re-deriving the design.
    hardcode `SandboxMode::DangerFullAccess`. The idle watchdog and `/timeout`
    are also not wired; `agent_stop_grace_ms` and session idle timeouts are
    parsed but unused.
-4. **Presentation parity** — no COT process messages, no card thinking panel
-   and no reasoning bubble. The text renderer honors `reasoningDisplay: inline`
-   only; `auto`, `off` and `bubble` have no COT client behind them. `markdown`
-   mode is a one-element streaming card with tool summaries from the text
-   renderer but no tool panel, footer element or stop button.
+4. **Presentation parity** — no COT process messages and no reasoning bubble.
+   The rich card now matches the TypeScript content model (reasoning panel,
+   per-tool panels, collapse rules, terminal notices, footer status and stop
+   button), but three presentation details are deliberate Rust simplifications:
+   tool inputs/outputs are stored bounded (4k chars) instead of raw; a
+   `final_text` event is folded into the trailing text block so a final-only
+   agent still renders (TS keeps it out of `blocks`); and individual tool panels
+   below the three-call threshold start collapsed (`expanded: false`) exactly as
+   in the TS snapshot. The rich-card terminal timeout notice reports the
+   30-minute bridge deadline because the idle watchdog is not wired; an
+   agent-reported timeout without minutes renders `⏱ 0 分钟`. The text renderer
+   honors `reasoningDisplay: inline` only; `auto`, `off` and `bubble` have no
+   COT client behind them. `markdown` mode is a one-element streaming card with
+   tool summaries from the text renderer but no tool panel, footer element or
+   stop button.
 5. **Attachments** — inbound images and files are not downloaded. `AgentSpec`
    always carries an empty image list, so the agent receives text prompts only.
 6. **Topic-scope edge cases** — topic scoping is implemented from the event's
