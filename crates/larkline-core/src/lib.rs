@@ -13,6 +13,7 @@ pub mod lock;
 pub mod paths;
 pub mod session;
 pub mod store;
+pub mod workspace;
 
 pub use config::{
     AgentKind, MessageReplyMode, Preferences, ProfileConfig, RootConfig, SecretInput, SecretRef,
@@ -23,6 +24,7 @@ pub use keystore::Keystore;
 pub use lock::FileLock;
 pub use paths::AppPaths;
 pub use session::{SessionEntry, SessionStore};
+pub use workspace::{ChatWorkspace, WorkspaceStore};
 
 /// Crate version, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
