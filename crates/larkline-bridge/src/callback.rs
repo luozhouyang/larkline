@@ -50,6 +50,26 @@
 //! disabled. Retired keys keep verifying old buttons but are never used to
 //! sign.
 //!
+//! ### What the signer must put in the payload
+//!
+//! A bridge-aware client (for example `lark-cli`) signs with the same key and
+//! binds the click to the conversation:
+//!
+//! * `r` — its run/session id; opaque to the bridge (logged only);
+//! * `s` and `c` — the chat id the card is sent to (the Rust bridge has no
+//!   topic scopes, so both are the plain chat id);
+//! * `o` — the open id of the user allowed to click, i.e. the sender of the
+//!   message that started the run (the `bridge_context.senderId` the agent
+//!   already sees);
+//! * `a` — [`AGENT_CALLBACK_ACTION`] (`agent_callback`);
+//! * `exp` — a future Unix-millisecond expiry; `n` — a fresh nonce;
+//! * `kv` — the configured key version.
+//!
+//! When the key comes from the environment, export it for the `larkline run`
+//! process: agent processes inherit the bridge environment, so a signer that
+//! runs inside a run sees the same value. The profile `extra.callback.*` form
+//! keeps the key in `config.json`, which a bridge-aware client already reads.
+//!
 //! ## Verification
 //!
 //! [`CallbackAuth::verify`] checks the prefix, parses the payload, resolves
