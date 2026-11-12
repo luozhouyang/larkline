@@ -7,8 +7,10 @@
 
 pub mod cards;
 pub mod client;
+pub mod meeting;
 pub mod rest;
 
 pub use cards::{error_card, final_card, running_card};
 pub use client::{Channel, LarkResult, domain_for};
+pub use meeting::{EventsPage, JoinResult, MeetingActivityItem, VcBotClient, is_not_in_gray};
 pub use rest::{RestClient, RestError, RestResult};
