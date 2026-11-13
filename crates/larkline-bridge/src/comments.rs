@@ -1104,6 +1104,7 @@ async fn run_comment_agent_with_wait(
 
     let spec = AgentSpec {
         kind: bridge.profile.agent_kind,
+        approvals: false,
         binary: bridge.agent_binary.clone(),
         cwd,
         prompt,

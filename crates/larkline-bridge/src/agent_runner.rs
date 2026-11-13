@@ -28,6 +28,13 @@ use crate::permissions::RunPermissions;
 #[derive(Debug, Clone)]
 pub struct AgentSpec {
     pub kind: AgentKind,
+    /// Whether this run can present an approval card.
+    ///
+    /// IM runs do; comment and meeting runs have their own loops and no card
+    /// flow, so they keep the agent's one-shot behavior (Claude print-mode
+    /// auto-deny / Codex `approval_policy=never`) instead of blocking on a
+    /// prompt nobody can answer.
+    pub approvals: bool,
     pub binary: PathBuf,
     pub cwd: PathBuf,
     pub prompt: String,
@@ -284,7 +291,7 @@ fn build_agent_args(
 ) -> anyhow::Result<(Vec<String>, String)> {
     match spec.kind {
         AgentKind::Claude => {
-            let approvals = spec.permissions.claude_approvals_enabled();
+            let approvals = spec.approvals && spec.permissions.claude_approvals_enabled();
             Ok((
                 build_claude_args(&ClaudeArgsInput {
                     permission_mode: Some(spec.permissions.claude_permission_mode().as_str()),
@@ -343,7 +350,10 @@ impl AgentProcess {
         }));
 
         let system_prompt_file = TempFile::new(&system_prompt)?;
-        if spec.kind == AgentKind::Codex && spec.permissions.codex_approvals_enabled() {
+        if spec.approvals
+            && spec.kind == AgentKind::Codex
+            && spec.permissions.codex_approvals_enabled()
+        {
             return Self::spawn_codex_app_server(spec, system_prompt, system_prompt_file).await;
         }
         let (args, stdin_prompt) = build_agent_args(&spec, &system_prompt_file.path)?;
@@ -386,8 +396,9 @@ impl AgentProcess {
         // Claude approval runs keep stdin open: the control protocol writes
         // `control_response` frames there while the agent is blocked on a
         // permission prompt. Everything else remains a one-shot prompt.
-        let approvals =
-            spec.kind == AgentKind::Claude && spec.permissions.claude_approvals_enabled();
+        let approvals = spec.approvals
+            && spec.kind == AgentKind::Claude
+            && spec.permissions.claude_approvals_enabled();
         let stdin = if let Some(mut stdin) = child.stdin.take() {
             // `stream-json` input is newline-delimited; a one-shot text prompt
             // is written verbatim (the CLI reads it until EOF).
@@ -713,6 +724,7 @@ mod tests {
     fn spec(kind: AgentKind, permissions: RunPermissions) -> AgentSpec {
         AgentSpec {
             kind,
+            approvals: true,
             binary: PathBuf::from("/nonexistent/agent"),
             cwd: PathBuf::from("/work"),
             prompt: "hello".into(),
@@ -771,6 +783,20 @@ mod tests {
             }
             assert!(!args.iter().any(|arg| arg == "hello"));
         }
+    }
+
+    #[test]
+    fn non_im_runs_disable_the_approval_protocol() {
+        let mut spec = spec(
+            AgentKind::Claude,
+            permissions(AccessMode::Workspace, AccessMode::Workspace),
+        );
+        spec.approvals = false;
+        let (args, stdin) =
+            build_agent_args(&spec, Path::new("/tmp/system.md")).expect("claude args");
+        assert_eq!(stdin, "hello");
+        assert!(!args.iter().any(|arg| arg == "--input-format"));
+        assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
     }
 
     #[test]

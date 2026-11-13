@@ -2325,6 +2325,7 @@ impl MeetingManager {
         let resume = self.host.resume_session(scope, &cwd_str).await;
         let spec = AgentSpec {
             kind: self.agent.kind,
+            approvals: false,
             binary: self.agent.binary.clone(),
             cwd,
             prompt,

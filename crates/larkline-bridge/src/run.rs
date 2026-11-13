@@ -362,6 +362,7 @@ struct ApprovalDecision {
 /// [`Bridge::active`] so [`Bridge::handle_card_action`] can deliver a decision
 /// without knowing the run task.
 struct ApprovalBroker {
+    run_id: u64,
     operator: String,
     tx: tokio::sync::mpsc::UnboundedSender<ApprovalDecision>,
 }
@@ -1575,6 +1576,7 @@ impl Bridge {
             .to_string();
         let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
         let approvals = Arc::new(ApprovalBroker {
+            run_id: id,
             operator: operator.clone(),
             tx: approval_tx,
         });
@@ -1591,7 +1593,7 @@ impl Bridge {
                 permit: Some(permit),
             };
             if let Err(err) = bridge
-                .run_batch(batch, run_interrupt, generation, operator, approval_rx)
+                .run_batch(batch, run_interrupt, generation, id, operator, approval_rx)
                 .await
             {
                 tracing::error!(error = %err, "agent run failed");
@@ -2162,10 +2164,11 @@ impl Bridge {
         let decision = value.get("decision").and_then(Value::as_str)?;
         let request_id = value.get("request_id").and_then(Value::as_str)?;
         let operator = value.get("operator").and_then(Value::as_str)?;
+        let run_id = value.get("run_id").and_then(Value::as_u64)?;
         if decision != "allow" && decision != "deny" {
             return None;
         }
-        if approval_action(decision, request_id, operator) != action_name {
+        if approval_action(decision, request_id, operator, run_id) != action_name {
             tracing::warn!(
                 scope,
                 "rejected an approval click whose action fields were changed"
@@ -2176,12 +2179,20 @@ impl Bridge {
             tracing::info!(scope, clicker, operator, "approval click from another user");
             return Some("只有发起本次任务的人可以处理授权。".to_string());
         }
-        let broker = lock(&self.active)
-            .get(scope)
-            .and_then(|run| run.approvals.clone());
+        let (run_matches, broker) = {
+            let active = lock(&self.active);
+            let run = active.get(scope);
+            (
+                run.is_some_and(|run| run.id == run_id),
+                run.and_then(|run| run.approvals.clone()),
+            )
+        };
         let Some(broker) = broker else {
             return Some("该授权请求已失效。".to_string());
         };
+        if !run_matches || broker.run_id != run_id {
+            return Some("该授权请求已失效。".to_string());
+        }
         if broker.operator != operator {
             return Some("只有发起本次任务的人可以处理授权。".to_string());
         }
@@ -2384,6 +2395,7 @@ impl Bridge {
         batch: Vec<NormalizedMessage>,
         interrupt: Arc<RunInterrupt>,
         generation: u64,
+        run_id: u64,
         operator: String,
         mut approval_rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
     ) -> anyhow::Result<()> {
@@ -2515,6 +2527,7 @@ impl Bridge {
 
         let spec = AgentSpec {
             kind: profile.agent_kind,
+            approvals: true,
             binary: self.agent_binary.clone(),
             cwd,
             prompt,
@@ -2751,6 +2764,7 @@ impl Bridge {
                                 &scope,
                                 &chat_id,
                                 &last_message_id,
+                                run_id,
                                 &operator,
                                 &request,
                             )
@@ -2795,7 +2809,14 @@ impl Bridge {
                             ApprovalWait::TimedOut => ("⌛ 超时自动拒绝", ""),
                             ApprovalWait::Interrupted => ("⏹ 已停止", ""),
                         };
-                        let card = approval_decided_card(&request.tool_name, status, by);
+                        tracing::info!(
+                            scope,
+                            request_id = %request.request_id,
+                            allow = matches!(outcome, ApprovalWait::Answered { allow: true, .. }),
+                            by,
+                            "approval decided"
+                        );
+                        let card = approval_decided_card(&request.tool_name, status);
                         if let Ok(card) = lark_channel::Card::from_value(card) {
                             if let Err(err) = self
                                 .transport
@@ -2834,6 +2855,9 @@ impl Bridge {
                                 .await;
                                 last_update = Instant::now();
                             }
+                        }
+                        if view.finished {
+                            break;
                         }
                         pending = EventSource::next_events(&mut process);
                         continue;
@@ -3195,11 +3219,12 @@ impl Bridge {
         scope: &str,
         chat_id: &str,
         source_message_id: &str,
+        run_id: u64,
         operator: &str,
         request: &PendingApproval,
     ) -> Option<String> {
-        let allow_action = approval_action("allow", &request.request_id, operator);
-        let deny_action = approval_action("deny", &request.request_id, operator);
+        let allow_action = approval_action("allow", &request.request_id, operator, run_id);
+        let deny_action = approval_action("deny", &request.request_id, operator, run_id);
         let input_json = serde_json::to_string_pretty(&request.input)
             .unwrap_or_else(|_| request.input.to_string());
         let input_json = truncate_chars(&input_json, 2_500);
@@ -3208,6 +3233,7 @@ impl Bridge {
         let value = approval_card(&ApprovalCardInput {
             scope,
             operator,
+            run_id,
             request_id: &request.request_id,
             tool_name: &request.tool_name,
             description: request.description.as_deref(),
@@ -4243,8 +4269,8 @@ fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
 }
 
 /// Action string signed into an approval button token.
-fn approval_action(decision: &str, request_id: &str, operator: &str) -> String {
-    format!("approval:{decision}:{request_id}:{operator}")
+fn approval_action(decision: &str, request_id: &str, operator: &str, run_id: u64) -> String {
+    format!("approval:{decision}:{request_id}:{operator}:{run_id}")
 }
 
 /// One-line preview of the tool input for the approval card.

@@ -35,6 +35,7 @@ async fn streams_and_folds_a_fake_claude_run() {
 
     let mut process = AgentProcess::spawn(AgentSpec {
         kind: AgentKind::Claude,
+        approvals: true,
         binary,
         cwd: dir.path().to_path_buf(),
         prompt: "hello".into(),
@@ -81,6 +82,7 @@ async fn missing_binary_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let result = AgentProcess::spawn(AgentSpec {
         kind: AgentKind::Codex,
+        approvals: true,
         binary: dir.path().join("does-not-exist"),
         cwd: dir.path().to_path_buf(),
         prompt: "hello".into(),
@@ -123,6 +125,7 @@ async fn answers_a_claude_permission_request_over_stdin() {
     let binary = approval_agent(dir.path());
     let mut process = AgentProcess::spawn(AgentSpec {
         kind: AgentKind::Claude,
+        approvals: true,
         binary,
         cwd: dir.path().to_path_buf(),
         prompt: "hello".into(),
@@ -257,6 +260,7 @@ async fn codex_app_server_approval_round_trip() {
     let binary = fake_codex_app_server(dir.path());
     let mut process = AgentProcess::spawn(AgentSpec {
         kind: AgentKind::Codex,
+        approvals: true,
         binary,
         cwd: dir.path().to_path_buf(),
         prompt: "please run pwd".into(),
@@ -370,6 +374,7 @@ for line in sys.stdin:
 
     let mut process = AgentProcess::spawn(AgentSpec {
         kind: AgentKind::Codex,
+        approvals: true,
         binary: path,
         cwd: dir.path().to_path_buf(),
         prompt: "hello again".into(),

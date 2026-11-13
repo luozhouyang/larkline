@@ -1258,6 +1258,10 @@ fn take_chars(value: &str, max: usize) -> String {
 pub struct ApprovalCardInput<'a> {
     pub scope: &'a str,
     pub operator: &'a str,
+    /// Unique id of the run that raised this request. Binding it into the
+    /// signed action prevents an old card from being replayed against a later
+    /// run that happens to reuse the same request id.
+    pub run_id: u64,
     pub request_id: &'a str,
     pub tool_name: &'a str,
     pub description: Option<&'a str>,
@@ -1337,6 +1341,7 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
             "action": input.allow_action,
             "scope": input.scope,
             "operator": input.operator,
+            "run_id": input.run_id,
             "request_id": input.request_id,
             "decision": "allow",
             "token": input.allow_token,
@@ -1351,6 +1356,7 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
             "action": input.deny_action,
             "scope": input.scope,
             "operator": input.operator,
+            "run_id": input.run_id,
             "request_id": input.request_id,
             "decision": "deny",
             "token": input.deny_token,
@@ -1359,8 +1365,7 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
     elements.push(json!({
         "tag": "markdown",
         "content": format!(
-            "等待 @{} 决策；{} 分钟内未处理将自动拒绝。",
-            mask_emails(input.operator),
+            "仅发起本次任务的用户可以操作；{} 分钟内未处理将自动拒绝。",
             input.timeout_minutes
         ),
         "text_size": "notation"
@@ -1377,12 +1382,7 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
 }
 
 /// The approval card after a decision: status line, no buttons.
-pub fn approval_decided_card(tool_name: &str, status: &str, operator: &str) -> Value {
-    let note = if operator.trim().is_empty() {
-        status.to_string()
-    } else {
-        format!("{status} · @{}", mask_emails(operator))
-    };
+pub fn approval_decided_card(tool_name: &str, status: &str) -> Value {
     json!({
         "schema": "2.0",
         "config": {
@@ -1392,7 +1392,7 @@ pub fn approval_decided_card(tool_name: &str, status: &str, operator: &str) -> V
         },
         "body": { "elements": [
             { "tag": "markdown", "content": format!("🔐 **{tool_name}**") },
-            { "tag": "markdown", "content": note }
+            { "tag": "markdown", "content": status }
         ] }
     })
 }
@@ -2516,14 +2516,15 @@ mod tests {
         let card = approval_card(&ApprovalCardInput {
             scope: "oc_1",
             operator: "ou_operator",
+            run_id: 7,
             request_id: "req-1",
             tool_name: "Bash",
             description: Some("run a command"),
             input_preview: "echo me@example.com",
             input_json: r#"{"command":"echo me@example.com"}"#,
-            allow_action: "approval:allow:req-1:ou_operator",
+            allow_action: "approval:allow:req-1:ou_operator:7",
             allow_token: "allow-token",
-            deny_action: "approval:deny:req-1:ou_operator",
+            deny_action: "approval:deny:req-1:ou_operator:7",
             deny_token: "deny-token",
             timeout_minutes: 10,
         });
@@ -2536,11 +2537,11 @@ mod tests {
             .collect();
         assert_eq!(buttons.len(), 2, "{text}");
         assert_eq!(
-            buttons[0]["behaviors"][0]["value"]["action"], "approval:allow:req-1:ou_operator",
+            buttons[0]["behaviors"][0]["value"]["action"], "approval:allow:req-1:ou_operator:7",
             "{text}"
         );
         assert_eq!(
-            buttons[1]["behaviors"][0]["value"]["action"], "approval:deny:req-1:ou_operator",
+            buttons[1]["behaviors"][0]["value"]["action"], "approval:deny:req-1:ou_operator:7",
             "{text}"
         );
         assert!(text.contains("allow-token"), "{text}");
@@ -2560,7 +2561,7 @@ mod tests {
             2
         );
 
-        let decided = approval_decided_card("Bash", "✅ 已允许", "ou_operator");
+        let decided = approval_decided_card("Bash", "✅ 已允许");
         let decided_text = serde_json::to_string(&decided).unwrap();
         assert!(!decided_text.contains("__bridge_cb"), "{decided_text}");
         assert!(decided_text.contains("已允许"), "{decided_text}");
