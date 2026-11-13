@@ -790,3 +790,46 @@ body:not(:has([data-mobile-sidebar])) [data-menu-btn] {
 		--nb-header-height: 6rem;
 	}
 }
+
+/* Hand-drawn architecture and sequence diagrams in docs pages. */
+.nb-diagram {
+	margin: 2rem 0;
+	padding: 1rem;
+	border: 1px solid var(--nb-border);
+	border-radius: var(--nb-radius);
+	background: var(--nb-card);
+	overflow-x: auto;
+}
+.nb-diagram svg {
+	/* Keep labels readable on phones by scrolling the figure instead of
+	   shrinking a four-column diagram into the prose column. */
+	min-width: 680px;
+}
+.nb-diagram figcaption {
+	margin-top: 0.75rem;
+	color: var(--nb-muted-foreground);
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	text-align: center;
+}
+@media (max-width: 640px) {
+	.nb-diagram {
+		padding: 0.5rem;
+	}
+	.nb-diagram::before {
+		content: "Scroll horizontally to see the full diagram →";
+		display: block;
+		margin: 0 0 0.5rem;
+		color: var(--nb-muted-foreground);
+		font-size: 0.75rem;
+		text-align: center;
+	}
+}
+
+/* Keep diagrams legible on common laptop widths; the default content column
+   is tuned for prose, not 3-4 column diagrams. */
+@media (min-width: 1280px) {
+	:root {
+		--nb-content-max: 52rem;
+	}
+}

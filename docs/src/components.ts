@@ -11,6 +11,9 @@ import { CardGrid } from "./components/ui/card-grid";
 import { PackageManagers } from "./components/ui/package-managers";
 import { Step, Steps } from "./components/ui/steps";
 import { Tabs, TabItem } from "./components/ui/tabs";
+import ArchitectureDiagram from "./components/diagrams/ArchitectureDiagram.astro";
+import MessageFlowDiagram from "./components/diagrams/MessageFlowDiagram.astro";
+import ApprovalSequenceDiagram from "./components/diagrams/ApprovalSequenceDiagram.astro";
 
 export const components = {
   Aside,
@@ -22,4 +25,7 @@ export const components = {
   Steps,
   TabItem,
   Tabs,
+  ArchitectureDiagram,
+  MessageFlowDiagram,
+  ApprovalSequenceDiagram,
 };

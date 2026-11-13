@@ -1,0 +1,85 @@
+---
+/**
+ * How the bridge connects Feishu / Lark, the local agent and the state
+ * directory. Hand-drawn SVG so it stays dependency-free and theme-aware.
+ */
+---
+<figure class="nb-diagram">
+  <svg viewBox="0 0 1000 560" role="img" aria-labelledby="arch-title arch-desc" style="width:100%;height:auto">
+    <title id="arch-title">larkline architecture</title>
+    <desc id="arch-desc">Feishu and Lark talk to the larkline bridge, which runs Claude Code or Codex in a local working directory and stores state under the home directory.</desc>
+    <defs>
+      <marker id="arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--nb-muted-foreground)" />
+      </marker>
+    </defs>
+
+    <g font-family="ui-sans-serif, system-ui, sans-serif">
+      <!-- Feishu / Lark -->
+      <rect x="20" y="160" width="210" height="220" rx="14" fill="var(--nb-card)" stroke="var(--nb-border-strong)" stroke-width="1.5" />
+      <text x="125" y="195" text-anchor="middle" font-size="19" font-weight="650" fill="var(--nb-foreground)">Feishu / Lark</text>
+      <text x="125" y="225" text-anchor="middle" font-size="15" fill="var(--nb-muted-foreground)">DM · group · topic</text>
+      <text x="125" y="247" text-anchor="middle" font-size="15" fill="var(--nb-muted-foreground)">comments · meetings</text>
+      <line x1="55" y1="270" x2="195" y2="270" stroke="var(--nb-border)" stroke-width="1" />
+      <text x="125" y="300" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">WebSocket events</text>
+      <text x="125" y="322" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">REST messages</text>
+      <text x="125" y="354" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">CardKit callbacks</text>
+
+      <!-- Bridge -->
+      <rect x="290" y="55" width="330" height="405" rx="16" fill="var(--nb-brand-wash)" stroke="var(--nb-brand)" stroke-width="1.5" />
+      <text x="455" y="87" text-anchor="middle" font-size="19" font-weight="700" fill="var(--nb-foreground)">larkline bridge</text>
+      <rect x="315" y="108" width="280" height="55" rx="10" fill="var(--nb-card)" stroke="var(--nb-border)" />
+      <text x="455" y="132" text-anchor="middle" font-size="15" font-weight="600" fill="var(--nb-foreground)">Transport + normalizer</text>
+      <text x="455" y="151" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">events, attachments, comments</text>
+      <rect x="315" y="178" width="280" height="55" rx="10" fill="var(--nb-card)" stroke="var(--nb-border)" />
+      <text x="455" y="202" text-anchor="middle" font-size="15" font-weight="600" fill="var(--nb-foreground)">Policy + access</text>
+      <text x="455" y="221" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">allowlists, mentions, admins</text>
+      <rect x="315" y="248" width="280" height="55" rx="10" fill="var(--nb-card)" stroke="var(--nb-border)" />
+      <text x="455" y="272" text-anchor="middle" font-size="15" font-weight="600" fill="var(--nb-foreground)">Queue + run loop</text>
+      <text x="455" y="291" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">debounce, batching, concurrency</text>
+      <rect x="315" y="318" width="280" height="55" rx="10" fill="var(--nb-card)" stroke="var(--nb-border)" />
+      <text x="455" y="342" text-anchor="middle" font-size="15" font-weight="600" fill="var(--nb-foreground)">Renderer + interactions</text>
+      <text x="455" y="361" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">streaming card, approvals, questions</text>
+      <text x="455" y="408" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">one binary · async Tokio runtime</text>
+
+      <!-- State -->
+      <rect x="290" y="490" width="330" height="52" rx="10" fill="var(--nb-muted)" stroke="var(--nb-border)" />
+      <text x="455" y="512" text-anchor="middle" font-size="15" font-weight="600" fill="var(--nb-foreground)">~/.larkline</text>
+      <text x="455" y="530" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">config · sessions · pending · secrets</text>
+
+      <!-- Agent -->
+      <rect x="690" y="90" width="290" height="170" rx="14" fill="var(--nb-card)" stroke="var(--nb-border-strong)" stroke-width="1.5" />
+      <text x="835" y="125" text-anchor="middle" font-size="19" font-weight="650" fill="var(--nb-foreground)">Agent process</text>
+      <text x="835" y="153" text-anchor="middle" font-size="15" fill="var(--nb-muted-foreground)">Claude Code / Codex</text>
+      <line x1="725" y1="170" x2="945" y2="170" stroke="var(--nb-border)" stroke-width="1" />
+      <text x="835" y="195" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">stdio JSON · JSON-RPC</text>
+      <text x="835" y="217" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">events · control requests</text>
+      <text x="835" y="239" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">permissions · questions</text>
+
+      <!-- Workspace -->
+      <rect x="690" y="315" width="290" height="145" rx="14" fill="var(--nb-card)" stroke="var(--nb-border-strong)" stroke-width="1.5" />
+      <text x="835" y="349" text-anchor="middle" font-size="19" font-weight="650" fill="var(--nb-foreground)">Working directory</text>
+      <text x="835" y="377" text-anchor="middle" font-size="15" fill="var(--nb-muted-foreground)">files · git · shell · tests</text>
+      <text x="835" y="402" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">the agent reads and edits here</text>
+      <text x="835" y="424" text-anchor="middle" font-size="17" fill="var(--nb-muted-foreground)">larkline does not sandbox it</text>
+
+      <!-- Links -->
+      <line x1="230" y1="220" x2="290" y2="220" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="260" y="207" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">messages</text>
+      <line x1="290" y1="265" x2="230" y2="265" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="260" y="282" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">replies</text>
+
+      <line x1="620" y1="155" x2="690" y2="155" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="655" y="143" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">spawn</text>
+      <line x1="690" y1="205" x2="620" y2="205" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="655" y="197" text-anchor="middle" font-size="13" fill="var(--nb-muted-foreground)">events</text>
+
+      <line x1="835" y1="260" x2="835" y2="315" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="845" y="292" font-size="13" fill="var(--nb-muted-foreground)">tools</text>
+
+      <line x1="455" y1="460" x2="455" y2="490" stroke="var(--nb-muted-foreground)" stroke-width="1.5" marker-end="url(#arch-arrow)" />
+      <text x="465" y="480" font-size="13" fill="var(--nb-muted-foreground)">persist</text>
+    </g>
+  </svg>
+  <figcaption>The bridge is the only long-running process; agents are short-lived child processes, and all durable state lives in ~/.larkline.</figcaption>
+</figure>

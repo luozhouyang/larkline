@@ -1,0 +1,180 @@
+---
+title: How it works
+description: The architecture, message lifecycle, agent protocols, approvals, cards, and crash recovery behind larkline.
+sidebar:
+  order: 3
+---
+
+larkline is a long-running bridge process. It receives Feishu / Lark events,
+turns them into runs of a short-lived local agent process, and streams what the
+agent is doing back into the chat. All durable state lives under
+`~/.larkline`.
+
+This page follows one message from arrival to answer, then covers the two
+places where the flow pauses: approvals and user questions.
+
+## The moving parts
+
+<ArchitectureDiagram />
+
+There are four boundaries worth knowing:
+
+- **Feishu / Lark** is the only remote service. larkline holds a WebSocket for
+  events and calls REST endpoints for messages, cards, files, comments, and
+  meetings.
+- **The bridge** owns policy, queueing, concurrency, sessions, the agent
+  process, and the card renderer. It is the only piece that knows about both
+  Feishu and the agent.
+- **The agent process** is Claude Code or Codex, spawned as a child process.
+  It speaks stdin/stdout JSON (Claude) or app-server JSON-RPC (Codex); larkline
+  does not embed a model or a tool runtime.
+- **The working directory** is the agent's cwd. larkline treats it as a
+  directory, not a sandbox: the agent's own permission mode and OS permissions
+  decide what it can touch.
+
+<Aside type="caution" title="No extra sandbox">
+  larkline does not add a filesystem sandbox around the agent. Use the agent's
+  permission mode, a container, or a dedicated user account when you need a
+  hard boundary.
+</Aside>
+
+## One message, one turn
+
+<MessageFlowDiagram />
+
+### 1. Admission
+
+The transport normalizes each event into a message plus a scope. A scope is a
+DM, a group, a topic thread, a comment thread, or a meeting. Before anything is
+queued, the bridge applies:
+
+- the user and chat allowlists;
+- the group `@`-mention requirement;
+- admin checks for privileged commands;
+- the profile's default workspace.
+
+Commands such as `/status`, `/cd`, and `/stop` take a separate path: they bypass
+the queue and drop anything already waiting for the scope.
+
+### 2. Debounce and queue
+
+Messages that arrive close together are merged into one batch. If a run is
+already active for the scope, the batch waits in the per-scope pending queue.
+The queue is written through to `pending.json`, with a `queuedAtMs` timestamp
+per message, so a restart can restore it and a busy queue cannot keep an old
+message alive past its 24-hour TTL.
+
+### 3. Start or resume an agent
+
+When a slot is free, the bridge starts a run. It picks the working directory
+for the scope and looks up a resumable session:
+
+- if the stored session was created in the same directory, it resumes it;
+- otherwise it starts a new session;
+- `/new` clears the stored session; `/cd` changes the directory.
+
+The global concurrency cap (`preferences.maxConcurrentRuns`) is shared with
+comment and meeting runs. A card approval or question keeps its slot while it
+waits; a queued batch waits for the next slot.
+
+### 4. Translate agent output
+
+The bridge reads the agent's event stream and folds it into a `RunView`: the
+current text, reasoning, tool calls, terminal status, and any pending decision.
+The renderer uses that view to update the card.
+
+Claude Code runs over stdio JSON, including its permission and question control
+requests. Codex runs through `codex app-server` when the profile needs
+approvals; `danger-full-access` keeps the simpler `codex exec` path and never
+prompts.
+
+### 5. Stream the card
+
+A normal run updates the existing card instead of posting a new message for
+every delta. The card carries the answer, a compact tool summary, and a stop
+button while the run is live. Feishu force-finalizes a streaming card about ten
+minutes after creation, so larkline rolls over to a fresh card at about 8.5
+minutes: the old card is marked as continued, the new card links back, and the
+final answer lands on the latest card.
+
+If a new card cannot be created, the bridge stops updating and sends the final
+answer as a separate message.
+
+### 6. Finalize
+
+The terminal event updates the card, records the agent's session id, removes
+the consumed batch from the pending queue, and wakes the next queued batch.
+Interrupted and timed-out runs keep their partial answer and get a terminal
+notice instead of a live stop button.
+
+## When the run needs a decision
+
+<ApprovalSequenceDiagram />
+
+An approval and a user question use the same interaction channel. The agent
+blocks until it receives a response; the bridge posts a normal (non-streaming)
+card and waits.
+
+- Only the sender of the run's first message can click. Other senders get a
+  rejection.
+- The card shows the agent and working directory, plus the command or question.
+- **Allow this time** returns the original input.
+- **Allow for this session** returns a session-scoped grant:
+  - Claude: the CLI's `permission_suggestions` as `updatedPermissions`;
+  - Codex: `acceptForSession`, or a session-scoped permission grant.
+- **Deny** tells the agent the user refused.
+- Ten minutes without a decision denies the request. A click already queued at
+  the timeout boundary is preferred over the denial.
+- If the card cannot be sent, the bridge posts a text fallback and denies
+  immediately so the agent cannot hang.
+
+Questions use the same card channel: options become buttons, multi-select
+questions get a submit button, and free-text or `isOther` questions get a form.
+See [Permissions](/permissions/) for the full behavior.
+
+## State, restarts, and concurrency
+
+The state directory is the contract between releases:
+
+| Path | Role |
+|---|---|
+| `config.json` | Profiles, app ids, preferences, access lists |
+| `profiles/<p>/sessions.json` | Resumable session per scope and cwd |
+| `profiles/<p>/workspaces.json` | Per-scope working-directory overrides |
+| `profiles/<p>/pending.json` | Durable queued messages, per-message TTL |
+| `profiles/<p>/secrets.enc` | Encrypted App Secret |
+| `registry/processes.json` | Processes listed by `larkline ps` |
+
+On restart, the bridge loads the queue, announces the restored count per scope,
+and starts the driver once the runtime is live. A message is removed from the
+queue before it runs, so a crash can lose the in-flight turn; it does not
+duplicate it.
+
+There is one bridge process per profile. Do not run `larkline run` and the
+service against the same app and profile at the same time.
+
+## Comments and meetings
+
+Comments and meetings reuse the run loop but are not chat scopes:
+
+- A comment reply is posted in the comment thread; `/stop comment:<hash>` aborts
+  it.
+- A meeting run can answer in-meeting chat or over IM, and `/meeting notes`
+  summarizes the live transcript.
+- Neither has approval or question cards. They keep the agent's non-interactive
+  behavior, so use full access for those scopes when tools must run.
+
+## Failure boundaries
+
+| Failure | Behavior |
+|---|---|
+| Agent emits no output | Idle watchdog stops the run with a terminal notice |
+| Card create fails | Final answer falls back to a separate message |
+| Card update fails | Bridge stops updating and sends the final answer separately |
+| Approval card cannot be sent | Text fallback, then deny |
+| Approval unanswered | Deny after ten minutes |
+| Session cannot be resumed | Start a new session; a Codex fallback posts a visible notice |
+| Agent crashes | Run finalizes with the error; the next queued batch can start |
+
+For setup failures, start with `larkline doctor` and the
+[Troubleshooting](/troubleshooting/) page.
