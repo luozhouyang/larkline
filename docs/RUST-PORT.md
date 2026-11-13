@@ -140,7 +140,7 @@ Ported:
   button). Claude answers travel in `updatedInput.answers`; Codex answers use
   the `answers[questionId].answers[]` payload. Free-text questions without
   options are skipped with a visible notice for now. Approval parameters are
-  shown in full up to the Feishu card budget (20KB of raw JSON); larger inputs
+  shown in full up to the Feishu card budget (12KB of raw JSON); larger inputs
   are truncated with a notice
 - Codex app-server transport for `read-only`/`workspace-write`: `codex
   app-server` replaces `codex exec` so command, file-change and permission

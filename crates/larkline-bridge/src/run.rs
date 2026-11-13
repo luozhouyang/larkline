@@ -4842,7 +4842,7 @@ fn answer_action(
 /// for escaping, buttons and notes. Inputs that fit are shown in full; larger
 /// ones are cut on a char boundary with an explicit notice.
 fn approval_input_json(input: &Value) -> (String, bool) {
-    const MAX_BYTES: usize = 20_000;
+    const MAX_BYTES: usize = 12_000;
     let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
     if pretty.len() <= MAX_BYTES {
         return (pretty, false);
@@ -8625,6 +8625,6 @@ mod tests {
         let (large, truncated) = approval_input_json(&big);
         assert!(truncated);
         assert!(large.contains("完整参数超过飞书卡片上限"));
-        assert!(large.len() <= 20_000 + 80);
+        assert!(large.len() <= 12_000 + 80);
     }
 }
