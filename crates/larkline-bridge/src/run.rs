@@ -2737,6 +2737,19 @@ impl Bridge {
                         }
                     }
                     if let Some(request) = requested {
+                        if view.finished {
+                            // A late request after a terminal turn: answer it
+                            // instead of showing a card for a run that is done.
+                            let _ = process
+                                .respond_to_permission(
+                                    &request.request_id,
+                                    PermissionResponse::Deny {
+                                        message: "任务已结束。".to_string(),
+                                    },
+                                )
+                                .await;
+                            break;
+                        }
                         let label = request.tool_name.clone();
                         view.pending_approval = Some(label.clone());
                         if let Some(tail) = tail.as_mut() {
