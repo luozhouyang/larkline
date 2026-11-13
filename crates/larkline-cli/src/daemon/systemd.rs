@@ -353,8 +353,8 @@ mod tests {
         assert!(unit.contains("Wants=network-online.target"));
         assert!(unit.contains("[Service]\nType=simple"));
         assert!(unit.contains(&format!(
-            "ExecStart=\"{}\" \"run\" \"--profile\" \"claude\"",
-            spec.program.display()
+            "ExecStart={} \"run\" \"--profile\" \"claude\"",
+            quote(&display_path(&spec.program))
         )));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=5"));
@@ -368,7 +368,7 @@ mod tests {
         )));
         assert!(unit.contains(&format!(
             "Environment=\"LARKLINE_HOME={}\"",
-            spec.env_value("LARKLINE_HOME").unwrap()
+            escape_environment(spec.env_value("LARKLINE_HOME").unwrap())
         )));
         assert!(unit.contains("Environment=\"LARKLINE_PROFILE=claude\""));
         assert!(unit.contains("Environment=\"PATH=/usr/local/bin:/usr/bin\""));
@@ -381,7 +381,7 @@ mod tests {
     fn renders_working_directory_when_set() {
         let work = std::path::absolute("/home/u/work dir").unwrap();
         let unit = render_unit(&spec().with_working_dir(work.clone()));
-        assert!(unit.contains(&format!("WorkingDirectory=\"{}\"", work.display())));
+        assert!(unit.contains(&format!("WorkingDirectory={}", quote(&display_path(&work)))));
     }
 
     #[test]
@@ -391,8 +391,8 @@ mod tests {
             .with_env("CUSTOM", "100%");
         let unit = render_unit(&spec);
         assert!(unit.contains(&format!(
-            "ExecStart=\"{}\" \"run\" \"--profile\" \"claude\"",
-            spec.program.display()
+            "ExecStart={} \"run\" \"--profile\" \"claude\"",
+            quote(&display_path(&spec.program))
         )));
         assert!(unit.contains("Environment=\"CUSTOM=100%%\""));
     }
