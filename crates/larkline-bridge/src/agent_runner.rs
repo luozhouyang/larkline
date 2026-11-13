@@ -82,6 +82,9 @@ pub struct AgentProcess {
     _system_prompt: Option<TempFile>,
 }
 
+// One instance lives inside `AgentProcess`; the size difference between the
+// line and app-server states is irrelevant next to the child process.
+#[allow(clippy::large_enum_variant)]
 enum Transport {
     /// `claude -p` or `codex exec --json`: newline-delimited output, optional
     /// control-protocol stdin for Claude approvals.
@@ -92,7 +95,7 @@ enum Transport {
     },
     /// `codex app-server`: JSON-RPC over stdio with server-initiated approval
     /// requests.
-    CodexAppServer(CodexAppServer),
+    CodexAppServer(Box<CodexAppServer>),
 }
 
 struct CodexServerRequest {
@@ -551,7 +554,7 @@ impl AgentProcess {
 
         Ok(Self {
             child,
-            transport: Transport::CodexAppServer(server),
+            transport: Transport::CodexAppServer(Box::new(server)),
             _system_prompt: Some(system_prompt_file),
         })
     }

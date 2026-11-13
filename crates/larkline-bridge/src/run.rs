@@ -3303,6 +3303,7 @@ impl Bridge {
                         .await
                     {
                         tracing::warn!(error = %err, "cannot deliver the timeout denial");
+                        return ApprovalWait::Interrupted;
                     }
                     tracing::info!(
                         request_id = %request.request_id,
@@ -3334,6 +3335,7 @@ impl Bridge {
                         .await
                     {
                         tracing::warn!(error = %err, "cannot deliver the approval decision");
+                        return ApprovalWait::Interrupted;
                     }
                     return ApprovalWait::Answered {
                         allow: decision.allow,
@@ -4282,6 +4284,17 @@ fn approval_input_preview(tool_name: &str, input: &Value) -> String {
     let preview = match tool_name {
         "Bash" => pick("command").to_string(),
         "Read" | "Edit" | "Write" | "NotebookEdit" => pick("file_path").to_string(),
+        "apply_patch" => input
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| change.get("path").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
         "WebFetch" => pick("url").to_string(),
         "WebSearch" => pick("query").to_string(),
         _ => String::new(),

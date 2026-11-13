@@ -50,6 +50,10 @@ pub fn thread_start_request(id: u64, config: &CodexThreadConfig) -> Value {
         "sandbox": config.sandbox.as_str(),
         "approvalPolicy": APPROVAL_POLICY,
         "ephemeral": false,
+        // `codex exec` was launched with this override so tools inherit the
+        // bridge's environment (PATH, proxies, credentials). App-server threads
+        // need the same setting explicitly.
+        "config": { "shell_environment_policy": { "inherit": "all" } },
     });
     if let Some(model) = &config.model {
         params["model"] = json!(model);
@@ -66,6 +70,7 @@ pub fn thread_resume_request(id: u64, thread_id: &str, config: &CodexThreadConfi
         "cwd": config.cwd,
         "sandbox": config.sandbox.as_str(),
         "approvalPolicy": APPROVAL_POLICY,
+        "config": { "shell_environment_policy": { "inherit": "all" } },
     });
     if let Some(model) = &config.model {
         params["model"] = json!(model);
@@ -134,6 +139,16 @@ pub struct CodexAppServerTranslator {
     finished: bool,
     started_items: std::collections::HashSet<String>,
     completed_items: std::collections::HashSet<String>,
+    reasoning_items_with_deltas: std::collections::HashSet<String>,
+    /// `changes` of file-change items, keyed by item id. The approval request
+    /// only carries the item id; keeping the item lets the card show the files
+    /// (and their diffs) the user is approving.
+    file_changes: std::collections::HashMap<String, Value>,
+    /// Text of the last completed `agentMessage`. Codex may emit commentary
+    /// messages before tools; only the last one before `turn/completed` is the
+    /// final answer, so it is emitted as `FinalText` at the terminal event
+    /// rather than replacing the streamed blocks on every item.
+    last_agent_message: Option<String>,
 }
 
 impl CodexAppServerTranslator {
@@ -187,11 +202,20 @@ impl CodexAppServerTranslator {
                     .and_then(Value::as_str)
                     .unwrap_or("failed");
                 match status {
-                    "completed" => vec![AgentEvent::Done {
-                        session_id: self.thread_id.clone(),
-                        thread_id: self.thread_id.clone(),
-                        termination_reason: TerminationReason::Normal,
-                    }],
+                    "completed" => {
+                        let mut events = Vec::new();
+                        if let Some(text) = self.last_agent_message.take() {
+                            if !text.is_empty() {
+                                events.push(AgentEvent::FinalText { content: text });
+                            }
+                        }
+                        events.push(AgentEvent::Done {
+                            session_id: self.thread_id.clone(),
+                            thread_id: self.thread_id.clone(),
+                            termination_reason: TerminationReason::Normal,
+                        });
+                        events
+                    }
                     "interrupted" => vec![AgentEvent::Done {
                         session_id: self.thread_id.clone(),
                         thread_id: self.thread_id.clone(),
@@ -228,6 +252,9 @@ impl CodexAppServerTranslator {
                 if delta.is_empty() {
                     return Vec::new();
                 }
+                if let Some(item_id) = params.get("itemId").and_then(Value::as_str) {
+                    self.reasoning_items_with_deltas.insert(item_id.to_string());
+                }
                 vec![AgentEvent::Thinking {
                     delta: delta.to_string(),
                 }]
@@ -251,18 +278,18 @@ impl CodexAppServerTranslator {
                     if text.is_empty() || !self.completed_items.insert(id.to_string()) {
                         return Vec::new();
                     }
-                    // Deltas already streamed this text; the final copy lets
-                    // the view prefer an exact answer without duplicating the
-                    // visible stream.
-                    vec![AgentEvent::FinalText {
-                        content: text.to_string(),
-                    }]
-                } else {
-                    Vec::new()
+                    // The completed item may be commentary; the terminal event
+                    // promotes the last one to the final answer.
+                    self.last_agent_message = Some(text.to_string());
                 }
+                Vec::new()
             }
             "reasoning" => {
                 if completed {
+                    // Deltas already streamed this item's text.
+                    if self.reasoning_items_with_deltas.contains(id) {
+                        return Vec::new();
+                    }
                     let text = join_strings(item.get("summary"))
                         .or_else(|| join_strings(item.get("content")))
                         .unwrap_or_default();
@@ -337,10 +364,12 @@ impl CodexAppServerTranslator {
                     if !self.started_items.insert(id.to_string()) {
                         return Vec::new();
                     }
+                    let changes = item.get("changes").cloned().unwrap_or(Value::Null);
+                    self.file_changes.insert(id.to_string(), changes.clone());
                     vec![AgentEvent::ToolUse {
                         id: id.to_string(),
                         name: "apply_patch".to_string(),
-                        input: item.get("changes").cloned().unwrap_or(Value::Null),
+                        input: changes,
                     }]
                 }
             }
@@ -435,24 +464,33 @@ impl CodexAppServerTranslator {
                     .and_then(Value::as_str)
                     .map(str::to_string),
             }),
-            "item/fileChange/requestApproval" => Some(AgentEvent::PermissionRequest {
-                request_id,
-                tool_name: "apply_patch".to_string(),
-                display_name: Some("apply_patch".to_string()),
-                input: json!({
-                    "itemId": params.get("itemId").cloned().unwrap_or(Value::Null),
-                    "grantRoot": params.get("grantRoot").cloned().unwrap_or(Value::Null),
-                }),
-                description: params
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                suggestions: Vec::new(),
-                tool_use_id: params
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }),
+            "item/fileChange/requestApproval" => {
+                let item_id = params.get("itemId").cloned().unwrap_or(Value::Null);
+                let changes = item_id
+                    .as_str()
+                    .and_then(|id| self.file_changes.get(id))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Some(AgentEvent::PermissionRequest {
+                    request_id,
+                    tool_name: "apply_patch".to_string(),
+                    display_name: Some("apply_patch".to_string()),
+                    input: json!({
+                        "itemId": item_id,
+                        "grantRoot": params.get("grantRoot").cloned().unwrap_or(Value::Null),
+                        "changes": changes,
+                    }),
+                    description: params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    suggestions: Vec::new(),
+                    tool_use_id: params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            }
             "item/permissions/requestApproval" => Some(AgentEvent::PermissionRequest {
                 request_id,
                 tool_name: "permissions".to_string(),
@@ -526,6 +564,10 @@ mod tests {
         assert_eq!(start["params"]["approvalPolicy"], "on-request");
         assert_eq!(start["params"]["developerInstructions"], "bridge");
         assert_eq!(start["params"]["model"], "gpt-5");
+        assert_eq!(
+            start["params"]["config"]["shell_environment_policy"]["inherit"],
+            "all"
+        );
 
         let resume = thread_resume_request(3, "thr_1", &config);
         assert_eq!(resume["method"], "thread/resume");
@@ -682,6 +724,70 @@ mod tests {
             }
         ));
         assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn only_the_last_completed_message_becomes_the_final_answer() {
+        let mut translator = CodexAppServerTranslator::new();
+        let mut events = Vec::new();
+        events.extend(translator.translate_notification(
+            "item/agentMessage/delta",
+            &json!({ "delta": "working on it" }),
+        ));
+        events.extend(translator.translate_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "m1", "type": "agentMessage", "text": "working on it" }
+            }),
+        ));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::FinalText { .. }))
+        );
+        events.extend(
+            translator.translate_notification(
+                "item/agentMessage/delta",
+                &json!({ "delta": "the answer" }),
+            ),
+        );
+        events.extend(translator.translate_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "m2", "type": "agentMessage", "text": "the answer" }
+            }),
+        ));
+        events.extend(translator.translate_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "t", "status": "completed" } }),
+        ));
+        assert!(matches!(
+            events.get(events.len() - 2),
+            Some(AgentEvent::FinalText { content }) if content == "the answer"
+        ));
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    #[test]
+    fn reasoning_deltas_are_not_repeated_by_the_completed_item() {
+        let mut translator = CodexAppServerTranslator::new();
+        let delta = translator.translate_notification(
+            "item/reasoning/textDelta",
+            &json!({ "itemId": "r1", "delta": "hmm" }),
+        );
+        assert_eq!(
+            delta,
+            vec![AgentEvent::Thinking {
+                delta: "hmm".into()
+            }]
+        );
+        let completed = translator.translate_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "r1", "type": "reasoning", "summary": ["hmm"], "content": [] }
+            }),
+        );
+        assert!(completed.is_empty());
     }
 
     #[test]

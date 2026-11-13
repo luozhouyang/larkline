@@ -1166,7 +1166,7 @@ printf '%s\n' "$response" > "$(dirname "$0")/decision.json"
 printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after approval"}]}}'
 printf '%s\n' '{"type":"result","session_id":"sess-appr"}'
 "#;
-    let agent = fake_agent(dir.path(), &body);
+    let agent = fake_agent(dir.path(), body);
     let mut profile = card_profile();
     profile.extra.insert(
         "permissions".into(),
