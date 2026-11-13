@@ -4,6 +4,14 @@ larkline 是一个自包含的单个静态二进制文件，用来把飞书 / La
 
 [文档](https://luozhouyang.github.io/larkline/) · [English README](./README.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
+![larkline 架构：飞书 / Lark、bridge、本机 agent 和工作目录](./assets/architecture.png)
+
+*bridge 是唯一长期运行的进程；agent 是本机子进程，持久状态保存在 `~/.larkline`。*
+
+![一条消息的生命周期：访问控制、排队、agent 事件、流式卡片和最终回答](./assets/message-turn.png)
+
+*一条消息对应一轮：准入、合并排队、运行 agent、折叠事件、渲染卡片并持久化。*
+
 ## 主要功能
 
 - 把飞书 / Lark 消息转发给本机 Claude Code 或 Codex CLI。可以私聊 bot，也可以在群里 `@bot`。

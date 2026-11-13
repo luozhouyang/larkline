@@ -4,6 +4,14 @@ larkline is a single, self-contained static binary that bridges Feishu / Lark me
 
 [Documentation](https://luozhouyang.github.io/larkline/) · [中文 README](./README.zh.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
+![larkline architecture: Feishu / Lark, the bridge, a local agent and the working directory](./assets/architecture.png)
+
+*The bridge is the only long-running process. Agents are local child processes; durable state lives under `~/.larkline`.*
+
+![One message lifecycle: access policy, queue, agent events, streaming card and final answer](./assets/message-turn.png)
+
+*One message, one turn: admission, debounce, agent run, event folding, card rendering and persistence.*
+
 ## What it does
 
 - Forwards Feishu / Lark messages to a local Claude Code or Codex CLI. DM the bot directly, or `@`-mention it in a group.
