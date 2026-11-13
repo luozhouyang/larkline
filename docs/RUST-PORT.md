@@ -136,7 +136,7 @@ Ported:
   `plan`/`bypassPermissions` keep the one-shot path; comment/meeting runs set
   `AgentSpec.approvals = false` and keep their old one-shot behavior
 - user questions: Claude `AskUserQuestion` and Codex `item/tool/requestUserInput`
-  become option cards (one question at a time, multi-select with a submit
+  become option cards (one request at a time, multiple questions on the card, multi-select with a submit
   button). Claude answers travel in `updatedInput.answers`; Codex answers use
   the `answers[questionId].answers[]` payload. Free-text questions without
   options are skipped with a visible notice for now. Approval parameters are

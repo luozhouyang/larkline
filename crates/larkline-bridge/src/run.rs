@@ -3786,7 +3786,13 @@ impl Bridge {
         loop {
             tokio::select! {
                 biased;
-                _ = interrupt.wait() => return QuestionOutcome::Interrupted,
+                _ = interrupt.wait() => {
+                    let card = question_decided_card("⏹ 已停止", &[]);
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::Interrupted;
+                }
                 _ = tokio::time::sleep_until(deadline) => {
                     let _ = process
                         .respond_to_question(&question.request_id, &question.raw_input, &[])
@@ -3799,6 +3805,10 @@ impl Bridge {
                 }
                 decision = rx.recv() => {
                     let Some(decision) = decision else {
+                        let card = question_decided_card("⏹ 已停止", &[]);
+                        if let Ok(card) = lark_channel::Card::from_value(card) {
+                            let _ = self.transport.update_card_message(&message_id, &card).await;
+                        }
                         return QuestionOutcome::Interrupted;
                     };
                     let InteractionDecision::Answer {
