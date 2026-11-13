@@ -26,7 +26,7 @@ in [`README.md`](../README.md) and [`README.zh.md`](../README.zh.md).
    pending.json,callback-nonces.json,secrets.enc,.keystore.salt,logs}`,
    `registry/{processes.json,locks}` and the `secrets-getter` wrapper.
    `pending.json` is a write-through copy of the per-scope debounce queue
-   (mode 0600, 24-hour TTL, raw platform payload stripped, corrupt files
+   (mode 0600, 24-hour per-message TTL, raw platform payload stripped, corrupt files
    treated as empty); a restart re-checks the access policy and resumes the
    queue. Delivery is at-most-once: a claimed batch leaves the file before the
    agent starts. `~/.lark-channel` is renamed to `~/.larkline` on
@@ -129,11 +129,19 @@ Ported:
 - IM approval cards for Claude Code `default`/`acceptEdits`: the adapter keeps
   stdin open and passes `--permission-prompt-tool stdio`; `can_use_tool`
   control requests become a standalone non-streaming card with signed
-  Allow/Deny buttons. Only the run's initiator can answer, a click writes the
-  `control_response` and resumes the CLI, ten idle minutes deny automatically,
-  and a failed card send denies immediately. `plan` and `bypassPermissions`
-  keep the one-shot path; comment/meeting runs set `AgentSpec.approvals =
-  false` and keep their old one-shot behavior
+  Allow/Allow-for-session/Deny buttons. Only the run's initiator can answer, a
+  click writes the `control_response` and resumes the CLI, ten minutes deny
+  automatically, and a failed card send denies immediately. Allow-for-session
+  sends the CLI's `permission_suggestions` as `updatedPermissions`.
+  `plan`/`bypassPermissions` keep the one-shot path; comment/meeting runs set
+  `AgentSpec.approvals = false` and keep their old one-shot behavior
+- user questions: Claude `AskUserQuestion` and Codex `item/tool/requestUserInput`
+  become option cards (one question at a time, multi-select with a submit
+  button). Claude answers travel in `updatedInput.answers`; Codex answers use
+  the `answers[questionId].answers[]` payload. Free-text questions without
+  options are skipped with a visible notice for now. Approval parameters are
+  shown in full up to the Feishu card budget (20KB of raw JSON); larger inputs
+  are truncated with a notice
 - Codex app-server transport for `read-only`/`workspace-write`: `codex
   app-server` replaces `codex exec` so command, file-change and permission
   requests can reach the same approval card. The bridge initializes, starts or
