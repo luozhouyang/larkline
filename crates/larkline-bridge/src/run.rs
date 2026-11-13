@@ -96,7 +96,7 @@ use lark_channel::message::{
     MessageChatType, MessageSenderInfo, MessageSenderType, NormalizedMessage, Recipient,
 };
 use larkline_agent::{
-    AgentEvent, PromptContext, PromptMention, TerminationReason,
+    AgentEvent, PermissionResponse, PromptContext, PromptMention, TerminationReason,
     build_agent_prompt_with_attachments,
 };
 use larkline_core::{
@@ -125,7 +125,8 @@ use crate::pending_store::PendingStore;
 use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
-    Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, card_status, card_summary, render_card,
+    ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, approval_card,
+    approval_decided_card, card_status, card_summary, render_card,
 };
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
@@ -181,6 +182,10 @@ const STREAM_CONTINUATION_NOTE: &str = "↪ 接续上一张卡片。";
 /// message is dropped (the newest user intent survives) and a warning is
 /// logged; [`QueueLimits::unbounded`] restores exact TS semantics.
 const MAX_PENDING_PER_SCOPE: usize = 100;
+/// How long a permission prompt waits for a user decision before the bridge
+/// denies it automatically. The approval card is a separate non-streaming
+/// message, so this is unrelated to the 8.5-minute progress-card window.
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Marker the bridge (and bridge-aware agents) put on callback button values.
 const BRIDGE_CALLBACK_MARKER: &str = crate::callback::BRIDGE_CALLBACK_MARKER;
@@ -312,6 +317,8 @@ pub struct Bridge {
     pending_store: PendingStore,
     /// Messages restored from `pending.json` at startup, for diagnostics.
     restored_pending: AtomicUsize,
+    /// How long one permission prompt waits for a user decision.
+    approval_timeout: Duration,
 }
 
 /// The running VC-bot manager and the handle that stops its poll task.
@@ -336,6 +343,42 @@ struct ActiveRun {
     /// `None` for tracked runs (comment / meeting) that own their own loop and
     /// cancellation semantics; those keep the historic immediate abort.
     interrupt: Option<Arc<RunInterrupt>>,
+    /// Pending permission prompts for an IM run. `None` for comment/meeting
+    /// runs, which have no card approval flow.
+    approvals: Option<Arc<ApprovalBroker>>,
+}
+
+/// One click on an approval card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovalDecision {
+    request_id: String,
+    allow: bool,
+    by: String,
+}
+
+/// The bridge side of one IM run's approval queue.
+///
+/// The run loop owns the receiver; this broker is registered in
+/// [`Bridge::active`] so [`Bridge::handle_card_action`] can deliver a decision
+/// without knowing the run task.
+struct ApprovalBroker {
+    operator: String,
+    tx: tokio::sync::mpsc::UnboundedSender<ApprovalDecision>,
+}
+
+/// A permission request the run loop is waiting on.
+struct PendingApproval {
+    request_id: String,
+    tool_name: String,
+    input: Value,
+    description: Option<String>,
+}
+
+/// Result of waiting for one approval decision.
+enum ApprovalWait {
+    Answered { allow: bool, by: String },
+    TimedOut,
+    Interrupted,
 }
 
 /// Per-run cooperative stop signal.
@@ -872,6 +915,7 @@ impl Bridge {
             card_safe_age: CARD_SAFE_AGE,
             pending_store,
             restored_pending: AtomicUsize::new(restored_pending),
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
         })
     }
 
@@ -894,6 +938,15 @@ impl Bridge {
     /// still reports the configured minutes.
     pub fn with_idle_timeout_unit(mut self, unit: Duration) -> Self {
         self.idle_timeout_unit = unit;
+        self
+    }
+
+    /// Override how long an approval card waits for a decision.
+    ///
+    /// Production uses ten minutes; tests shorten it to exercise the automatic
+    /// denial without waiting.
+    pub fn with_approval_timeout(mut self, timeout: Duration) -> Self {
+        self.approval_timeout = timeout;
         self
     }
 
@@ -1513,6 +1566,18 @@ impl Bridge {
         let task_scope = scope.clone();
         let interrupt = RunInterrupt::new();
         let run_interrupt = Arc::clone(&interrupt);
+        // Approval decisions are delivered to the run task through this
+        // channel; the broker is registered in `active` for card clicks.
+        let operator = batch
+            .first()
+            .map(message_sender_id)
+            .unwrap_or_default()
+            .to_string();
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
+        let approvals = Arc::new(ApprovalBroker {
+            operator: operator.clone(),
+            tx: approval_tx,
+        });
         // Snapshot the session generation while the run is still atomically
         // registered: a `/new` that lands after this point bumps the
         // generation and the finishing run must not re-save its session.
@@ -1525,7 +1590,10 @@ impl Bridge {
                 id,
                 permit: Some(permit),
             };
-            if let Err(err) = bridge.run_batch(batch, run_interrupt, generation).await {
+            if let Err(err) = bridge
+                .run_batch(batch, run_interrupt, generation, operator, approval_rx)
+                .await
+            {
                 tracing::error!(error = %err, "agent run failed");
             }
         });
@@ -1538,6 +1606,7 @@ impl Bridge {
                 id,
                 abort: handle.abort_handle(),
                 interrupt: Some(interrupt),
+                approvals: Some(approvals),
             },
         );
         drop(active);
@@ -1588,6 +1657,7 @@ impl Bridge {
                 // Comment/meeting runs own their agent loop and keep the
                 // historic immediate abort; there is no shared loop to signal.
                 interrupt: None,
+                approvals: None,
             },
         ) {
             // Callers serialize per scope (the comment guard / meeting map),
@@ -2063,11 +2133,81 @@ impl Bridge {
                         "当前没有正在运行的任务。".to_string()
                     })
                 }
+                name if name.starts_with("approval:") => {
+                    let clicker = action.operator.open_id.as_deref().unwrap_or_default();
+                    self.handle_approval_action(scope, name, value, clicker)
+                        .await
+                }
                 _ => None,
             };
         }
 
         None
+    }
+
+    /// Handle an allow/deny click on an approval card.
+    ///
+    /// The generic bridge-button check has already verified the process-local
+    /// token against the full `approval:<decision>:<request>:<operator>` action.
+    /// Rebuild that action from the payload so the unsigned fields cannot be
+    /// swapped after verification, then require the clicker to be the run's
+    /// initiator before delivering the decision to the run task.
+    async fn handle_approval_action(
+        &self,
+        scope: &str,
+        action_name: &str,
+        value: &serde_json::Map<String, Value>,
+        clicker: &str,
+    ) -> Option<String> {
+        let decision = value.get("decision").and_then(Value::as_str)?;
+        let request_id = value.get("request_id").and_then(Value::as_str)?;
+        let operator = value.get("operator").and_then(Value::as_str)?;
+        if decision != "allow" && decision != "deny" {
+            return None;
+        }
+        if approval_action(decision, request_id, operator) != action_name {
+            tracing::warn!(
+                scope,
+                "rejected an approval click whose action fields were changed"
+            );
+            return Some("操作已失效，请重新发起。".to_string());
+        }
+        if clicker != operator {
+            tracing::info!(scope, clicker, operator, "approval click from another user");
+            return Some("只有发起本次任务的人可以处理授权。".to_string());
+        }
+        let broker = lock(&self.active)
+            .get(scope)
+            .and_then(|run| run.approvals.clone());
+        let Some(broker) = broker else {
+            return Some("该授权请求已失效。".to_string());
+        };
+        if broker.operator != operator {
+            return Some("只有发起本次任务的人可以处理授权。".to_string());
+        }
+        if broker
+            .tx
+            .send(ApprovalDecision {
+                request_id: request_id.to_string(),
+                allow: decision == "allow",
+                by: clicker.to_string(),
+            })
+            .is_err()
+        {
+            return Some("该授权请求已失效。".to_string());
+        }
+        tracing::info!(
+            scope,
+            request_id,
+            decision,
+            operator,
+            "approval decision accepted"
+        );
+        Some(if decision == "allow" {
+            "已允许，继续执行。".to_string()
+        } else {
+            "已拒绝。".to_string()
+        })
     }
 
     /// Verify and forward an agent-rendered card callback.
@@ -2244,6 +2384,8 @@ impl Bridge {
         batch: Vec<NormalizedMessage>,
         interrupt: Arc<RunInterrupt>,
         generation: u64,
+        operator: String,
+        mut approval_rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
     ) -> anyhow::Result<()> {
         let Some(first) = batch.first() else {
             return Ok(());
@@ -2560,6 +2702,142 @@ impl Bridge {
                             run.observe(event).await;
                         }
                     }
+                    // A permission request blocks the agent until the user
+                    // answers. Handle it before creating the next stdout read:
+                    // the child is waiting on stdin, not producing events.
+                    let mut requested: Option<PendingApproval> = None;
+                    for event in &events {
+                        if let AgentEvent::PermissionRequest {
+                            request_id,
+                            tool_name,
+                            input,
+                            description,
+                            ..
+                        } = event
+                        {
+                            requested = Some(PendingApproval {
+                                request_id: request_id.clone(),
+                                tool_name: tool_name.clone(),
+                                input: input.clone(),
+                                description: description.clone(),
+                            });
+                        }
+                    }
+                    if let Some(request) = requested {
+                        let label = request.tool_name.clone();
+                        view.pending_approval = Some(label.clone());
+                        if let Some(tail) = tail.as_mut() {
+                            tail.pending_approval = Some(label.clone());
+                        }
+                        if let Some(format) = card_format {
+                            if !paused {
+                                let render_view = tail.as_ref().unwrap_or(&view);
+                                self.refresh_card(
+                                    &scope,
+                                    &mut streaming,
+                                    message_id.as_deref(),
+                                    render_view,
+                                    started,
+                                    format,
+                                )
+                                .await;
+                                last_update = Instant::now();
+                            }
+                        }
+                        let approval_message = if operator.is_empty() {
+                            None
+                        } else {
+                            self.send_approval_card(
+                                &scope,
+                                &chat_id,
+                                &last_message_id,
+                                &operator,
+                                &request,
+                            )
+                            .await
+                        };
+                        let Some(approval_message) = approval_message else {
+                            // No card means no one can answer; do not leave the
+                            // agent blocked for the full timeout.
+                            tracing::warn!(
+                                scope,
+                                request_id = %request.request_id,
+                                "cannot present an approval card; denying the tool"
+                            );
+                            if let Err(err) = process
+                                .respond_to_permission(
+                                    &request.request_id,
+                                    PermissionResponse::Deny {
+                                        message: "无法创建授权卡片，已自动拒绝。".to_string(),
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %err, "cannot deliver the fallback denial");
+                            }
+                            view.pending_approval = None;
+                            if let Some(tail) = tail.as_mut() {
+                                tail.pending_approval = None;
+                            }
+                            pending = EventSource::next_events(&mut process);
+                            continue;
+                        };
+                        let outcome = self
+                            .wait_for_approval(&mut process, &mut approval_rx, &interrupt, &request)
+                            .await;
+                        let (status, by) = match &outcome {
+                            ApprovalWait::Answered { allow: true, by } => {
+                                ("✅ 已允许", by.as_str())
+                            }
+                            ApprovalWait::Answered { allow: false, by } => {
+                                ("⛔ 已拒绝", by.as_str())
+                            }
+                            ApprovalWait::TimedOut => ("⌛ 超时自动拒绝", ""),
+                            ApprovalWait::Interrupted => ("⏹ 已停止", ""),
+                        };
+                        let card = approval_decided_card(&request.tool_name, status, by);
+                        if let Ok(card) = lark_channel::Card::from_value(card) {
+                            if let Err(err) = self
+                                .transport
+                                .update_card_message(&approval_message, &card)
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "cannot update the decided approval card"
+                                );
+                            }
+                        }
+                        view.pending_approval = None;
+                        if let Some(tail) = tail.as_mut() {
+                            tail.pending_approval = None;
+                        }
+                        if matches!(outcome, ApprovalWait::Interrupted) {
+                            process.kill().await;
+                            view.mark_interrupted();
+                            if let Some(tail) = tail.as_mut() {
+                                tail.mark_interrupted();
+                            }
+                            break;
+                        }
+                        if let Some(format) = card_format {
+                            if !paused {
+                                let render_view = tail.as_ref().unwrap_or(&view);
+                                self.refresh_card(
+                                    &scope,
+                                    &mut streaming,
+                                    message_id.as_deref(),
+                                    render_view,
+                                    started,
+                                    format,
+                                )
+                                .await;
+                                last_update = Instant::now();
+                            }
+                        }
+                        pending = EventSource::next_events(&mut process);
+                        continue;
+                    }
                     if view.finished {
                         break;
                     }
@@ -2582,6 +2860,10 @@ impl Bridge {
                 }
             }
         }
+
+        // Approval runs keep stdin open for control responses; close it so a
+        // finished Claude process can exit before `finalize` reports.
+        process.close_stdin().await;
 
         // EOF without a protocol terminal is still a normal finish (TS
         // `finalizeIfRunning`); an interrupted/timed-out view already has its
@@ -2900,6 +3182,140 @@ impl Bridge {
             format = ?format,
             "progress card paused at the card safe age"
         );
+    }
+
+    /// Send the standalone permission-approval card.
+    ///
+    /// Two signed buttons (allow / deny) bind the scope, the operator allowed
+    /// to answer, the request id and the decision. The card is a normal
+    /// non-streaming message: it can outlive the 8.5-minute progress window and
+    /// a new message is what notifies the user that the agent is waiting.
+    async fn send_approval_card(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        operator: &str,
+        request: &PendingApproval,
+    ) -> Option<String> {
+        let allow_action = approval_action("allow", &request.request_id, operator);
+        let deny_action = approval_action("deny", &request.request_id, operator);
+        let input_json = serde_json::to_string_pretty(&request.input)
+            .unwrap_or_else(|_| request.input.to_string());
+        let input_json = truncate_chars(&input_json, 2_500);
+        let input_preview = approval_input_preview(&request.tool_name, &request.input);
+        let timeout_minutes = self.approval_timeout.as_secs().div_ceil(60).max(1);
+        let value = approval_card(&ApprovalCardInput {
+            scope,
+            operator,
+            request_id: &request.request_id,
+            tool_name: &request.tool_name,
+            description: request.description.as_deref(),
+            input_preview: &input_preview,
+            input_json: &input_json,
+            allow_action: &allow_action,
+            allow_token: &self.tokens.sign(scope, &allow_action),
+            deny_action: &deny_action,
+            deny_token: &self.tokens.sign(scope, &deny_action),
+            timeout_minutes,
+        });
+        let Ok(card) = lark_channel::Card::from_value(value) else {
+            tracing::warn!("approval card is not a valid CardKit document");
+            return None;
+        };
+        match reply::send_card(
+            &*self.transport,
+            scope,
+            chat_id,
+            Some(source_message_id),
+            &card,
+        )
+        .await
+        {
+            Ok(id) => {
+                tracing::info!(
+                    scope,
+                    request_id = %request.request_id,
+                    tool = %request.tool_name,
+                    "approval card sent"
+                );
+                Some(id.0)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot send the approval card");
+                None
+            }
+        }
+    }
+
+    /// Wait for the user's decision, the timeout, or `/stop`.
+    ///
+    /// The run loop is not reading stdout here: the agent is blocked on the
+    /// permission response, so there is no event to lose. The progress card is
+    /// deliberately not rolled over mid-wait; if its safe age elapses, the next
+    /// loop tick rolls it over immediately after the decision.
+    async fn wait_for_approval(
+        &self,
+        process: &mut AgentProcess,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
+        interrupt: &Arc<RunInterrupt>,
+        request: &PendingApproval,
+    ) -> ApprovalWait {
+        let deadline = tokio::time::Instant::now() + self.approval_timeout;
+        loop {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => return ApprovalWait::Interrupted,
+                _ = tokio::time::sleep_until(deadline) => {
+                    if let Err(err) = process
+                        .respond_to_permission(
+                            &request.request_id,
+                            PermissionResponse::Deny {
+                                message: "审批超时，已自动拒绝。".to_string(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "cannot deliver the timeout denial");
+                    }
+                    tracing::info!(
+                        request_id = %request.request_id,
+                        "approval timed out; denied automatically"
+                    );
+                    return ApprovalWait::TimedOut;
+                }
+                decision = rx.recv() => {
+                    let Some(decision) = decision else {
+                        // The broker was dropped (run removed): treat it as a
+                        // stop so the loop kills the child and finalizes.
+                        return ApprovalWait::Interrupted;
+                    };
+                    if decision.request_id != request.request_id {
+                        // A stale click for an already-answered request.
+                        continue;
+                    }
+                    let response = if decision.allow {
+                        PermissionResponse::Allow {
+                            updated_input: request.input.clone(),
+                        }
+                    } else {
+                        PermissionResponse::Deny {
+                            message: format!("用户（{}）拒绝了该操作。", decision.by),
+                        }
+                    };
+                    if let Err(err) = process
+                        .respond_to_permission(&request.request_id, response)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "cannot deliver the approval decision");
+                    }
+                    return ApprovalWait::Answered {
+                        allow: decision.allow,
+                        by: decision.by,
+                    };
+                }
+            }
+        }
     }
 
     /// Hand the progress over to a fresh card when the current one reaches
@@ -3606,6 +4022,17 @@ fn build_markdown_card(
             format!("{note}\n\n{body}")
         };
     }
+    if let Some(tool) = view
+        .pending_approval
+        .as_deref()
+        .filter(|tool| !tool.trim().is_empty())
+    {
+        body = if body.trim().is_empty() {
+            format!("⏳ 等待授权：{tool}")
+        } else {
+            format!("⏳ 等待授权：{tool}\n\n{body}")
+        };
+    }
     if paused {
         body = append_pause_note(body);
     }
@@ -3791,6 +4218,7 @@ fn final_answer_only_view(view: &RunView) -> RunView {
     final_view.reasoning_active = false;
     final_view.footer_status = None;
     final_view.continuation_note = None;
+    final_view.pending_approval = None;
     final_view.tools.clear();
     final_view.tool_calls.clear();
     final_view.tool_errors = 0;
@@ -3811,6 +4239,31 @@ fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
         "（没有输出）".to_string()
     } else {
         body
+    }
+}
+
+/// Action string signed into an approval button token.
+fn approval_action(decision: &str, request_id: &str, operator: &str) -> String {
+    format!("approval:{decision}:{request_id}:{operator}")
+}
+
+/// One-line preview of the tool input for the approval card.
+fn approval_input_preview(tool_name: &str, input: &Value) -> String {
+    let Some(object) = input.as_object() else {
+        return String::new();
+    };
+    let pick = |key: &str| object.get(key).and_then(Value::as_str).unwrap_or_default();
+    let preview = match tool_name {
+        "Bash" => pick("command").to_string(),
+        "Read" | "Edit" | "Write" | "NotebookEdit" => pick("file_path").to_string(),
+        "WebFetch" => pick("url").to_string(),
+        "WebSearch" => pick("query").to_string(),
+        _ => String::new(),
+    };
+    if preview.trim().is_empty() {
+        truncate_chars(&serde_json::to_string(input).unwrap_or_default(), 400)
+    } else {
+        truncate_chars(&preview, 400)
     }
 }
 
@@ -4783,6 +5236,7 @@ mod tests {
                     id: 42,
                     abort: task.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
+                    approvals: None,
                 },
             );
         }
@@ -4827,6 +5281,7 @@ mod tests {
                     id: 7,
                     abort: task.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
+                    approvals: None,
                 },
             );
         }
@@ -4873,6 +5328,7 @@ mod tests {
                     id: 9,
                     abort: hung.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
+                    approvals: None,
                 },
             );
         }
@@ -6098,6 +6554,7 @@ mod tests {
                     abort: handle_a.abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
             active.insert(
@@ -6107,6 +6564,7 @@ mod tests {
                     abort: handle_b.abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
         }
@@ -6169,6 +6627,7 @@ mod tests {
                     abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
             active.insert(
@@ -6178,6 +6637,7 @@ mod tests {
                     abort: handle_b.abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
         }
@@ -6552,6 +7012,7 @@ mod tests {
                 abort: handle.abort_handle(),
 
                 interrupt: None,
+                approvals: None,
             },
         );
 
@@ -7105,6 +7566,7 @@ mod tests {
                     abort: comment_run.abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
             active.insert(
@@ -7114,6 +7576,7 @@ mod tests {
                     abort: chat_run.abort_handle(),
 
                     interrupt: None,
+                    approvals: None,
                 },
             );
         }

@@ -52,6 +52,15 @@ pub enum TerminationReason {
     Timeout,
 }
 
+/// A parent-process answer to an agent permission prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermissionResponse {
+    /// Run the tool with this input (normally the original input echoed back).
+    Allow { updated_input: Value },
+    /// Do not run the tool; the message is shown to the model.
+    Deny { message: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// The agent reported its identity / session.
@@ -77,6 +86,25 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    /// The agent needs the user's decision before running a tool.
+    ///
+    /// Claude Code's `--permission-prompt-tool stdio` control protocol sends
+    /// this; the bridge renders an approval card and answers with
+    /// [`PermissionResponse`] through the agent process handle.
+    PermissionRequest {
+        request_id: String,
+        tool_name: String,
+        display_name: Option<String>,
+        input: Value,
+        description: Option<String>,
+        /// `permission_suggestions` from the CLI (for example a
+        /// `setMode acceptEdits` session rule); kept for a future
+        /// "allow for this session" button.
+        suggestions: Vec<Value>,
+        tool_use_id: Option<String>,
+    },
+    /// A pending permission request was withdrawn by the agent.
+    PermissionCancelled { request_id: String },
     /// The final answer, when the protocol distinguishes it from commentary.
     FinalText { content: String },
     Usage {

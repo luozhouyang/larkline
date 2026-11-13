@@ -264,6 +264,9 @@ pub struct RunView {
     /// previous card after the 8.5-minute rollover. Final cards clear it; the
     /// text renderer ignores it.
     pub continuation_note: Option<String>,
+    /// Tool name while the run is blocked on an approval card. Drives the
+    /// "⏳ 等待授权" line in the progress card; cleared when the decision lands.
+    pub pending_approval: Option<String>,
     /// Minutes reported by the idle-timeout notice (TS `state.idleTimeoutMinutes`).
     pub idle_timeout_minutes: Option<u64>,
     pub session_id: Option<String>,
@@ -288,6 +291,7 @@ impl Default for RunView {
             tool_errors: 0,
             footer_status: Some(FooterStatus::Thinking),
             continuation_note: None,
+            pending_approval: None,
             idle_timeout_minutes: None,
             session_id: None,
             thread_id: None,
@@ -431,6 +435,9 @@ impl RunView {
                 self.footer_status = None;
                 self.finished = true;
             }
+            // Approval prompts are rendered as a separate card and tracked by
+            // the run loop; they do not change the agent output view.
+            AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionCancelled { .. } => {}
         }
     }
 
@@ -449,6 +456,7 @@ impl RunView {
         self.close_streaming_text();
         self.reasoning_active = false;
         self.footer_status = None;
+        self.pending_approval = None;
         self.termination = Some(TerminationReason::Interrupted);
         self.finished = true;
     }
@@ -464,6 +472,7 @@ impl RunView {
         self.close_streaming_text();
         self.reasoning_active = false;
         self.footer_status = None;
+        self.pending_approval = None;
         self.termination = Some(TerminationReason::Timeout);
         self.idle_timeout_minutes = Some(minutes);
         self.finished = true;
@@ -584,6 +593,7 @@ pub fn card_summary(view: &RunView) -> &'static str {
         Terminal::IdleTimeout => "已超时",
         Terminal::Error => "出错",
         Terminal::Done => "已完成",
+        Terminal::Running if view.pending_approval.is_some() => "等待授权",
         Terminal::Running => match view.footer_status {
             Some(FooterStatus::ToolRunning) => "正在调用工具",
             Some(FooterStatus::Streaming) => "正在输出",
@@ -738,6 +748,16 @@ fn build_elements(view: &RunView, options: &CardRenderOptions, detail: CardDetai
             .filter(|note| !note.trim().is_empty())
         {
             elements.push(notation(note));
+        }
+    }
+
+    if terminal == Terminal::Running {
+        if let Some(tool) = view
+            .pending_approval
+            .as_deref()
+            .filter(|tool| !tool.trim().is_empty())
+        {
+            elements.push(notation(format!("⏳ 等待授权：{tool}")));
         }
     }
 
@@ -1232,6 +1252,149 @@ fn truncate(value: &str, max: usize) -> String {
 
 fn take_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
+}
+
+/// Everything needed to render one permission-approval card.
+pub struct ApprovalCardInput<'a> {
+    pub scope: &'a str,
+    pub operator: &'a str,
+    pub request_id: &'a str,
+    pub tool_name: &'a str,
+    pub description: Option<&'a str>,
+    /// One-line command/path preview shown above the full input.
+    pub input_preview: &'a str,
+    /// Pretty-printed tool input, already bounded by the caller.
+    pub input_json: &'a str,
+    /// Signed action string for the allow button (also what the token binds).
+    pub allow_action: &'a str,
+    /// Signed callback token for the allow button.
+    pub allow_token: &'a str,
+    /// Signed action string for the deny button.
+    pub deny_action: &'a str,
+    /// Signed callback token for the deny button.
+    pub deny_token: &'a str,
+    pub timeout_minutes: u64,
+}
+
+/// A tool-permission prompt as a standalone interactive card.
+///
+/// Kept separate from the progress card: an approval can outlive the 8.5-minute
+/// streaming window, and a new message is what notifies the user that the agent
+/// is waiting. The button payload is signed by the bridge's process-local
+/// callback key and binds the requesting run's scope, the operator allowed to
+/// answer and the request id.
+pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!("🔐 **需要授权：{}**", input.tool_name),
+    })];
+    if let Some(description) = input.description.filter(|text| !text.trim().is_empty()) {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": mask_emails(description),
+            "text_size": "notation",
+        }));
+    }
+    let preview = mask_emails(input.input_preview.trim());
+    if !preview.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("```\n{preview}\n```"),
+        }));
+    }
+    let body = mask_emails(input.input_json.trim());
+    if !body.is_empty() && body != preview {
+        elements.push(json!({
+            "tag": "collapsible_panel",
+            "expanded": false,
+            "header": {
+                "title": { "tag": "markdown", "content": "完整参数" },
+                "vertical_align": "center",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "size": "16px 16px"
+                },
+                "icon_position": "follow_text",
+                "icon_expanded_angle": -180
+            },
+            "border": { "color": "grey", "corner_radius": "5px" },
+            "vertical_spacing": "8px",
+            "padding": "8px 8px 8px 8px",
+            "elements": [{
+                "tag": "markdown",
+                "content": format!("```json\n{body}\n```"),
+                "text_size": "notation"
+            }]
+        }));
+    }
+    elements.push(json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "✅ 允许" },
+        "type": "primary",
+        "behaviors": [{ "type": "callback", "value": {
+            "__bridge_cb": true,
+            "action": input.allow_action,
+            "scope": input.scope,
+            "operator": input.operator,
+            "request_id": input.request_id,
+            "decision": "allow",
+            "token": input.allow_token,
+        } }]
+    }));
+    elements.push(json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
+        "type": "danger",
+        "behaviors": [{ "type": "callback", "value": {
+            "__bridge_cb": true,
+            "action": input.deny_action,
+            "scope": input.scope,
+            "operator": input.operator,
+            "request_id": input.request_id,
+            "decision": "deny",
+            "token": input.deny_token,
+        } }]
+    }));
+    elements.push(json!({
+        "tag": "markdown",
+        "content": format!(
+            "等待 @{} 决策；{} 分钟内未处理将自动拒绝。",
+            mask_emails(input.operator),
+            input.timeout_minutes
+        ),
+        "text_size": "notation"
+    }));
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": format!("等待授权：{}", input.tool_name) }
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// The approval card after a decision: status line, no buttons.
+pub fn approval_decided_card(tool_name: &str, status: &str, operator: &str) -> Value {
+    let note = if operator.trim().is_empty() {
+        status.to_string()
+    } else {
+        format!("{status} · @{}", mask_emails(operator))
+    };
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": status }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("🔐 **{tool_name}**") },
+            { "tag": "markdown", "content": note }
+        ] }
+    })
 }
 
 #[cfg(test)]
@@ -2347,5 +2510,80 @@ mod tests {
         assert_eq!(card["schema"], "2.0");
         assert_eq!(card["config"]["update_multi"], true);
         assert_eq!(card["config"]["streaming_mode"], false);
+    }
+    #[test]
+    fn approval_card_binds_both_buttons_and_masks_emails() {
+        let card = approval_card(&ApprovalCardInput {
+            scope: "oc_1",
+            operator: "ou_operator",
+            request_id: "req-1",
+            tool_name: "Bash",
+            description: Some("run a command"),
+            input_preview: "echo me@example.com",
+            input_json: r#"{"command":"echo me@example.com"}"#,
+            allow_action: "approval:allow:req-1:ou_operator",
+            allow_token: "allow-token",
+            deny_action: "approval:deny:req-1:ou_operator",
+            deny_token: "deny-token",
+            timeout_minutes: 10,
+        });
+        let text = serde_json::to_string(&card).unwrap();
+        let buttons: Vec<&Value> = card["body"]["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .filter(|element| element["tag"] == "button")
+            .collect();
+        assert_eq!(buttons.len(), 2, "{text}");
+        assert_eq!(
+            buttons[0]["behaviors"][0]["value"]["action"], "approval:allow:req-1:ou_operator",
+            "{text}"
+        );
+        assert_eq!(
+            buttons[1]["behaviors"][0]["value"]["action"], "approval:deny:req-1:ou_operator",
+            "{text}"
+        );
+        assert!(text.contains("allow-token"), "{text}");
+        assert!(text.contains("deny-token"), "{text}");
+        assert!(text.contains("\"decision\":\"allow\""), "{text}");
+        assert!(text.contains("\"decision\":\"deny\""), "{text}");
+        assert!(text.contains("ou_operator"), "{text}");
+        assert!(!text.contains("me@example.com"), "{text}");
+        assert!(text.contains("me[at]example.com"), "{text}");
+        assert_eq!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|element| element["tag"] == "button")
+                .count(),
+            2
+        );
+
+        let decided = approval_decided_card("Bash", "✅ 已允许", "ou_operator");
+        let decided_text = serde_json::to_string(&decided).unwrap();
+        assert!(!decided_text.contains("__bridge_cb"), "{decided_text}");
+        assert!(decided_text.contains("已允许"), "{decided_text}");
+    }
+
+    #[test]
+    fn a_pending_approval_is_visible_in_the_progress_card_summary() {
+        let mut view = RunView::default();
+        view.apply(&AgentEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "pwd" }),
+        });
+        view.pending_approval = Some("Bash".into());
+        let card = render_card(
+            &view,
+            &CardRenderOptions {
+                stop_value: Some(json!({ "cmd": "stop" })),
+                ..CardRenderOptions::default()
+            },
+        );
+        let text = serde_json::to_string(&card).unwrap();
+        assert!(text.contains("等待授权"), "{text}");
+        assert_eq!(card["config"]["summary"]["content"], "等待授权");
     }
 }

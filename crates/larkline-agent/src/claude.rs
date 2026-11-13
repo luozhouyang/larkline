@@ -22,6 +22,30 @@ pub struct ClaudeArgsInput<'a> {
     pub system_prompt_file: Option<&'a Path>,
     pub session_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    /// Feed the prompt as a `stream-json` user frame and keep stdin open for
+    /// control responses. Required by the permission-prompt control protocol.
+    pub stream_json_input: bool,
+    /// Ask the CLI to route permission prompts to this process over stdio
+    /// (`--permission-prompt-tool stdio`).
+    pub permission_prompt_tool: bool,
+}
+
+/// Encode a prompt as the `stream-json` user frame the CLI expects when
+/// `--input-format stream-json` is active.
+///
+/// The frame mirrors the official Agent SDK: one user message with a text
+/// block, no parent tool use and an empty session id (the CLI fills it in).
+pub fn user_message_json(prompt: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": prompt }]
+        },
+        "parent_tool_use_id": null,
+        "session_id": ""
+    })
+    .to_string()
 }
 
 pub fn build_claude_args(input: &ClaudeArgsInput<'_>) -> Vec<String> {
@@ -37,6 +61,17 @@ pub fn build_claude_args(input: &ClaudeArgsInput<'_>) -> Vec<String> {
             .unwrap_or(CLAUDE_DEFAULT_PERMISSION_MODE)
             .into(),
     ];
+    if input.stream_json_input {
+        args.push("--input-format".into());
+        args.push("stream-json".into());
+    }
+    if input.permission_prompt_tool {
+        // Hidden in `claude --help` but the mechanism the official Agent SDK
+        // uses: permission prompts arrive as `control_request` frames and are
+        // answered on stdin. Without it print mode auto-denies them.
+        args.push("--permission-prompt-tool".into());
+        args.push("stdio".into());
+    }
     if let Some(path) = input.system_prompt_file {
         args.push("--append-system-prompt-file".into());
         args.push(path.to_string_lossy().into_owned());
@@ -88,6 +123,12 @@ impl ClaudeStreamTranslator {
                     model: string_field(obj, "model"),
                 });
             }
+            Some("control_request") => self.translate_control_request(obj, &mut out),
+            Some("control_cancel_request") => {
+                if let Some(request_id) = string_field(obj, "request_id") {
+                    out.push(AgentEvent::PermissionCancelled { request_id });
+                }
+            }
             Some("assistant") => self.translate_assistant(obj, &mut out),
             Some("user") => self.translate_user(obj, &mut out),
             Some("result") => {
@@ -109,6 +150,37 @@ impl ClaudeStreamTranslator {
             _ => {}
         }
         out
+    }
+
+    /// Claude Code's permission control protocol: the CLI asks the host
+    /// whether a tool may run. Only `can_use_tool` is surfaced; other
+    /// control requests (dialogs, elicitations) are ignored for now.
+    fn translate_control_request(&mut self, obj: &Map<String, Value>, out: &mut Vec<AgentEvent>) {
+        let Some(request_id) = string_field(obj, "request_id") else {
+            return;
+        };
+        let Some(request) = obj.get("request").and_then(Value::as_object) else {
+            return;
+        };
+        if string_field(request, "subtype").as_deref() != Some("can_use_tool") {
+            return;
+        }
+        let Some(tool_name) = string_field(request, "tool_name") else {
+            return;
+        };
+        out.push(AgentEvent::PermissionRequest {
+            request_id,
+            tool_name,
+            display_name: string_field(request, "display_name"),
+            input: request.get("input").cloned().unwrap_or(Value::Null),
+            description: string_field(request, "description"),
+            suggestions: request
+                .get("permission_suggestions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            tool_use_id: string_field(request, "tool_use_id"),
+        });
     }
 
     fn translate_stream_event(&mut self, event: &Value, out: &mut Vec<AgentEvent>) {
@@ -247,6 +319,8 @@ mod tests {
             system_prompt_file: Some(Path::new("/tmp/sys.txt")),
             session_id: Some("s-1"),
             model: Some("claude-sonnet-4-5"),
+            stream_json_input: false,
+            permission_prompt_tool: false,
         });
         assert_eq!(args[0], "-p");
         assert!(!args.iter().any(|a| a.contains("bridge_context")));
@@ -263,6 +337,96 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--permission-mode", "bypassPermissions"])
         );
+    }
+
+    #[test]
+    fn approval_args_enable_the_control_protocol() {
+        let args = build_claude_args(&ClaudeArgsInput {
+            permission_mode: Some("default"),
+            system_prompt_file: None,
+            session_id: None,
+            model: None,
+            stream_json_input: true,
+            permission_prompt_tool: true,
+        });
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--input-format", "stream-json"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--permission-prompt-tool", "stdio"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--permission-mode", "default"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn control_request_translates_to_a_permission_request() {
+        let mut translator = ClaudeStreamTranslator::new();
+        let events = translator.translate(&json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Write",
+                "display_name": "Write",
+                "input": { "file_path": "/tmp/x", "content": "hi" },
+                "description": "x",
+                "tool_use_id": "call-1",
+                "permission_suggestions": [
+                    { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
+                ]
+            }
+        }));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::PermissionRequest {
+                request_id,
+                tool_name,
+                input,
+                description,
+                suggestions,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(tool_name, "Write");
+                assert_eq!(input["file_path"], "/tmp/x");
+                assert_eq!(description.as_deref(), Some("x"));
+                assert_eq!(suggestions.len(), 1);
+                assert_eq!(tool_use_id.as_deref(), Some("call-1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cancel = translator.translate(&json!({
+            "type": "control_cancel_request",
+            "request_id": "req-1"
+        }));
+        assert_eq!(
+            cancel,
+            vec![AgentEvent::PermissionCancelled {
+                request_id: "req-1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn user_message_json_matches_the_stream_json_shape() {
+        let value: Value =
+            serde_json::from_str(&user_message_json("hello")).expect("json user frame");
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+        assert_eq!(value["message"]["content"][0]["type"], "text");
+        assert_eq!(value["message"]["content"][0]["text"], "hello");
+        assert_eq!(value["parent_tool_use_id"], Value::Null);
+        assert_eq!(value["session_id"], "");
     }
 
     #[test]

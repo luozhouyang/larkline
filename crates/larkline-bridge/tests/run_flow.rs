@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lark_channel::event::{
+    CardActionContext, CardActionEvent, CardActionOperator, CardActionPayload, EventContext,
+};
 use lark_channel::media::{DownloadedResource, ResourceDescriptor, ResourceType};
 use lark_channel::message::MessageId;
 use lark_channel::{Card, CardId};
@@ -383,7 +386,7 @@ fn test_bridge(
     downloader: Arc<dyn ResourceDownloader>,
     idle_unit: Option<Duration>,
 ) -> (Arc<Bridge>, FakeTransport) {
-    test_bridge_with_safe_age(root, profile, agent, downloader, idle_unit, None)
+    test_bridge_with_safe_age(root, profile, agent, downloader, idle_unit, None, None)
 }
 
 fn test_bridge_with_safe_age(
@@ -393,6 +396,7 @@ fn test_bridge_with_safe_age(
     downloader: Arc<dyn ResourceDownloader>,
     idle_unit: Option<Duration>,
     card_safe_age: Option<Duration>,
+    approval_timeout: Option<Duration>,
 ) -> (Arc<Bridge>, FakeTransport) {
     let paths = AppPaths::resolve(root, "test").expect("app paths");
     let media = MediaCache::new(paths.media_dir.clone(), downloader);
@@ -417,6 +421,9 @@ fn test_bridge_with_safe_age(
     }
     if let Some(safe_age) = card_safe_age {
         bridge = bridge.with_card_safe_age(safe_age);
+    }
+    if let Some(timeout) = approval_timeout {
+        bridge = bridge.with_approval_timeout(timeout);
     }
     (Arc::new(bridge), fake)
 }
@@ -1015,6 +1022,7 @@ async fn long_runs_roll_over_to_a_second_card_and_finish_there() {
         }),
         None,
         Some(Duration::from_millis(120)),
+        None,
     );
 
     bridge
@@ -1100,4 +1108,260 @@ async fn long_runs_roll_over_to_a_second_card_and_finish_there() {
             .any(|frame| matches!(frame, Frame::Card { .. } | Frame::ReplyCard { .. })),
         "a rolled-over run finishes on its last card instead of sending a separate one"
     );
+}
+
+fn card_click(value: Value, message_id: &str, chat_id: &str, operator: &str) -> CardActionEvent {
+    CardActionEvent {
+        context: EventContext {
+            event_id: "evt_appr".to_string(),
+            tenant_key: None,
+            create_time: None,
+        },
+        operator: CardActionOperator {
+            tenant_key: None,
+            user_id: None,
+            open_id: Some(operator.to_string()),
+            union_id: None,
+        },
+        token: None,
+        action: CardActionPayload {
+            value,
+            tag: None,
+            timezone: None,
+            name: None,
+            form_value: None,
+            input_value: None,
+            option: None,
+            options: Vec::new(),
+            checked: None,
+            raw: Value::Null,
+        },
+        host: None,
+        delivery_type: None,
+        card_context: Some(CardActionContext {
+            url: None,
+            preview_token: None,
+            open_message_id: Some(message_id.to_string()),
+            open_chat_id: Some(chat_id.to_string()),
+            raw: Value::Null,
+        }),
+        raw: Value::Null,
+    }
+}
+
+/// A workspace/`default` profile routes Claude's tool prompt to an approval
+/// card; allowing it resumes the run and records the control response.
+#[tokio::test]
+async fn approval_card_allows_a_blocked_tool_and_resumes_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-appr"}'
+printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"pwd"}}]}}'
+printf '%s\n' '{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"pwd"},"description":"print cwd","tool_use_id":"call-1"}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after approval"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-appr"}'
+"#;
+    let agent = fake_agent(dir.path(), &body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+
+    bridge
+        .handle_message(message("om_appr", "oc_flow", "run a command"))
+        .await;
+
+    // The approval card is a standalone normal card message.
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("approval:allow:req-1")
+            )
+        })
+    })
+    .await;
+    let (approval_message_id, approval_card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("approval:allow:req-1") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("approval card");
+    let allow_button = approval_card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| {
+            element["tag"] == "button" && element["behaviors"][0]["value"]["decision"] == "allow"
+        })
+        .expect("allow button");
+    let button_value = allow_button["behaviors"][0]["value"].clone();
+    assert_eq!(button_value["operator"], "ou_user");
+    assert_eq!(button_value["request_id"], "req-1");
+    assert!(
+        button_value["token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
+
+    let other_event = card_click(
+        button_value.clone(),
+        &approval_message_id,
+        "oc_flow",
+        "ou_someone_else",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&other_event).await.as_deref(),
+        Some("只有发起本次任务的人可以处理授权。")
+    );
+
+    let event = card_click(button_value, &approval_message_id, "oc_flow", "ou_user");
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已允许，继续执行。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::UpdateCard { message_id, card }
+                    if message_id == &approval_message_id
+                        && card_json(card).contains("已允许")
+            )
+        })
+    })
+    .await;
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after approval"))
+    })
+    .await;
+
+    let decision = std::fs::read_to_string(dir.path().join("decision.json"))
+        .expect("the fake agent recorded the control response");
+    assert!(decision.contains("control_response"), "{decision}");
+    assert!(decision.contains("\"behavior\":\"allow\""), "{decision}");
+    assert!(decision.contains("updatedInput"), "{decision}");
+
+    let updated = transport
+        .frames()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Frame::UpdateCard { message_id, card } if message_id == approval_message_id => {
+                Some(card)
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the approval card was updated");
+    assert!(
+        !card_json(&updated).contains("__bridge_cb"),
+        "the decided card has no live buttons: {updated}"
+    );
+}
+
+#[tokio::test]
+async fn approval_times_out_and_denies_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-timeout"}'
+printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"rm -rf /tmp/x"}}]}}'
+printf '%s\n' '{"type":"control_request","request_id":"req-timeout","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf /tmp/x"}}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/timeout-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"denied by timeout"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-timeout"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge_with_safe_age(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+        None,
+        Some(Duration::from_millis(150)),
+    );
+
+    bridge
+        .handle_message(message("om_timeout", "oc_flow", "clean up"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("approval:allow:req-timeout")
+            )
+        })
+    })
+    .await;
+    let approval_message_id = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("approval:allow:req-timeout") => Some(message_id),
+            _ => None,
+        })
+        .expect("approval card");
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::UpdateCard { message_id, card }
+                    if message_id == &approval_message_id
+                        && card_json(card).contains("超时自动拒绝")
+            )
+        })
+    })
+    .await;
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("denied by timeout"))
+    })
+    .await;
+
+    let decision = std::fs::read_to_string(dir.path().join("timeout-decision.json"))
+        .expect("the fake agent recorded the timeout denial");
+    assert!(decision.contains("\"behavior\":\"deny\""), "{decision}");
+    assert!(decision.contains("审批超时"), "{decision}");
 }

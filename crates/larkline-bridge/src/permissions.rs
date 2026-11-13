@@ -217,6 +217,23 @@ impl RunPermissions {
             _ => access.default_claude_permission_mode(),
         }
     }
+
+    /// Whether Claude should route permission prompts to the bridge.
+    ///
+    /// `default` asks for anything that would need approval and `acceptEdits`
+    /// still asks for commands/network/MCP tools; both become card approvals.
+    /// `plan` cannot execute tools and `bypassPermissions` never asks, so they
+    /// keep the plain one-shot stdin path.
+    pub fn claude_approvals_enabled(self) -> bool {
+        self.claude_permission_mode().asks_for_approval()
+    }
+}
+
+impl ClaudePermissionMode {
+    /// Modes whose prompts should reach the bridge's approval card.
+    pub fn asks_for_approval(self) -> bool {
+        matches!(self, Self::Default | Self::AcceptEdits)
+    }
 }
 
 /// `clampAccess` from `src/config/permissions.ts`.

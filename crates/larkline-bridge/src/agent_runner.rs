@@ -11,8 +11,8 @@ use std::process::Stdio;
 use anyhow::{Context as _, anyhow};
 use larkline_agent::{
     AgentEvent, BridgePromptContext, ClaudeArgsInput, ClaudeStreamTranslator, CodexArgsInput,
-    CodexFinishReason, CodexJsonlTranslator, build_bridge_system_prompt, build_claude_args,
-    build_codex_args, prefix_bridge_system_prompt,
+    CodexFinishReason, CodexJsonlTranslator, PermissionResponse, build_bridge_system_prompt,
+    build_claude_args, build_codex_args, prefix_bridge_system_prompt, user_message_json,
 };
 use larkline_core::AgentKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -67,6 +67,10 @@ pub struct AgentProcess {
     child: Child,
     stdout: BufReader<ChildStdout>,
     translator: Translator,
+    /// Kept open for the Claude permission-prompt control protocol. `None`
+    /// when the prompt was a one-shot write and stdin was already closed
+    /// (Codex and Claude runs without approvals).
+    stdin: Option<tokio::process::ChildStdin>,
     /// Removed on drop: the agent has already read it by then.
     _system_prompt: Option<TempFile>,
 }
@@ -82,15 +86,24 @@ fn build_agent_args(
     system_prompt_file: &Path,
 ) -> anyhow::Result<(Vec<String>, String)> {
     match spec.kind {
-        AgentKind::Claude => Ok((
-            build_claude_args(&ClaudeArgsInput {
-                permission_mode: Some(spec.permissions.claude_permission_mode().as_str()),
-                system_prompt_file: Some(system_prompt_file),
-                session_id: spec.session_id.as_deref(),
-                model: spec.model.as_deref(),
-            }),
-            spec.prompt.clone(),
-        )),
+        AgentKind::Claude => {
+            let approvals = spec.permissions.claude_approvals_enabled();
+            Ok((
+                build_claude_args(&ClaudeArgsInput {
+                    permission_mode: Some(spec.permissions.claude_permission_mode().as_str()),
+                    system_prompt_file: Some(system_prompt_file),
+                    session_id: spec.session_id.as_deref(),
+                    model: spec.model.as_deref(),
+                    stream_json_input: approvals,
+                    permission_prompt_tool: approvals,
+                }),
+                if approvals {
+                    user_message_json(&spec.prompt)
+                } else {
+                    spec.prompt.clone()
+                },
+            ))
+        }
         AgentKind::Codex => {
             let args = build_codex_args(&CodexArgsInput {
                 cwd: spec.cwd.to_string_lossy().into_owned(),
@@ -163,13 +176,31 @@ impl AgentProcess {
                 }
             });
         }
-        if let Some(mut stdin) = child.stdin.take() {
+        // Claude approval runs keep stdin open: the control protocol writes
+        // `control_response` frames there while the agent is blocked on a
+        // permission prompt. Everything else remains a one-shot prompt.
+        let approvals =
+            spec.kind == AgentKind::Claude && spec.permissions.claude_approvals_enabled();
+        let stdin = if let Some(mut stdin) = child.stdin.take() {
+            // `stream-json` input is newline-delimited; a one-shot text prompt
+            // is written verbatim (the CLI reads it until EOF).
+            let mut payload = stdin_prompt.into_bytes();
+            if approvals {
+                payload.push(b'\n');
+            }
             stdin
-                .write_all(stdin_prompt.as_bytes())
+                .write_all(&payload)
                 .await
                 .context("failed to write prompt to agent stdin")?;
-            stdin.shutdown().await.ok();
-        }
+            if approvals {
+                Some(stdin)
+            } else {
+                stdin.shutdown().await.ok();
+                None
+            }
+        } else {
+            None
+        };
 
         let translator = match spec.kind {
             AgentKind::Claude => Translator::Claude(ClaudeStreamTranslator::new()),
@@ -180,6 +211,7 @@ impl AgentProcess {
             child,
             stdout: BufReader::new(stdout),
             translator,
+            stdin,
             _system_prompt: Some(system_prompt_file),
         })
     }
@@ -207,7 +239,52 @@ impl AgentProcess {
         events
     }
 
+    /// Answer a pending permission prompt over the Claude control protocol.
+    pub async fn respond_to_permission(
+        &mut self,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> anyhow::Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            anyhow::bail!("agent stdin is closed; cannot answer the permission request");
+        };
+        let decision = match response {
+            PermissionResponse::Allow { updated_input } => {
+                serde_json::json!({ "behavior": "allow", "updatedInput": updated_input })
+            }
+            PermissionResponse::Deny { message } => {
+                serde_json::json!({ "behavior": "deny", "message": message })
+            }
+        };
+        let frame = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": decision
+            }
+        });
+        let mut line = frame.to_string();
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("failed to write a permission response to agent stdin")?;
+        stdin.flush().await.ok();
+        Ok(())
+    }
+
+    /// Close the control-protocol stdin so a finished Claude process can exit.
+    ///
+    /// Idempotent; a run without approvals already closed stdin at spawn.
+    pub async fn close_stdin(&mut self) {
+        if let Some(mut stdin) = self.stdin.take() {
+            stdin.shutdown().await.ok();
+        }
+    }
+
     pub async fn kill(&mut self) {
+        self.stdin = None;
         let _ = self.child.kill().await;
     }
 }
@@ -325,8 +402,19 @@ mod tests {
                 Some(expected),
                 "access {access:?}"
             );
-            // Claude gets the prompt on stdin, not argv.
-            assert_eq!(stdin, "hello");
+            // Claude gets the prompt on stdin, not argv. Workspace/acceptEdits
+            // enables the approval protocol, so the prompt is a stream-json
+            // user frame instead of plain text.
+            if access == AccessMode::Workspace {
+                assert!(stdin.contains("\"text\":\"hello\""), "{stdin}");
+                assert!(
+                    args.windows(2)
+                        .any(|w| w == ["--input-format", "stream-json"])
+                );
+            } else {
+                assert_eq!(stdin, "hello");
+                assert!(!args.iter().any(|arg| arg == "--input-format"));
+            }
             assert!(!args.iter().any(|arg| arg == "hello"));
         }
     }

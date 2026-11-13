@@ -11,11 +11,13 @@ pub mod detect;
 pub mod prompt;
 pub mod types;
 
-pub use claude::{ClaudeArgsInput, ClaudeStreamTranslator, build_claude_args};
+pub use claude::{ClaudeArgsInput, ClaudeStreamTranslator, build_claude_args, user_message_json};
 pub use codex::{CodexArgsInput, CodexFinishReason, CodexJsonlTranslator, build_codex_args};
 pub use detect::{ResolvedBinary, resolve_executable};
 pub use prompt::{
     BridgePromptContext, PromptAttachment, PromptContext, PromptMention, build_agent_prompt,
     build_agent_prompt_with_attachments, build_bridge_system_prompt, prefix_bridge_system_prompt,
 };
-pub use types::{AgentEvent, SandboxMode, TerminationReason, usage_total_tokens};
+pub use types::{
+    AgentEvent, PermissionResponse, SandboxMode, TerminationReason, usage_total_tokens,
+};
