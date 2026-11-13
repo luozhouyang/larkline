@@ -1458,9 +1458,10 @@ for line in sys.stdin:
         .expect("elements")
         .iter()
         .find(|element| {
-            element["tag"] == "button" && element["behaviors"][0]["value"]["decision"] == "allow"
+            element["tag"] == "button"
+                && element["behaviors"][0]["value"]["decision"] == "allow_session"
         })
-        .expect("allow button");
+        .expect("session button");
     let event = card_click(
         button["behaviors"][0]["value"].clone(),
         &approval_message_id,
@@ -1469,7 +1470,7 @@ for line in sys.stdin:
     );
     assert_eq!(
         bridge.handle_card_action(&event).await.as_deref(),
-        Some("已允许，继续执行。")
+        Some("已允许，本次会话不再询问。")
     );
 
     wait_for(&transport, Duration::from_secs(4), |frames| {
@@ -1480,9 +1481,426 @@ for line in sys.stdin:
     .await;
     let decision = std::fs::read_to_string(dir.path().join("codex-decision.json"))
         .expect("the fake app-server recorded the decision");
-    assert!(
-        decision.contains("\"decision\": \"accept\"")
-            || decision.contains("\"decision\":\"accept\""),
-        "{decision}"
+    assert!(decision.contains("acceptForSession"), "{decision}");
+}
+
+/// Claude AskUserQuestion is rendered as an option card and answered with
+/// the CLI's `updatedInput.answers` shape.
+#[tokio::test]
+async fn question_card_answers_claude_ask_user_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-q"}'
+printf '%s\n' '{"type":"control_request","request_id":"req-q","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Which option?","header":"Choice","multiSelect":false,"options":[{"label":"Option A","description":"first"},{"label":"Option B","description":"second"}]}]},"tool_use_id":"call-q","requires_user_interaction":true}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/question-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after answer"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-q"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
     );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+
+    bridge
+        .handle_message(message("om_question", "oc_flow", "ask me"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("answer:req-q")
+            )
+        })
+    })
+    .await;
+    let (question_message_id, question_card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("answer:req-q") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("question card");
+    let option = question_card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| {
+            element["tag"] == "button"
+                && element["behaviors"][0]["value"]["question_index"] == 0
+                && element["behaviors"][0]["value"]["option_index"] == 0
+        })
+        .expect("first option");
+    let event = card_click(
+        option["behaviors"][0]["value"].clone(),
+        &question_message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已记录选择。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after answer"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("question-decision.json"))
+        .expect("the fake agent recorded the answer");
+    assert!(decision.contains("control_response"), "{decision}");
+    assert!(decision.contains("\"answers\""), "{decision}");
+    assert!(decision.contains("Option A"), "{decision}");
+}
+
+#[tokio::test]
+async fn question_card_answers_codex_request_user_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+def send(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        send({"id": req_id, "result": {"userAgent": "fake"}})
+    elif method == "thread/start":
+        send({"id": req_id, "result": {"thread": {"id": "thr_question"}}})
+    elif method == "turn/start":
+        send({"id": req_id, "result": {"turn": {"id": "turn_q", "status": "inProgress", "items": []}}})
+        send({"id": 88, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "thr_question", "turnId": "turn_q", "itemId": "item_q",
+            "questions": [{"id": "q1", "header": "Choice", "question": "Pick one",
+                "isOther": False, "isSecret": False,
+                "options": [{"label": "A", "description": "first"}, {"label": "B", "description": "second"}]}]}})
+    elif req_id == 88:
+        with open(os.path.join(here, "codex-question.json"), "w") as handle:
+            json.dump(msg, handle)
+        send({"method": "item/agentMessage/delta", "params": {"threadId": "thr_question", "turnId": "turn_q", "itemId": "m", "delta": "done after codex question"}})
+        send({"method": "item/completed", "params": {"threadId": "thr_question", "turnId": "turn_q", "item": {"id": "m", "type": "agentMessage", "text": "done after codex question"}}})
+        send({"method": "turn/completed", "params": {"threadId": "thr_question", "turn": {"id": "turn_q", "status": "completed", "items": []}}})
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.agent_kind = AgentKind::Codex;
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace"
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+
+    bridge
+        .handle_message(message("om_codex_q", "oc_flow", "ask me"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("answer:88")
+            )
+        })
+    })
+    .await;
+    let (question_message_id, question_card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("answer:88") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("question card");
+    let option = question_card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| {
+            element["tag"] == "button"
+                && element["behaviors"][0]["value"]["question_index"] == 0
+                && element["behaviors"][0]["value"]["option_index"] == 0
+        })
+        .expect("first option");
+    let event = card_click(
+        option["behaviors"][0]["value"].clone(),
+        &question_message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已记录选择。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after codex question"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("codex-question.json"))
+        .expect("the fake app-server recorded the answer");
+    assert!(decision.contains("answers"), "{decision}");
+    assert!(decision.contains("q1"), "{decision}");
+    assert!(decision.contains('A'), "{decision}");
+}
+
+#[tokio::test]
+async fn session_approval_allows_with_updated_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-session"}'
+printf '%s\n' '{"type":"control_request","request_id":"req-session","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"pwd"},"tool_use_id":"call-session","permission_suggestions":[{"type":"setMode","mode":"acceptEdits","destination":"session"}]}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/session-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after session allow"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-session"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+
+    bridge
+        .handle_message(message("om_session", "oc_flow", "allow session"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("approval:allow_session:req-session")
+            )
+        })
+    })
+    .await;
+    let (approval_message_id, approval_card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("approval:allow_session:req-session") => {
+                Some((message_id, card))
+            }
+            _ => None,
+        })
+        .expect("session approval card");
+    let button = approval_card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| element["behaviors"][0]["value"]["decision"] == "allow_session")
+        .expect("session button");
+    let event = card_click(
+        button["behaviors"][0]["value"].clone(),
+        &approval_message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已允许，本次会话不再询问。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after session allow"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("session-decision.json"))
+        .expect("the fake agent recorded the session response");
+    assert!(decision.contains("updatedPermissions"), "{decision}");
+    assert!(decision.contains("acceptEdits"), "{decision}");
+}
+
+#[tokio::test]
+async fn question_card_supports_multi_select_and_submit() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-multi"}'
+printf '%s\n' '{"type":"control_request","request_id":"req-multi","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Pick any","header":"Multi","multiSelect":true,"options":[{"label":"A","description":"first"},{"label":"B","description":"second"}]}]},"requires_user_interaction":true}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/multi-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after multi"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-multi"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+    bridge
+        .handle_message(message("om_multi", "oc_flow", "ask multi"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("answer:req-multi")
+            )
+        })
+    })
+    .await;
+    let (message_id, card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("answer:req-multi") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("question card");
+    let option_value = |card: &Value, index: u64| {
+        card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| {
+                element["tag"] == "button"
+                    && element["behaviors"][0]["value"]["option_index"] == index
+                    && element["behaviors"][0]["value"]["submit"] == false
+            })
+            .map(|element| element["behaviors"][0]["value"].clone())
+            .expect("option button")
+    };
+    for index in [0, 1] {
+        let event = card_click(
+            option_value(&card, index),
+            &message_id,
+            "oc_flow",
+            "ou_user",
+        );
+        assert_eq!(
+            bridge.handle_card_action(&event).await.as_deref(),
+            Some("已记录选择。")
+        );
+    }
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::UpdateCard { message_id: id, card }
+                    if id == &message_id
+                        && card_json(card).contains("\"submit\":true")
+            )
+        })
+    })
+    .await;
+    let updated = transport
+        .frames()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Frame::UpdateCard {
+                message_id: id,
+                card,
+            } if id == message_id => Some(card),
+            _ => None,
+        })
+        .next_back()
+        .expect("updated question card");
+    let submit = updated["body"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|element| {
+            element["tag"] == "button" && element["behaviors"][0]["value"]["submit"] == true
+        })
+        .expect("submit button");
+    let event = card_click(
+        submit["behaviors"][0]["value"].clone(),
+        &message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已提交。")
+    );
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after multi"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("multi-decision.json"))
+        .expect("the fake agent recorded the multi answer");
+    assert!(decision.contains("A"), "{decision}");
+    assert!(decision.contains("B"), "{decision}");
 }

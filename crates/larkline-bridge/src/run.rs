@@ -96,13 +96,13 @@ use lark_channel::message::{
     MessageChatType, MessageSenderInfo, MessageSenderType, NormalizedMessage, Recipient,
 };
 use larkline_agent::{
-    AgentEvent, PermissionResponse, PromptContext, PromptMention, TerminationReason,
-    build_agent_prompt_with_attachments,
+    AgentEvent, PermissionResponse, PromptContext, PromptMention, QuestionAnswer,
+    TerminationReason, build_agent_prompt_with_attachments,
 };
 use larkline_core::{
     AppPaths, CoreError, MessageReplyMode, Preferences, ProfileConfig, SessionStore, TenantBrand,
     WorkspaceStore,
-    config::{ProfileMode, ReasoningDisplay},
+    config::{AgentKind, ProfileMode, ReasoningDisplay},
 };
 use larkline_lark::cot::{CotClient, CotTransport};
 use larkline_lark::reactions::TYPING;
@@ -125,8 +125,9 @@ use crate::pending_store::PendingStore;
 use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
-    ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, RunView, approval_card,
-    approval_decided_card, card_status, card_summary, render_card,
+    ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, QuestionCardInput, RunView,
+    approval_card, approval_decided_card, card_status, card_summary, question_card,
+    question_card_questions, question_decided_card, render_card,
 };
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
@@ -343,28 +344,46 @@ struct ActiveRun {
     /// `None` for tracked runs (comment / meeting) that own their own loop and
     /// cancellation semantics; those keep the historic immediate abort.
     interrupt: Option<Arc<RunInterrupt>>,
-    /// Pending permission prompts for an IM run. `None` for comment/meeting
-    /// runs, which have no card approval flow.
-    approvals: Option<Arc<ApprovalBroker>>,
+    /// Pending card interactions (permission prompts and user questions) for
+    /// an IM run. `None` for comment/meeting runs, which have no card flow.
+    interactions: Option<Arc<InteractionBroker>>,
 }
 
-/// One click on an approval card.
+/// One choice on a permission card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionChoice {
+    Allow,
+    AllowSession,
+    Deny,
+}
+
+/// A click delivered to the run task.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ApprovalDecision {
-    request_id: String,
-    allow: bool,
-    by: String,
+enum InteractionDecision {
+    Approval {
+        request_id: String,
+        choice: PermissionChoice,
+        by: String,
+    },
+    Answer {
+        request_id: String,
+        question_index: usize,
+        option_index: usize,
+        submit: bool,
+        by: String,
+    },
 }
 
-/// The bridge side of one IM run's approval queue.
+/// The bridge side of one IM run's interaction queue.
 ///
 /// The run loop owns the receiver; this broker is registered in
-/// [`Bridge::active`] so [`Bridge::handle_card_action`] can deliver a decision
-/// without knowing the run task.
-struct ApprovalBroker {
+/// [`Bridge::active`] so [`Bridge::handle_card_action`] can deliver a click
+/// without knowing the run task. Only one card interaction is active at a
+/// time; the enum keeps permission and question clicks on one channel.
+struct InteractionBroker {
     run_id: u64,
     operator: String,
-    tx: tokio::sync::mpsc::UnboundedSender<ApprovalDecision>,
+    tx: tokio::sync::mpsc::UnboundedSender<InteractionDecision>,
 }
 
 /// A permission request the run loop is waiting on.
@@ -373,11 +392,35 @@ struct PendingApproval {
     tool_name: String,
     input: Value,
     description: Option<String>,
+    /// Claude `permission_suggestions`; enables the session button.
+    suggestions: Vec<Value>,
+}
+
+/// A user-question request the run loop is waiting on.
+struct PendingQuestion {
+    request_id: String,
+    questions: Vec<larkline_agent::UserQuestion>,
+    raw_input: Value,
+    /// Selected option indices per question.
+    selected: Vec<Vec<usize>>,
+    /// Single-select questions already answered.
+    locked: Vec<bool>,
+    card_message_id: Option<String>,
 }
 
 /// Result of waiting for one approval decision.
 enum ApprovalWait {
-    Answered { allow: bool, by: String },
+    Answered {
+        choice: PermissionChoice,
+        by: String,
+    },
+    TimedOut,
+    Interrupted,
+}
+
+/// Result of waiting for one question card.
+enum QuestionOutcome {
+    Answered,
     TimedOut,
     Interrupted,
 }
@@ -1574,11 +1617,11 @@ impl Bridge {
             .map(message_sender_id)
             .unwrap_or_default()
             .to_string();
-        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
-        let approvals = Arc::new(ApprovalBroker {
+        let (interaction_tx, interaction_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interactions = Arc::new(InteractionBroker {
             run_id: id,
             operator: operator.clone(),
-            tx: approval_tx,
+            tx: interaction_tx,
         });
         // Snapshot the session generation while the run is still atomically
         // registered: a `/new` that lands after this point bumps the
@@ -1593,7 +1636,14 @@ impl Bridge {
                 permit: Some(permit),
             };
             if let Err(err) = bridge
-                .run_batch(batch, run_interrupt, generation, id, operator, approval_rx)
+                .run_batch(
+                    batch,
+                    run_interrupt,
+                    generation,
+                    id,
+                    operator,
+                    interaction_rx,
+                )
                 .await
             {
                 tracing::error!(error = %err, "agent run failed");
@@ -1608,7 +1658,7 @@ impl Bridge {
                 id,
                 abort: handle.abort_handle(),
                 interrupt: Some(interrupt),
-                approvals: Some(approvals),
+                interactions: Some(interactions),
             },
         );
         drop(active);
@@ -1659,7 +1709,7 @@ impl Bridge {
                 // Comment/meeting runs own their agent loop and keep the
                 // historic immediate abort; there is no shared loop to signal.
                 interrupt: None,
-                approvals: None,
+                interactions: None,
             },
         ) {
             // Callers serialize per scope (the comment guard / meeting map),
@@ -2140,6 +2190,10 @@ impl Bridge {
                     self.handle_approval_action(scope, name, value, clicker)
                         .await
                 }
+                name if name.starts_with("answer:") => {
+                    let clicker = action.operator.open_id.as_deref().unwrap_or_default();
+                    self.handle_answer_action(scope, name, value, clicker).await
+                }
                 _ => None,
             };
         }
@@ -2165,9 +2219,12 @@ impl Bridge {
         let request_id = value.get("request_id").and_then(Value::as_str)?;
         let operator = value.get("operator").and_then(Value::as_str)?;
         let run_id = value.get("run_id").and_then(Value::as_u64)?;
-        if decision != "allow" && decision != "deny" {
-            return None;
-        }
+        let choice = match decision {
+            "allow" => PermissionChoice::Allow,
+            "allow_session" => PermissionChoice::AllowSession,
+            "deny" => PermissionChoice::Deny,
+            _ => return None,
+        };
         if approval_action(decision, request_id, operator, run_id) != action_name {
             tracing::warn!(
                 scope,
@@ -2184,7 +2241,7 @@ impl Bridge {
             let run = active.get(scope);
             (
                 run.is_some_and(|run| run.id == run_id),
-                run.and_then(|run| run.approvals.clone()),
+                run.and_then(|run| run.interactions.clone()),
             )
         };
         let Some(broker) = broker else {
@@ -2198,9 +2255,9 @@ impl Bridge {
         }
         if broker
             .tx
-            .send(ApprovalDecision {
+            .send(InteractionDecision::Approval {
                 request_id: request_id.to_string(),
-                allow: decision == "allow",
+                choice,
                 by: clicker.to_string(),
             })
             .is_err()
@@ -2214,10 +2271,75 @@ impl Bridge {
             operator,
             "approval decision accepted"
         );
-        Some(if decision == "allow" {
-            "已允许，继续执行。".to_string()
+        Some(match choice {
+            PermissionChoice::Allow => "已允许，继续执行。".to_string(),
+            PermissionChoice::AllowSession => "已允许，本次会话不再询问。".to_string(),
+            PermissionChoice::Deny => "已拒绝。".to_string(),
+        })
+    }
+
+    /// Handle a click on a user-question option or its submit button.
+    async fn handle_answer_action(
+        &self,
+        scope: &str,
+        action_name: &str,
+        value: &serde_json::Map<String, Value>,
+        clicker: &str,
+    ) -> Option<String> {
+        let request_id = value.get("request_id").and_then(Value::as_str)?;
+        let operator = value.get("operator").and_then(Value::as_str)?;
+        let run_id = value.get("run_id").and_then(Value::as_u64)?;
+        let question_index = value.get("question_index").and_then(Value::as_u64)? as usize;
+        let option_index = value.get("option_index").and_then(Value::as_u64)? as usize;
+        let submit = value
+            .get("submit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if answer_action(
+            request_id,
+            question_index,
+            option_index,
+            submit,
+            operator,
+            run_id,
+        ) != action_name
+        {
+            return Some("操作已失效，请重新发起。".to_string());
+        }
+        if clicker != operator {
+            return Some("只有发起本次任务的人可以回答。".to_string());
+        }
+        let (run_matches, broker) = {
+            let active = lock(&self.active);
+            let run = active.get(scope);
+            (
+                run.is_some_and(|run| run.id == run_id),
+                run.and_then(|run| run.interactions.clone()),
+            )
+        };
+        let Some(broker) = broker else {
+            return Some("该问题已失效。".to_string());
+        };
+        if !run_matches || broker.run_id != run_id || broker.operator != operator {
+            return Some("该问题已失效。".to_string());
+        }
+        if broker
+            .tx
+            .send(InteractionDecision::Answer {
+                request_id: request_id.to_string(),
+                question_index,
+                option_index,
+                submit,
+                by: clicker.to_string(),
+            })
+            .is_err()
+        {
+            return Some("该问题已失效。".to_string());
+        }
+        Some(if submit {
+            "已提交。".to_string()
         } else {
-            "已拒绝。".to_string()
+            "已记录选择。".to_string()
         })
     }
 
@@ -2397,7 +2519,7 @@ impl Bridge {
         generation: u64,
         run_id: u64,
         operator: String,
-        mut approval_rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
+        mut interaction_rx: tokio::sync::mpsc::UnboundedReceiver<InteractionDecision>,
     ) -> anyhow::Result<()> {
         let Some(first) = batch.first() else {
             return Ok(());
@@ -2716,30 +2838,50 @@ impl Bridge {
                         }
                     }
                     // A permission request blocks the agent until the user
-                    // answers. Handle it before creating the next stdout read:
-                    // the child is waiting on stdin, not producing events.
-                    let mut requested: Option<PendingApproval> = None;
+                    // answers. Collect every request in this batch and handle
+                    // them one at a time; the provider is waiting on stdin.
+                    let mut requested: std::collections::VecDeque<PendingApproval> =
+                        std::collections::VecDeque::new();
+                    let mut requested_questions: std::collections::VecDeque<PendingQuestion> =
+                        std::collections::VecDeque::new();
                     for event in &events {
+                        if let AgentEvent::QuestionRequest {
+                            request_id,
+                            questions,
+                            raw_input,
+                            ..
+                        } = event
+                        {
+                            requested_questions.push_back(PendingQuestion {
+                                request_id: request_id.clone(),
+                                questions: questions.clone(),
+                                raw_input: raw_input.clone(),
+                                selected: vec![Vec::new(); questions.len()],
+                                locked: vec![false; questions.len()],
+                                card_message_id: None,
+                            });
+                        }
                         if let AgentEvent::PermissionRequest {
                             request_id,
                             tool_name,
                             input,
                             description,
+                            suggestions,
                             ..
                         } = event
                         {
-                            requested = Some(PendingApproval {
+                            requested.push_back(PendingApproval {
                                 request_id: request_id.clone(),
                                 tool_name: tool_name.clone(),
                                 input: input.clone(),
                                 description: description.clone(),
+                                suggestions: suggestions.clone(),
                             });
                         }
                     }
-                    if let Some(request) = requested {
+                    let mut stop_run = false;
+                    while let Some(request) = requested.pop_front() {
                         if view.finished {
-                            // A late request after a terminal turn: answer it
-                            // instead of showing a card for a run that is done.
                             let _ = process
                                 .respond_to_permission(
                                     &request.request_id,
@@ -2748,6 +2890,7 @@ impl Bridge {
                                     },
                                 )
                                 .await;
+                            stop_run = true;
                             break;
                         }
                         let label = request.tool_name.clone();
@@ -2770,6 +2913,11 @@ impl Bridge {
                                 last_update = Instant::now();
                             }
                         }
+                        // Claude can grant a session rule only when the CLI
+                        // supplied one; Codex supports acceptForSession for
+                        // command/file/permission requests.
+                        let allow_session = profile.agent_kind == AgentKind::Codex
+                            || !request.suggestions.is_empty();
                         let approval_message = if operator.is_empty() {
                             None
                         } else {
@@ -2780,6 +2928,7 @@ impl Bridge {
                                 run_id,
                                 &operator,
                                 &request,
+                                allow_session,
                             )
                             .await
                         };
@@ -2806,26 +2955,36 @@ impl Bridge {
                             if let Some(tail) = tail.as_mut() {
                                 tail.pending_approval = None;
                             }
-                            pending = EventSource::next_events(&mut process);
                             continue;
                         };
                         let outcome = self
-                            .wait_for_approval(&mut process, &mut approval_rx, &interrupt, &request)
+                            .wait_for_approval(
+                                &mut process,
+                                &mut interaction_rx,
+                                &interrupt,
+                                &request,
+                                allow_session,
+                            )
                             .await;
-                        let (status, by) = match &outcome {
-                            ApprovalWait::Answered { allow: true, by } => {
-                                ("✅ 已允许", by.as_str())
+                        let (status, by, choice) = match &outcome {
+                            ApprovalWait::Answered { choice, by } => {
+                                let status = match choice {
+                                    PermissionChoice::Allow => "✅ 已允许",
+                                    PermissionChoice::AllowSession => "✅ 本次会话已允许",
+                                    PermissionChoice::Deny => "⛔ 已拒绝",
+                                };
+                                (status, by.as_str(), Some(*choice))
                             }
-                            ApprovalWait::Answered { allow: false, by } => {
-                                ("⛔ 已拒绝", by.as_str())
-                            }
-                            ApprovalWait::TimedOut => ("⌛ 超时自动拒绝", ""),
-                            ApprovalWait::Interrupted => ("⏹ 已停止", ""),
+                            ApprovalWait::TimedOut => ("⌛ 超时自动拒绝", "", None),
+                            ApprovalWait::Interrupted => ("⏹ 已停止", "", None),
                         };
                         tracing::info!(
                             scope,
                             request_id = %request.request_id,
-                            allow = matches!(outcome, ApprovalWait::Answered { allow: true, .. }),
+                            allow = matches!(
+                                choice,
+                                Some(PermissionChoice::Allow | PermissionChoice::AllowSession)
+                            ),
                             by,
                             "approval decided"
                         );
@@ -2852,6 +3011,7 @@ impl Bridge {
                             if let Some(tail) = tail.as_mut() {
                                 tail.mark_interrupted();
                             }
+                            stop_run = true;
                             break;
                         }
                         if let Some(format) = card_format {
@@ -2870,10 +3030,53 @@ impl Bridge {
                             }
                         }
                         if view.finished {
+                            stop_run = true;
                             break;
                         }
-                        pending = EventSource::next_events(&mut process);
-                        continue;
+                    }
+                    while !stop_run {
+                        let Some(mut question) = requested_questions.pop_front() else {
+                            break;
+                        };
+                        if view.finished {
+                            let _ = process
+                                .respond_to_question(&question.request_id, &question.raw_input, &[])
+                                .await;
+                            stop_run = true;
+                            break;
+                        }
+                        let outcome = self
+                            .run_question(
+                                &scope,
+                                &chat_id,
+                                &last_message_id,
+                                &operator,
+                                run_id,
+                                &mut process,
+                                &mut interaction_rx,
+                                &interrupt,
+                                &mut question,
+                            )
+                            .await;
+                        match outcome {
+                            QuestionOutcome::Answered | QuestionOutcome::TimedOut => {}
+                            QuestionOutcome::Interrupted => {
+                                process.kill().await;
+                                view.mark_interrupted();
+                                if let Some(tail) = tail.as_mut() {
+                                    tail.mark_interrupted();
+                                }
+                                stop_run = true;
+                                break;
+                            }
+                        }
+                        if view.finished {
+                            stop_run = true;
+                            break;
+                        }
+                    }
+                    if stop_run {
+                        break;
                     }
                     if view.finished {
                         break;
@@ -3227,6 +3430,7 @@ impl Bridge {
     /// to answer, the request id and the decision. The card is a normal
     /// non-streaming message: it can outlive the 8.5-minute progress window and
     /// a new message is what notifies the user that the agent is waiting.
+    #[allow(clippy::too_many_arguments)]
     async fn send_approval_card(
         &self,
         scope: &str,
@@ -3235,12 +3439,16 @@ impl Bridge {
         run_id: u64,
         operator: &str,
         request: &PendingApproval,
+        allow_session: bool,
     ) -> Option<String> {
         let allow_action = approval_action("allow", &request.request_id, operator, run_id);
         let deny_action = approval_action("deny", &request.request_id, operator, run_id);
-        let input_json = serde_json::to_string_pretty(&request.input)
-            .unwrap_or_else(|_| request.input.to_string());
-        let input_json = truncate_chars(&input_json, 2_500);
+        let session_action = allow_session
+            .then(|| approval_action("allow_session", &request.request_id, operator, run_id));
+        let session_token = session_action
+            .as_ref()
+            .map(|action| self.tokens.sign(scope, action));
+        let (input_json, input_truncated) = approval_input_json(&request.input);
         let input_preview = approval_input_preview(&request.tool_name, &request.input);
         let timeout_minutes = self.approval_timeout.as_secs().div_ceil(60).max(1);
         let value = approval_card(&ApprovalCardInput {
@@ -3252,10 +3460,13 @@ impl Bridge {
             description: request.description.as_deref(),
             input_preview: &input_preview,
             input_json: &input_json,
+            input_truncated,
             allow_action: &allow_action,
             allow_token: &self.tokens.sign(scope, &allow_action),
             deny_action: &deny_action,
             deny_token: &self.tokens.sign(scope, &deny_action),
+            session_action: session_action.as_deref(),
+            session_token: session_token.as_deref(),
             timeout_minutes,
         });
         let Ok(card) = lark_channel::Card::from_value(value) else {
@@ -3296,9 +3507,10 @@ impl Bridge {
     async fn wait_for_approval(
         &self,
         process: &mut AgentProcess,
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<InteractionDecision>,
         interrupt: &Arc<RunInterrupt>,
         request: &PendingApproval,
+        allow_session: bool,
     ) -> ApprovalWait {
         let deadline = tokio::time::Instant::now() + self.approval_timeout;
         loop {
@@ -3330,18 +3542,33 @@ impl Bridge {
                         // stop so the loop kills the child and finalizes.
                         return ApprovalWait::Interrupted;
                     };
-                    if decision.request_id != request.request_id {
+                    let InteractionDecision::Approval { request_id, choice, by } = decision else {
+                        // A stale question click, or an answer for another
+                        // interaction; only one is active at a time.
+                        continue;
+                    };
+                    if request_id != request.request_id {
                         // A stale click for an already-answered request.
                         continue;
                     }
-                    let response = if decision.allow {
-                        PermissionResponse::Allow {
-                            updated_input: request.input.clone(),
-                        }
+                    let effective_choice = if choice == PermissionChoice::AllowSession
+                        && !allow_session
+                    {
+                        PermissionChoice::Deny
                     } else {
-                        PermissionResponse::Deny {
+                        choice
+                    };
+                    let response = match effective_choice {
+                        PermissionChoice::Allow => PermissionResponse::Allow {
+                            updated_input: request.input.clone(),
+                        },
+                        PermissionChoice::AllowSession => PermissionResponse::AllowForSession {
+                            updated_input: request.input.clone(),
+                            updated_permissions: request.suggestions.clone(),
+                        },
+                        PermissionChoice::Deny => PermissionResponse::Deny {
                             message: "用户拒绝了该操作。".to_string(),
-                        }
+                        },
                     };
                     if let Err(err) = process
                         .respond_to_permission(&request.request_id, response)
@@ -3351,9 +3578,307 @@ impl Bridge {
                         return ApprovalWait::Interrupted;
                     }
                     return ApprovalWait::Answered {
-                        allow: decision.allow,
-                        by: decision.by,
+                        choice: effective_choice,
+                        by,
                     };
+                }
+            }
+        }
+    }
+
+    /// Render and send/update a question card for the current selections.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_question_card(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        operator: &str,
+        run_id: u64,
+        question: &PendingQuestion,
+        update: bool,
+    ) -> Option<String> {
+        let actions: Vec<Vec<(String, String)>> = question
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(question_index, item)| {
+                item.options
+                    .iter()
+                    .enumerate()
+                    .map(|(option_index, _)| {
+                        let action = answer_action(
+                            &question.request_id,
+                            question_index,
+                            option_index,
+                            false,
+                            operator,
+                            run_id,
+                        );
+                        let token = self.tokens.sign(scope, &action);
+                        (action, token)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut card_questions = question_card_questions(&question.questions, &actions);
+        for (index, card_question) in card_questions.iter_mut().enumerate() {
+            card_question.selected = question.selected[index].clone();
+            card_question.locked = question.locked[index];
+        }
+        let all_selected =
+            question.questions.iter().enumerate().all(|(index, item)| {
+                !item.options.is_empty() && !question.selected[index].is_empty()
+            });
+        let any_multi = question.questions.iter().any(|item| item.multi_select);
+        let submit_action = (any_multi && all_selected).then(|| {
+            let action = answer_action(&question.request_id, 0, 0, true, operator, run_id);
+            let token = self.tokens.sign(scope, &action);
+            (action, token)
+        });
+        let timeout_minutes = self.approval_timeout.as_secs().div_ceil(60).max(1);
+        let value = question_card(&QuestionCardInput {
+            scope,
+            operator,
+            run_id,
+            request_id: &question.request_id,
+            questions: &card_questions,
+            submit_action: submit_action
+                .as_ref()
+                .map(|(action, token)| (action.as_str(), token.as_str())),
+            timeout_minutes,
+        });
+        let Ok(card) = lark_channel::Card::from_value(value) else {
+            tracing::warn!("question card is not a valid CardKit document");
+            return None;
+        };
+        if update {
+            if let Some(message_id) = question.card_message_id.as_deref() {
+                if let Err(err) = self.transport.update_card_message(message_id, &card).await {
+                    tracing::warn!(error = %err, "cannot update the question card");
+                }
+                return Some(message_id.to_string());
+            }
+        }
+        match reply::send_card(
+            &*self.transport,
+            scope,
+            chat_id,
+            Some(source_message_id),
+            &card,
+        )
+        .await
+        {
+            Ok(id) => Some(id.0),
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot send the question card");
+                None
+            }
+        }
+    }
+
+    fn question_answers(question: &PendingQuestion) -> Vec<QuestionAnswer> {
+        question
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, item)| QuestionAnswer {
+                question_id: item.id.clone(),
+                answers: question.selected[index]
+                    .iter()
+                    .filter_map(|option| item.options.get(*option))
+                    .map(|option| option.label.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn question_answer_pairs(question: &PendingQuestion) -> Vec<(String, String)> {
+        question
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let answer = question.selected[index]
+                    .iter()
+                    .filter_map(|option| item.options.get(*option))
+                    .map(|option| option.label.clone())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                (item.question.clone(), answer)
+            })
+            .collect()
+    }
+
+    /// Collect answers to one question request. Cards are updated after every
+    /// click; a multi-select card submits explicitly, a single-select card
+    /// submits as soon as every question has an answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_question(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        operator: &str,
+        run_id: u64,
+        process: &mut AgentProcess,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<InteractionDecision>,
+        interrupt: &Arc<RunInterrupt>,
+        question: &mut PendingQuestion,
+    ) -> QuestionOutcome {
+        if question
+            .questions
+            .iter()
+            .any(|item| item.options.is_empty())
+        {
+            let _ = reply::send_text(
+                &*self.transport,
+                scope,
+                chat_id,
+                Some(source_message_id),
+                "该问题需要自由文本回答，当前卡片暂不支持；已跳过本次提问。",
+            )
+            .await;
+            if let Err(err) = process
+                .respond_to_question(&question.request_id, &question.raw_input, &[])
+                .await
+            {
+                tracing::warn!(error = %err, "cannot skip the text-only question");
+                return QuestionOutcome::Interrupted;
+            }
+            return QuestionOutcome::Answered;
+        }
+        let Some(message_id) = self
+            .send_question_card(
+                scope,
+                chat_id,
+                source_message_id,
+                operator,
+                run_id,
+                question,
+                false,
+            )
+            .await
+        else {
+            let _ = reply::send_text(
+                &*self.transport,
+                scope,
+                chat_id,
+                Some(source_message_id),
+                "无法创建问题卡片，已跳过本次提问。",
+            )
+            .await;
+            let _ = process
+                .respond_to_question(&question.request_id, &question.raw_input, &[])
+                .await;
+            return QuestionOutcome::Answered;
+        };
+        question.card_message_id = Some(message_id.clone());
+        let deadline = tokio::time::Instant::now() + self.approval_timeout;
+        loop {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => return QuestionOutcome::Interrupted,
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = process
+                        .respond_to_question(&question.request_id, &question.raw_input, &[])
+                        .await;
+                    let card = question_decided_card("⌛ 超时未回答", &Self::question_answer_pairs(question));
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::TimedOut;
+                }
+                decision = rx.recv() => {
+                    let Some(decision) = decision else {
+                        return QuestionOutcome::Interrupted;
+                    };
+                    let InteractionDecision::Answer {
+                        request_id,
+                        question_index,
+                        option_index,
+                        submit,
+                        by,
+                    } = decision else {
+                        continue;
+                    };
+                    if request_id != question.request_id {
+                        continue;
+                    }
+                    if submit {
+                        let complete = question
+                            .questions
+                            .iter()
+                            .enumerate()
+                            .all(|(index, item)| !item.options.is_empty() && !question.selected[index].is_empty());
+                        if !complete {
+                            continue;
+                        }
+                    } else {
+                        let Some(item) = question.questions.get(question_index) else {
+                            continue;
+                        };
+                        if option_index >= item.options.len() {
+                            continue;
+                        }
+                        if item.multi_select {
+                            if let Some(position) = question.selected[question_index]
+                                .iter()
+                                .position(|selected| *selected == option_index)
+                            {
+                                question.selected[question_index].remove(position);
+                            } else {
+                                question.selected[question_index].push(option_index);
+                            }
+                        } else {
+                            question.selected[question_index] = vec![option_index];
+                            question.locked[question_index] = true;
+                        }
+                    }
+                    let all_locked = question.locked.iter().all(|locked| *locked);
+                    let multi_complete = question.questions.iter().any(|item| item.multi_select)
+                        && question.questions.iter().enumerate().all(|(index, item)| {
+                            !item.options.is_empty() && !question.selected[index].is_empty()
+                        });
+                    if all_locked || (submit && multi_complete) {
+                        let answers = Self::question_answers(question);
+                        if let Err(err) = process
+                            .respond_to_question(
+                                &question.request_id,
+                                &question.raw_input,
+                                &answers,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %err, "cannot deliver the question answer");
+                            return QuestionOutcome::Interrupted;
+                        }
+                        tracing::info!(
+                            scope,
+                            request_id = %question.request_id,
+                            by,
+                            "question answered"
+                        );
+                        let card = question_decided_card(
+                            "✅ 已回答",
+                            &Self::question_answer_pairs(question),
+                        );
+                        if let Ok(card) = lark_channel::Card::from_value(card) {
+                            let _ = self.transport.update_card_message(&message_id, &card).await;
+                        }
+                        return QuestionOutcome::Answered;
+                    }
+                    let _ = self
+                        .send_question_card(
+                            scope,
+                            chat_id,
+                            source_message_id,
+                            operator,
+                            run_id,
+                            question,
+                            true,
+                        )
+                        .await;
                 }
             }
         }
@@ -4286,6 +4811,45 @@ fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
 /// Action string signed into an approval button token.
 fn approval_action(decision: &str, request_id: &str, operator: &str, run_id: u64) -> String {
     format!("approval:{decision}:{request_id}:{operator}:{run_id}")
+}
+
+/// Action string signed into a question option/submit button.
+fn answer_action(
+    request_id: &str,
+    question_index: usize,
+    option_index: usize,
+    submit: bool,
+    operator: &str,
+    run_id: u64,
+) -> String {
+    format!(
+        "answer:{request_id}:{question_index}:{option_index}:{}:{operator}:{run_id}",
+        if submit { "submit" } else { "option" }
+    )
+}
+
+/// Pretty-print the full tool input within Feishu's card budget.
+///
+/// The card itself has a ~30KB serialized limit; 16KB of raw JSON leaves room
+/// for escaping, buttons and notes. Inputs that fit are shown in full; larger
+/// ones are cut on a char boundary with an explicit notice.
+fn approval_input_json(input: &Value) -> (String, bool) {
+    const MAX_BYTES: usize = 20_000;
+    let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+    if pretty.len() <= MAX_BYTES {
+        return (pretty, false);
+    }
+    let mut out = String::with_capacity(MAX_BYTES);
+    let mut used = 0;
+    for ch in pretty.chars() {
+        if used + ch.len_utf8() > MAX_BYTES {
+            break;
+        }
+        out.push(ch);
+        used += ch.len_utf8();
+    }
+    out.push_str("\n…（完整参数超过飞书卡片上限，已截断）");
+    (out, true)
 }
 
 /// One-line preview of the tool input for the approval card.
@@ -5288,7 +5852,7 @@ mod tests {
                     id: 42,
                     abort: task.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -5333,7 +5897,7 @@ mod tests {
                     id: 7,
                     abort: task.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -5380,7 +5944,7 @@ mod tests {
                     id: 9,
                     abort: hung.abort_handle(),
                     interrupt: Some(Arc::clone(&interrupt)),
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -6606,7 +7170,7 @@ mod tests {
                     abort: handle_a.abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
             active.insert(
@@ -6616,7 +7180,7 @@ mod tests {
                     abort: handle_b.abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -6679,7 +7243,7 @@ mod tests {
                     abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
             active.insert(
@@ -6689,7 +7253,7 @@ mod tests {
                     abort: handle_b.abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -7064,7 +7628,7 @@ mod tests {
                 abort: handle.abort_handle(),
 
                 interrupt: None,
-                approvals: None,
+                interactions: None,
             },
         );
 
@@ -7618,7 +8182,7 @@ mod tests {
                     abort: comment_run.abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
             active.insert(
@@ -7628,7 +8192,7 @@ mod tests {
                     abort: chat_run.abort_handle(),
 
                     interrupt: None,
-                    approvals: None,
+                    interactions: None,
                 },
             );
         }
@@ -8041,5 +8605,18 @@ mod tests {
             0,
             "a sender removed from the allowlist is not replayed"
         );
+    }
+    #[test]
+    fn approval_input_json_keeps_small_inputs_whole_and_marks_truncation() {
+        let (small, truncated) = approval_input_json(&json!({ "command": "pwd" }));
+        assert!(!truncated);
+        assert!(small.contains("\"command\""));
+        assert!(small.contains("pwd"));
+
+        let big = json!({ "content": "x".repeat(20_000) });
+        let (large, truncated) = approval_input_json(&big);
+        assert!(truncated);
+        assert!(large.contains("完整参数超过飞书卡片上限"));
+        assert!(large.len() <= 20_000 + 80);
     }
 }

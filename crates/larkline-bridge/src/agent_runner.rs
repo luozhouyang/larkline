@@ -14,10 +14,11 @@ use anyhow::{Context as _, anyhow};
 use larkline_agent::{
     AgentEvent, BridgePromptContext, ClaudeArgsInput, ClaudeStreamTranslator,
     CodexAppServerTranslator, CodexArgsInput, CodexFinishReason, CodexJsonlTranslator,
-    CodexThreadConfig, PermissionResponse, approval_response, build_bridge_system_prompt,
-    build_claude_args, build_codex_args, error_response, initialize_request, permissions_response,
-    prefix_bridge_system_prompt, request_id_string, thread_resume_request, thread_start_request,
-    turn_start_request, user_message_json,
+    CodexThreadConfig, PermissionResponse, QuestionAnswer, approval_response,
+    approval_response_for_session, build_bridge_system_prompt, build_claude_args, build_codex_args,
+    error_response, initialize_request, permissions_response, permissions_response_for_session,
+    prefix_bridge_system_prompt, request_id_string, success_response, thread_resume_request,
+    thread_start_request, turn_start_request, user_message_json,
 };
 use larkline_core::AgentKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -201,25 +202,60 @@ impl CodexAppServer {
         let Some(pending) = self.pending.remove(request_id) else {
             anyhow::bail!("no pending codex approval request with id {request_id}");
         };
-        let allow = matches!(response, PermissionResponse::Allow { .. });
+        let allow = !matches!(response, PermissionResponse::Deny { .. });
+        let session = matches!(response, PermissionResponse::AllowForSession { .. });
         let frame = match pending.method.as_str() {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                approval_response(&pending.id, allow)
+                if session {
+                    approval_response_for_session(&pending.id, allow)
+                } else {
+                    approval_response(&pending.id, allow)
+                }
             }
-            "item/permissions/requestApproval" => permissions_response(
-                &pending.id,
-                allow,
-                pending
+            "item/permissions/requestApproval" => {
+                let requested = pending
                     .params
                     .get("permissions")
-                    .unwrap_or(&serde_json::Value::Null),
-            ),
+                    .unwrap_or(&serde_json::Value::Null);
+                if session {
+                    permissions_response_for_session(&pending.id, allow, requested)
+                } else {
+                    permissions_response(&pending.id, allow, requested)
+                }
+            }
             other => error_response(
                 &pending.id,
                 -32601,
                 &format!("unsupported codex approval request: {other}"),
             ),
         };
+        self.send(&frame).await
+    }
+
+    async fn respond_to_question(
+        &mut self,
+        request_id: &str,
+        answers: &[QuestionAnswer],
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.pending.remove(request_id) else {
+            anyhow::bail!("no pending codex question request with id {request_id}");
+        };
+        if pending.method != "item/tool/requestUserInput" {
+            anyhow::bail!(
+                "codex request {request_id} is not a user-input request: {}",
+                pending.method
+            );
+        }
+        let answers: serde_json::Map<String, serde_json::Value> = answers
+            .iter()
+            .map(|answer| {
+                (
+                    answer.question_id.clone(),
+                    serde_json::json!({ "answers": answer.answers }),
+                )
+            })
+            .collect();
+        let frame = success_response(&pending.id, serde_json::json!({ "answers": answers }));
         self.send(&frame).await
     }
 
@@ -594,6 +630,19 @@ impl AgentProcess {
                     PermissionResponse::Allow { updated_input } => {
                         serde_json::json!({ "behavior": "allow", "updatedInput": updated_input })
                     }
+                    PermissionResponse::AllowForSession {
+                        updated_input,
+                        updated_permissions,
+                    } => {
+                        let mut value = serde_json::json!({
+                            "behavior": "allow",
+                            "updatedInput": updated_input,
+                        });
+                        if !updated_permissions.is_empty() {
+                            value["updatedPermissions"] = serde_json::json!(updated_permissions);
+                        }
+                        value
+                    }
                     PermissionResponse::Deny { message } => {
                         serde_json::json!({ "behavior": "deny", "message": message })
                     }
@@ -617,6 +666,53 @@ impl AgentProcess {
             }
             Transport::CodexAppServer(server) => {
                 server.respond_to_permission(request_id, response).await
+            }
+        }
+    }
+
+    /// Answer a user-question request (Claude `AskUserQuestion`, Codex
+    /// `request_user_input`).
+    pub async fn respond_to_question(
+        &mut self,
+        request_id: &str,
+        raw_input: &serde_json::Value,
+        answers: &[QuestionAnswer],
+    ) -> anyhow::Result<()> {
+        match &mut self.transport {
+            Transport::Line { stdin, .. } => {
+                let Some(stdin) = stdin.as_mut() else {
+                    anyhow::bail!("agent stdin is closed; cannot answer the question");
+                };
+                let mut updated = raw_input.clone();
+                let map: serde_json::Map<String, serde_json::Value> = answers
+                    .iter()
+                    .map(|answer| {
+                        (
+                            answer.question_id.clone(),
+                            serde_json::Value::String(answer.answers.join(", ")),
+                        )
+                    })
+                    .collect();
+                updated["answers"] = serde_json::Value::Object(map);
+                let frame = serde_json::json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": { "behavior": "allow", "updatedInput": updated }
+                    }
+                });
+                let mut line = frame.to_string();
+                line.push('\n');
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .context("failed to write a question answer to agent stdin")?;
+                stdin.flush().await.ok();
+                Ok(())
+            }
+            Transport::CodexAppServer(server) => {
+                server.respond_to_question(request_id, answers).await
             }
         }
     }

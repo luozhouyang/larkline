@@ -168,11 +168,27 @@ impl ClaudeStreamTranslator {
         let Some(tool_name) = string_field(request, "tool_name") else {
             return;
         };
+        let input = request.get("input").cloned().unwrap_or(Value::Null);
+        let requires_user_interaction = request
+            .get("requires_user_interaction")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if requires_user_interaction && tool_name == "AskUserQuestion" {
+            if let Some(questions) = parse_user_questions(&input) {
+                out.push(AgentEvent::QuestionRequest {
+                    request_id,
+                    tool_name,
+                    questions,
+                    raw_input: input,
+                });
+                return;
+            }
+        }
         out.push(AgentEvent::PermissionRequest {
             request_id,
             tool_name,
             display_name: string_field(request, "display_name"),
-            input: request.get("input").cloned().unwrap_or(Value::Null),
+            input,
             description: string_field(request, "description"),
             suggestions: request
                 .get("permission_suggestions")
@@ -299,6 +315,48 @@ impl ClaudeStreamTranslator {
     }
 }
 
+/// Parse Claude's `AskUserQuestion` input into the bridge's question model.
+///
+/// The CLI has no separate ids for Claude questions; the question text is the
+/// key the tool itself expects in the `answers` map.
+fn parse_user_questions(input: &Value) -> Option<Vec<crate::types::UserQuestion>> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut parsed = Vec::with_capacity(questions.len());
+    for question in questions {
+        let object = question.as_object()?;
+        let text = string_field(object, "question")?;
+        let options = object
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        let option = option.as_object()?;
+                        Some(crate::types::UserQuestionOption {
+                            label: string_field(option, "label")?,
+                            description: string_field(option, "description").unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        parsed.push(crate::types::UserQuestion {
+            id: text.clone(),
+            header: string_field(object, "header").unwrap_or_default(),
+            question: text,
+            options,
+            multi_select: object
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            is_other: false,
+            is_secret: false,
+        });
+    }
+    (!parsed.is_empty()).then_some(parsed)
+}
+
 pub(crate) fn string_field(obj: &Map<String, Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -415,6 +473,50 @@ mod tests {
                 request_id: "req-1".into()
             }]
         );
+    }
+
+    #[test]
+    fn ask_user_question_becomes_a_question_request() {
+        let mut translator = ClaudeStreamTranslator::new();
+        let events = translator.translate(&json!({
+            "type": "control_request",
+            "request_id": "req-q1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {
+                    "questions": [{
+                        "question": "Which option?",
+                        "header": "Choice",
+                        "multiSelect": false,
+                        "options": [
+                            { "label": "A", "description": "first" },
+                            { "label": "B", "description": "second" }
+                        ]
+                    }]
+                },
+                "tool_use_id": "call-q1",
+                "requires_user_interaction": true
+            }
+        }));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::QuestionRequest {
+                request_id,
+                questions,
+                raw_input,
+                ..
+            } => {
+                assert_eq!(request_id, "req-q1");
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0].id, "Which option?");
+                assert_eq!(questions[0].header, "Choice");
+                assert_eq!(questions[0].options[1].label, "B");
+                assert!(!questions[0].multi_select);
+                assert_eq!(raw_input["questions"][0]["header"], "Choice");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

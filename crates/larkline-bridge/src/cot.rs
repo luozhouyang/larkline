@@ -238,9 +238,9 @@ impl CotStream {
             } => self.observe_tool_result(id, output, *is_error),
             AgentEvent::Text { delta } => self.observe_text(delta),
             AgentEvent::FinalText { .. } => Vec::new(),
-            AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionCancelled { .. } => {
-                Vec::new()
-            }
+            AgentEvent::PermissionRequest { .. }
+            | AgentEvent::QuestionRequest { .. }
+            | AgentEvent::PermissionCancelled { .. } => Vec::new(),
             AgentEvent::Done { .. } | AgentEvent::Error { .. } => Vec::new(),
         }
     }

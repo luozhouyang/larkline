@@ -49,7 +49,7 @@
 
 use std::time::Duration;
 
-use larkline_agent::{AgentEvent, TerminationReason};
+use larkline_agent::{AgentEvent, TerminationReason, UserQuestion};
 use serde_json::{Value, json};
 
 use crate::text_render::mask_emails;
@@ -437,7 +437,9 @@ impl RunView {
             }
             // Approval prompts are rendered as a separate card and tracked by
             // the run loop; they do not change the agent output view.
-            AgentEvent::PermissionRequest { .. } | AgentEvent::PermissionCancelled { .. } => {}
+            AgentEvent::PermissionRequest { .. }
+            | AgentEvent::QuestionRequest { .. }
+            | AgentEvent::PermissionCancelled { .. } => {}
         }
     }
 
@@ -1269,6 +1271,8 @@ pub struct ApprovalCardInput<'a> {
     pub input_preview: &'a str,
     /// Pretty-printed tool input, already bounded by the caller.
     pub input_json: &'a str,
+    /// True when the caller had to cut the input for Feishu's card limit.
+    pub input_truncated: bool,
     /// Signed action string for the allow button (also what the token binds).
     pub allow_action: &'a str,
     /// Signed callback token for the allow button.
@@ -1277,6 +1281,11 @@ pub struct ApprovalCardInput<'a> {
     pub deny_action: &'a str,
     /// Signed callback token for the deny button.
     pub deny_token: &'a str,
+    /// Optional "allow for this session" button. Only offered when the
+    /// provider gave a usable session suggestion (Claude) or supports
+    /// `acceptForSession` (Codex).
+    pub session_action: Option<&'a str>,
+    pub session_token: Option<&'a str>,
     pub timeout_minutes: u64,
 }
 
@@ -1347,6 +1356,23 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
             "token": input.allow_token,
         } }]
     }));
+    if let (Some(action), Some(token)) = (input.session_action, input.session_token) {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "✅ 本次会话都允许" },
+            "type": "default",
+            "behaviors": [{ "type": "callback", "value": {
+                "__bridge_cb": true,
+                "action": action,
+                "scope": input.scope,
+                "operator": input.operator,
+                "run_id": input.run_id,
+                "request_id": input.request_id,
+                "decision": "allow_session",
+                "token": token,
+            } }]
+        }));
+    }
     elements.push(json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
@@ -1362,12 +1388,16 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
             "token": input.deny_token,
         } }]
     }));
+    let mut note = format!(
+        "仅发起本次任务的用户可以操作；{} 分钟内未处理将自动拒绝。",
+        input.timeout_minutes
+    );
+    if input.input_truncated {
+        note.push_str("\n参数超过飞书卡片上限，已截断显示。");
+    }
     elements.push(json!({
         "tag": "markdown",
-        "content": format!(
-            "仅发起本次任务的用户可以操作；{} 分钟内未处理将自动拒绝。",
-            input.timeout_minutes
-        ),
+        "content": note,
         "text_size": "notation"
     }));
     json!({
@@ -1379,6 +1409,212 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
         },
         "body": { "elements": elements }
     })
+}
+
+/// One option button on a user-question card.
+#[derive(Debug, Clone)]
+pub struct QuestionOptionButton {
+    pub label: String,
+    pub description: String,
+    /// Signed action string; the bridge rebuilds and verifies it on click.
+    pub action: String,
+    pub token: String,
+}
+
+/// One question rendered on a user-question card.
+#[derive(Debug, Clone)]
+pub struct QuestionCardQuestion {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOptionButton>,
+    /// Indices of options currently selected.
+    pub selected: Vec<usize>,
+    pub multi_select: bool,
+    /// True once a single-select question has been answered (hide its buttons).
+    pub locked: bool,
+}
+
+/// A card that collects answers to one or more `AskUserQuestion` /
+/// `request_user_input` questions.
+pub struct QuestionCardInput<'a> {
+    pub scope: &'a str,
+    pub operator: &'a str,
+    pub run_id: u64,
+    pub request_id: &'a str,
+    pub questions: &'a [QuestionCardQuestion],
+    /// Submit button for multi-select questions, when every question has at
+    /// least one selection. The action/token are signed by the caller.
+    pub submit_action: Option<(&'a str, &'a str)>,
+    pub timeout_minutes: u64,
+}
+
+pub fn question_card(input: &QuestionCardInput<'_>) -> Value {
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": "🙋 **需要你的选择**",
+    })];
+    for (question_index, question) in input.questions.iter().enumerate() {
+        if !question.header.trim().is_empty() {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("**{}**", question.header),
+                "text_size": "notation",
+            }));
+        }
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("{}. {}", question_index + 1, question.question),
+        }));
+        if question.locked {
+            let labels = question
+                .selected
+                .iter()
+                .filter_map(|index| question.options.get(*index))
+                .map(|option| option.label.clone())
+                .collect::<Vec<_>>()
+                .join("、");
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("✅ 已选择：{labels}"),
+                "text_size": "notation",
+            }));
+            continue;
+        }
+        for (option_index, option) in question.options.iter().enumerate() {
+            let selected = question.selected.contains(&option_index);
+            let prefix = if selected {
+                "✅"
+            } else if question.multi_select {
+                "◻️"
+            } else {
+                ""
+            };
+            elements.push(json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": format!("{prefix} {}", option.label) },
+                "type": if selected { "primary" } else { "default" },
+                "behaviors": [{ "type": "callback", "value": {
+                    "__bridge_cb": true,
+                    "action": option.action,
+                    "scope": input.scope,
+                    "operator": input.operator,
+                    "run_id": input.run_id,
+                    "request_id": input.request_id,
+                    "question_index": question_index,
+                    "option_index": option_index,
+                    "submit": false,
+                    "token": option.token,
+                } }]
+            }));
+            if !option.description.trim().is_empty() {
+                elements.push(json!({
+                    "tag": "markdown",
+                    "content": mask_emails(&option.description),
+                    "text_size": "notation",
+                }));
+            }
+        }
+    }
+    if let Some((action, token)) = input.submit_action {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "提交选择" },
+            "type": "primary",
+            "behaviors": [{ "type": "callback", "value": {
+                "__bridge_cb": true,
+                "action": action,
+                "scope": input.scope,
+                "operator": input.operator,
+                "run_id": input.run_id,
+                "request_id": input.request_id,
+                "question_index": 0,
+                "option_index": 0,
+                "submit": true,
+                "token": token,
+            } }]
+        }));
+    }
+    elements.push(json!({
+        "tag": "markdown",
+        "content": format!(
+            "仅发起本次任务的用户可以操作；{} 分钟内未回答将自动拒绝。",
+            input.timeout_minutes
+        ),
+        "text_size": "notation"
+    }));
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": "等待你的选择" }
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// The question card after an answer/timeout: status plus a compact Q/A log.
+pub fn question_decided_card(status: &str, answers: &[(String, String)]) -> Value {
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!("🙋 **{status}**"),
+    })];
+    for (question, answer) in answers {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("**{}**\\n{}", mask_emails(question), mask_emails(answer)),
+            "text_size": "notation",
+        }));
+    }
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": status }
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// Convert parsed user questions into the renderer's per-question shape.
+///
+/// The caller supplies the signed action/token for every option. Questions
+/// without options are skipped by the card (the caller should fall back to a
+/// text notice).
+pub fn question_card_questions(
+    questions: &[UserQuestion],
+    actions: &[Vec<(String, String)>],
+) -> Vec<QuestionCardQuestion> {
+    questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| QuestionCardQuestion {
+            header: question.header.clone(),
+            question: question.question.clone(),
+            options: question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(option_index, option)| {
+                    let (action, token) = actions
+                        .get(index)
+                        .and_then(|row| row.get(option_index))
+                        .cloned()
+                        .unwrap_or_default();
+                    QuestionOptionButton {
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                        action,
+                        token,
+                    }
+                })
+                .collect(),
+            selected: Vec::new(),
+            multi_select: question.multi_select,
+            locked: false,
+        })
+        .collect()
 }
 
 /// The approval card after a decision: status line, no buttons.
@@ -2522,10 +2758,13 @@ mod tests {
             description: Some("run a command"),
             input_preview: "echo me@example.com",
             input_json: r#"{"command":"echo me@example.com"}"#,
+            input_truncated: false,
             allow_action: "approval:allow:req-1:ou_operator:7",
             allow_token: "allow-token",
             deny_action: "approval:deny:req-1:ou_operator:7",
             deny_token: "deny-token",
+            session_action: Some("approval:allow_session:req-1:ou_operator:7"),
+            session_token: Some("session-token"),
             timeout_minutes: 10,
         });
         let text = serde_json::to_string(&card).unwrap();
@@ -2535,13 +2774,18 @@ mod tests {
             .iter()
             .filter(|element| element["tag"] == "button")
             .collect();
-        assert_eq!(buttons.len(), 2, "{text}");
+        assert_eq!(buttons.len(), 3, "{text}");
         assert_eq!(
             buttons[0]["behaviors"][0]["value"]["action"], "approval:allow:req-1:ou_operator:7",
             "{text}"
         );
         assert_eq!(
-            buttons[1]["behaviors"][0]["value"]["action"], "approval:deny:req-1:ou_operator:7",
+            buttons[1]["behaviors"][0]["value"]["action"],
+            "approval:allow_session:req-1:ou_operator:7",
+            "{text}"
+        );
+        assert_eq!(
+            buttons[2]["behaviors"][0]["value"]["action"], "approval:deny:req-1:ou_operator:7",
             "{text}"
         );
         assert!(text.contains("allow-token"), "{text}");
@@ -2558,7 +2802,7 @@ mod tests {
                 .iter()
                 .filter(|element| element["tag"] == "button")
                 .count(),
-            2
+            3
         );
 
         let decided = approval_decided_card("Bash", "✅ 已允许");

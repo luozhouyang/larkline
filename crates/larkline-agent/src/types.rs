@@ -57,8 +57,46 @@ pub enum TerminationReason {
 pub enum PermissionResponse {
     /// Run the tool with this input (normally the original input echoed back).
     Allow { updated_input: Value },
+    /// Allow and remember the decision for the rest of the agent session.
+    ///
+    /// Claude receives `updatedPermissions` (from the CLI's
+    /// `permission_suggestions`); Codex receives `acceptForSession` or a
+    /// session-scoped permission grant.
+    AllowForSession {
+        updated_input: Value,
+        updated_permissions: Vec<Value>,
+    },
     /// Do not run the tool; the message is shown to the model.
     Deny { message: String },
+}
+
+/// One selectable option in a user question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One user-decision question (Claude `AskUserQuestion`, Codex
+/// `request_user_input`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestion {
+    /// Stable key for the answer map. Claude uses the question text; Codex
+    /// sends an explicit id.
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    pub multi_select: bool,
+    pub is_other: bool,
+    pub is_secret: bool,
+}
+
+/// One answered question, ready to send back to the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    pub answers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +141,18 @@ pub enum AgentEvent {
         suggestions: Vec<Value>,
         tool_use_id: Option<String>,
     },
-    /// A pending permission request was withdrawn by the agent.
+    /// The agent asks the user to choose between options (Claude
+    /// `AskUserQuestion`, Codex `request_user_input`). Unlike a permission
+    /// prompt, the card must collect an answer, not just allow/deny.
+    QuestionRequest {
+        request_id: String,
+        tool_name: String,
+        questions: Vec<UserQuestion>,
+        /// Original provider input, retained so Claude's `updatedInput` can
+        /// echo the questions alongside the `answers` map.
+        raw_input: Value,
+    },
+    /// A pending permission/question request was withdrawn by the agent.
     PermissionCancelled { request_id: String },
     /// The final answer, when the protocol distinguishes it from commentary.
     FinalText { content: String },

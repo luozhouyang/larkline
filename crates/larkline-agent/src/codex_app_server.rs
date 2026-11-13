@@ -122,13 +122,35 @@ pub fn approval_response(id: &Value, allow: bool) -> Value {
     )
 }
 
+/// Session-scoped approval response for command/file requests.
+pub fn approval_response_for_session(id: &Value, allow: bool) -> Value {
+    success_response(
+        id,
+        json!({ "decision": if allow { "acceptForSession" } else { "decline" } }),
+    )
+}
+
 /// Response to `item/permissions/requestApproval`.
 ///
 /// An allowed request grants exactly the profile Codex asked for; a denied one
 /// grants an empty profile, which leaves the sandbox unchanged.
 pub fn permissions_response(id: &Value, allow: bool, requested: &Value) -> Value {
+    permissions_response_with_scope(id, allow, requested, "turn")
+}
+
+/// Session-scoped permission grant for `item/permissions/requestApproval`.
+pub fn permissions_response_for_session(id: &Value, allow: bool, requested: &Value) -> Value {
+    permissions_response_with_scope(id, allow, requested, "session")
+}
+
+fn permissions_response_with_scope(
+    id: &Value,
+    allow: bool,
+    requested: &Value,
+    scope: &str,
+) -> Value {
     let permissions = if allow { requested.clone() } else { json!({}) };
-    success_response(id, json!({ "permissions": permissions, "scope": "turn" }))
+    success_response(id, json!({ "permissions": permissions, "scope": scope }))
 }
 
 /// Translate one server notification into agent events.
@@ -491,6 +513,70 @@ impl CodexAppServerTranslator {
                         .map(str::to_string),
                 })
             }
+            "item/tool/requestUserInput" => {
+                let questions: Vec<crate::types::UserQuestion> = params
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .map(|questions| {
+                        questions
+                            .iter()
+                            .filter_map(|question| {
+                                let question = question.as_object()?;
+                                let id = question.get("id").and_then(Value::as_str)?;
+                                let text = question.get("question").and_then(Value::as_str)?;
+                                let options = question
+                                    .get("options")
+                                    .and_then(Value::as_array)
+                                    .map(|options| {
+                                        options
+                                            .iter()
+                                            .filter_map(|option| {
+                                                let option = option.as_object()?;
+                                                Some(crate::types::UserQuestionOption {
+                                                    label: option
+                                                        .get("label")
+                                                        .and_then(Value::as_str)?
+                                                        .to_string(),
+                                                    description: option
+                                                        .get("description")
+                                                        .and_then(Value::as_str)
+                                                        .unwrap_or_default()
+                                                        .to_string(),
+                                                })
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                Some(crate::types::UserQuestion {
+                                    id: id.to_string(),
+                                    header: question
+                                        .get("header")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    question: text.to_string(),
+                                    options,
+                                    multi_select: false,
+                                    is_other: question
+                                        .get("isOther")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                    is_secret: question
+                                        .get("isSecret")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (!questions.is_empty()).then(|| AgentEvent::QuestionRequest {
+                    request_id,
+                    tool_name: "request_user_input".to_string(),
+                    questions,
+                    raw_input: params.clone(),
+                })
+            }
             "item/permissions/requestApproval" => Some(AgentEvent::PermissionRequest {
                 request_id,
                 tool_name: "permissions".to_string(),
@@ -619,6 +705,14 @@ mod tests {
         assert_eq!(response["result"]["decision"], "accept");
         let denied = approval_response(&json!(77), false);
         assert_eq!(denied["result"]["decision"], "decline");
+        let session = approval_response_for_session(&json!(77), true);
+        assert_eq!(session["result"]["decision"], "acceptForSession");
+        let session_permissions = permissions_response_for_session(
+            &json!(78),
+            true,
+            &json!({ "network": { "enabled": true } }),
+        );
+        assert_eq!(session_permissions["result"]["scope"], "session");
     }
 
     #[test]
@@ -659,6 +753,46 @@ mod tests {
         let denied =
             permissions_response(&json!(9), false, &json!({ "network": { "enabled": true } }));
         assert_eq!(denied["result"]["permissions"], json!({}));
+    }
+
+    #[test]
+    fn request_user_input_becomes_a_question_request() {
+        let mut translator = CodexAppServerTranslator::new();
+        let event = translator
+            .translate_server_request(
+                &json!(12),
+                "item/tool/requestUserInput",
+                &json!({
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_1",
+                    "questions": [{
+                        "id": "q1",
+                        "header": "Choice",
+                        "question": "Pick one",
+                        "isOther": true,
+                        "isSecret": false,
+                        "options": [
+                            { "label": "A", "description": "first" },
+                            { "label": "B", "description": "second" }
+                        ]
+                    }]
+                }),
+            )
+            .expect("question");
+        match event {
+            AgentEvent::QuestionRequest {
+                request_id,
+                questions,
+                ..
+            } => {
+                assert_eq!(request_id, "12");
+                assert_eq!(questions[0].id, "q1");
+                assert_eq!(questions[0].options[1].description, "second");
+                assert!(questions[0].is_other);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
