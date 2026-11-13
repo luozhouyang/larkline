@@ -2,9 +2,7 @@
 
 larkline is a single, self-contained static binary that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. **No Node.js. No npm. One binary, at install time and at runtime.** Start the bridge, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
-larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge), renamed from `lark-channel-bridge`. The Rust implementation keeps the same `~/.larkline` state directory, config schema and encrypted keystore as the TypeScript bridge, so an existing install can switch over without re-onboarding. See [Rust port notes](./docs/RUST-PORT.md).
-
-[中文 README](./README.zh.md) · [Rust port notes](./docs/RUST-PORT.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
+[中文 README](./README.zh.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## What it does
 
@@ -177,7 +175,7 @@ Daemon stdout/stderr logs are under `~/.larkline/profiles/<profile>/logs/daemon/
 
 Global options: `--home <path>` (defaults to `$LARKLINE_HOME` or `~/.larkline`), `--profile <name>` (defaults to `$LARKLINE_PROFILE` or the active profile), and `-v`/`-vv` for more logging.
 
-`ps` and `kill` read `~/.larkline/registry/processes.json`. `larkline run` registers its process at startup and removes it on normal exit and on ctrl-c/SIGTERM, so Rust and TypeScript processes share one list. Rust entries carry no `botName` (`lark-channel` 0.6 has no bot-identity accessor); `larkline ps` shows the profile, agent, pid and start time.
+`ps` and `kill` read `~/.larkline/registry/processes.json`. `larkline run` registers its process at startup and removes it on normal exit and on ctrl-c/SIGTERM, so all larkline processes share one list. Entries carry no `botName` (the Feishu channel has no bot-identity accessor); `larkline ps` shows the profile, agent, pid and start time.
 
 ## Commands inside Feishu / Lark
 
@@ -267,7 +265,7 @@ A profile fragment looks like this. Do not replace the whole `config.json` with 
 }
 ```
 
-The Rust binary preserves config fields it does not read yet, so a round-trip never drops settings written by the TypeScript bridge.
+The binary preserves config fields it does not read yet, so a round-trip never drops settings.
 
 ### App Secret and the keystore
 
@@ -287,7 +285,7 @@ The encryption key is derived from the machine's hostname and your user name, pl
 |---|---|
 | `LARKLINE_HOME` | State root. Defaults to `~/.larkline`; `--home` overrides it. |
 | `LARKLINE_PROFILE` | Profile for this process. `--profile` overrides it. |
-| `LARKLINE_CALLBACK_SECRET` | Optional override for the HMAC key used to verify card buttons rendered by the agent. When absent, the profile App Secret is used as key version 1 (same as TypeScript). |
+| `LARKLINE_CALLBACK_SECRET` | Optional override for the HMAC key used to verify card buttons rendered by the agent. When absent, the profile App Secret is used as key version 1. |
 
 The pre-rename fallbacks `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE` and `LARK_CHANNEL_CALLBACK_SECRET` are still read when the new names are absent.
 
@@ -323,14 +321,14 @@ The profile's `permissions` block selects the agent's access and whether tool pr
 
 ### Access control
 
-The Rust bridge implements a subset of the TypeScript access model:
+The bridge implements this access model:
 
 - `access.allowedUsers` restricts who can trigger the bot in DMs, groups and comment threads. When the list is empty, no user allowlist is applied.
 - Group messages require an `@` mention by default. `access.requireMentionInGroup` can turn that off for a profile.
 - `access.admins` gates `/config set`, `/meeting` and `/stop <scope>`; while `admins` is empty, `access.allowedUsers` acts as the admin set. The runtime app owner is also accepted, resolved from the Applications API and cached for 30 minutes.
 - `access.allowedChats` is not applied to ordinary messages yet. It is only consulted when verifying card-button clicks.
 
-`/invite` and `/remove` maintain the user, admin and group lists. The TypeScript owner bypass for ordinary messages, team-mode usage for ordinary messages and per-chat `chatRequireMention` overrides are not applied yet; `allowedChats` is consulted only for card-click verification. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
+`/invite` and `/remove` maintain the user, admin and group lists. The owner bypass for ordinary messages, team-mode usage for ordinary messages and per-chat `chatRequireMention` overrides are not applied yet; `allowedChats` is consulted only for card-click verification. In particular, an empty `allowedUsers` list means anyone who can reach the app can DM it. Set `allowedUsers` explicitly before sharing the bot.
 
 ### Meetings
 
@@ -344,7 +342,7 @@ The in-meeting agent is opt-in. Add the meeting block to the profile and restart
 }
 ```
 
-The app needs the VC bot scopes, and the tenant must support the VC bot capability. Once enabled, `/meeting join <9-digit number>` joins a meeting; in-meeting chat prefixed with the configured trigger can ask questions, and `/meeting notes` summarizes the transcript. See [Rust port notes](./docs/RUST-PORT.md) for the exact limitations.
+The app needs the VC bot scopes, and the tenant must support the VC bot capability. Once enabled, `/meeting join <9-digit number>` joins a meeting; in-meeting chat prefixed with the configured trigger can ask questions, and `/meeting notes` summarizes the transcript.
 
 ## Data directory and compatibility
 
@@ -360,17 +358,17 @@ The app needs the VC bot scopes, and the tenant must support the VC bot capabili
 | `~/.larkline/registry/processes.json` | Process registry read by `ps` / `kill` |
 | `~/.larkline/secrets-getter` | Exec-provider wrapper used by lark-cli |
 
-### Same config, same keystore
+### Config and keystore
 
-- The state layout, config schema v2 and encrypted keystore are shared with the TypeScript bridge.
-- The keystore uses the same AES-256-GCM / PBKDF2-HMAC-SHA256 construction, so the Rust binary can decrypt an App Secret written by the TypeScript bridge (and the other way round).
-- `~/.lark-channel` is renamed to `~/.larkline` automatically on first launch with the default home when `~/.larkline` does not exist. `~/.lark-channel-workspaces` is moved the same way when possible.
-- Either implementation can read the same config. Stop one before starting the other; do not run both against the same app and profile at once.
+- The state layout, config schema v2 and encrypted keystore are stable across larkline releases.
+- The keystore uses AES-256-GCM / PBKDF2-HMAC-SHA256, so an App Secret written by an older release can still be decrypted.
+- A legacy `~/.lark-channel` directory is renamed to `~/.larkline` automatically on first launch with the default home when `~/.larkline` does not exist. `~/.lark-channel-workspaces` is moved the same way when possible.
+- Stop the old process before starting a new binary; do not run two larkline processes against the same app and profile at once.
 
-### Migrating from the TypeScript bridge
+### Upgrading an existing install
 
-1. Stop and unregister the old service with the old CLI: `larkline stop` and `larkline unregister`.
-2. Install the Rust binary with `install.sh` and make sure `command -v larkline` resolves to it.
+1. Stop and unregister the old service: `larkline stop` and `larkline unregister`.
+2. Install the new binary with `install.sh` and make sure `command -v larkline` resolves to it.
 3. Run `larkline doctor`. The same profile, app id, keystore and sessions are found.
 4. Start the service with `larkline start`.
 
@@ -397,14 +395,12 @@ items remain:
   loop only; comment and meeting runs keep the old non-interactive behavior.
   Tool input is not editable, and in a group only the run's first sender can
   approve.
-- **Non-TS extras and remaining parity edges**: access-control edges (the
-  TypeScript owner bypass for ordinary messages, team-mode usage for ordinary
-  messages, per-chat `chatRequireMention` overrides and `allowedChats` on
-  ordinary messages), Windows Authenticode signing, bot-name enrichment for
-  Rust-owned `ps` entries, and the live keepalive watchdog (`lark-channel` 0.6
-  exposes no connection-status or force-reconnect hook).
-
-See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reasons behind each gap.
+- **Remaining parity edges**: access-control edges (the owner bypass for
+  ordinary messages, team-mode usage for ordinary messages, per-chat
+  `chatRequireMention` overrides and `allowedChats` on ordinary messages),
+  Windows Authenticode signing, bot-name enrichment for `ps` entries, and the
+  live keepalive watchdog (the Feishu channel exposes no connection-status or
+  force-reconnect hook).
 
 ## FAQ
 

@@ -2,9 +2,7 @@
 
 larkline 是一个自包含的单个静态二进制文件，用来把飞书 / Lark 消息和本机 Claude Code 或 Codex CLI 打通。**不依赖 Node.js，不需要 npm；安装和运行时都只需要这一个二进制。** 启动 bridge，扫码绑定 PersonalAgent 应用，就可以在飞书里和本机编程助手对话。
 
-larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)，由 `lark-channel-bridge` 更名而来。Rust 实现沿用 TypeScript 版本的 `~/.larkline` 状态目录、配置结构和加密 keystore，老用户不需要重新扫码或重新录入 App Secret。详见 [Rust 移植说明](./docs/RUST-PORT.md)。
-
-[English README](./README.md) · [Rust 移植说明](./docs/RUST-PORT.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
+[English README](./README.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## 主要功能
 
@@ -177,7 +175,7 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 
 全局选项：`--home <path>`（默认 `$LARKLINE_HOME` 或 `~/.larkline`）、`--profile <name>`（默认 `$LARKLINE_PROFILE` 或当前 profile）、`-v` / `-vv` 提高日志级别。
 
-`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。`larkline run` 启动时会注册自己的进程，正常退出和 ctrl-c/SIGTERM 时移除条目，因此 Rust 和 TypeScript 进程共用同一份列表。Rust 条目没有 `botName`（`lark-channel` 0.6 没有读取 bot 身份的接口）；`larkline ps` 显示 profile、agent、pid 和启动时间。
+`ps` 和 `kill` 读取 `~/.larkline/registry/processes.json`。`larkline run` 启动时会注册自己的进程，正常退出和 ctrl-c/SIGTERM 时移除条目，因此所有 larkline 进程共用同一份列表。条目没有 `botName`（飞书 channel 没有读取 bot 身份的接口）；`larkline ps` 显示 profile、agent、pid 和启动时间。
 
 ## 飞书内命令
 
@@ -267,7 +265,7 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 }
 ```
 
-Rust 二进制会保留自己暂时不读取的配置字段，因此与 TypeScript 版本往返读写不会丢设置。
+二进制会保留自己暂时不读取的配置字段，因此往返读写不会丢设置。
 
 ### App Secret 与 keystore
 
@@ -287,7 +285,7 @@ larkline secrets remove app-cli_xxx
 |---|---|
 | `LARKLINE_HOME` | 状态根目录，默认 `~/.larkline`；`--home` 优先。 |
 | `LARKLINE_PROFILE` | 当前进程使用的 profile；`--profile` 优先。 |
-| `LARKLINE_CALLBACK_SECRET` | 校验 agent 渲染的卡片按钮时使用的 HMAC key，可选覆盖。未配置时默认使用 profile 的 App Secret 作为 key version 1（与 TypeScript 一致）。 |
+| `LARKLINE_CALLBACK_SECRET` | 校验 agent 渲染的卡片按钮时使用的 HMAC key，可选覆盖。未配置时默认使用 profile 的 App Secret 作为 key version 1。 |
 
 改名前的回退变量 `LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`LARK_CHANNEL_CALLBACK_SECRET` 在新变量不存在时仍然生效。
 
@@ -323,14 +321,14 @@ profile 的 `permissions` 块决定 agent 的访问级别，以及工具调用�
 
 ### 访问控制
 
-Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
+bridge 目前实现了以下访问模型：
 
 - `access.allowedUsers` 限制谁能在私聊、群聊和评论线程中触发 bot。名单为空时，不启用用户白名单。
 - 群消息默认要求 `@` mention；`access.requireMentionInGroup` 可以按 profile 关闭这个要求。
 - `access.admins` 控制 `/config set`、`/meeting` 和 `/stop <scope>`；`admins` 为空时，`access.allowedUsers` 作为管理员集合。运行时应用 owner 也可以通过；owner 从 Applications API 解析并缓存 30 分钟。
 - `access.allowedChats` 暂不作用于普通消息，只在校验卡片按钮点击时使用。
 
-`/invite` 和 `/remove` 已用于维护用户、管理员和群名单。普通消息上的 TypeScript owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖尚未生效；`allowedChats` 只用于卡片按钮校验。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
+`/invite` 和 `/remove` 已用于维护用户、管理员和群名单。普通消息上的 owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖尚未生效；`allowedChats` 只用于卡片按钮校验。特别是：`allowedUsers` 为空时，任何能触达应用的人都可以私聊 bot。对外分享 bot 前请显式配置 `allowedUsers`。
 
 ### 会议
 
@@ -344,7 +342,7 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 }
 ```
 
-应用需要具备 VC bot 相关 scope，租户需要支持 VC bot 能力。启用后可以用 `/meeting join <9 位会议号>` 入会；会中聊天带配置的 trigger 前缀即可提问，`/meeting notes` 可以总结字幕。具体限制见 [Rust 移植说明](./docs/RUST-PORT.md)。
+应用需要具备 VC bot 相关 scope，租户需要支持 VC bot 能力。启用后可以用 `/meeting join <9 位会议号>` 入会；会中聊天带配置的 trigger 前缀即可提问，`/meeting notes` 可以总结字幕。
 
 ## 数据目录与兼容性
 
@@ -360,17 +358,17 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 | `~/.larkline/registry/processes.json` | `ps` / `kill` 读取的进程注册表 |
 | `~/.larkline/secrets-getter` | 供 lark-cli 使用的 exec-provider wrapper |
 
-### 同一份配置，同一个 keystore
+### 配置与 keystore
 
-- 状态布局、配置 schema v2 和加密 keystore 与 TypeScript 版本共用。
-- keystore 使用相同的 AES-256-GCM / PBKDF2-HMAC-SHA256 构造，因此 Rust 二进制可以解密 TypeScript 版本写入的 App Secret，反过来也一样。
-- 使用默认 home 首次启动时，如果 `~/.larkline` 不存在，会自动把 `~/.lark-channel` rename 为 `~/.larkline`；`~/.lark-channel-workspaces` 也会尽量一并迁移。
-- 两个实现可以读取同一份配置。切换前先停掉其中一个；不要同时用两个实现连接同一个应用和 profile。
+- 状态布局、配置 schema v2 和加密 keystore 在不同 larkline 版本之间保持稳定。
+- keystore 使用 AES-256-GCM / PBKDF2-HMAC-SHA256，旧版本写入的 App Secret 仍可解密。
+- 使用默认 home 首次启动时，如果 `~/.larkline` 不存在，会自动把旧的 `~/.lark-channel` 目录 rename 为 `~/.larkline`；`~/.lark-channel-workspaces` 也会尽量一并迁移。
+- 切换前先停掉旧进程；不要让两个 larkline 进程同时连接同一个应用和 profile。
 
-### 从 TypeScript 版本迁移
+### 升级已有安装
 
-1. 用旧 CLI 停止并注销旧服务：`larkline stop`、`larkline unregister`。
-2. 用 `install.sh` 安装 Rust 二进制，并确认 `command -v larkline` 指向它。
+1. 停止并注销旧服务：`larkline stop`、`larkline unregister`。
+2. 用 `install.sh` 安装新二进制，并确认 `command -v larkline` 指向它。
 3. 运行 `larkline doctor`。它会找到原有 profile、app id、keystore 和会话。
 4. 用 `larkline start` 启动服务。
 
@@ -393,13 +391,10 @@ markdown 模式、附件下载失败、8.5 分钟卡片接续，以及 Claude / 
   scope 和工作目录匹配。
 - **授权范围**：授权和问题卡片只接入了 IM run loop；评论和会议任务仍保持原来的
   非交互行为。暂无编辑工具参数；群里只有本轮第一条消息的发送者可以操作。
-- **非 TS 附加项与剩余边界**：普通消息上尚未生效的访问控制边界（TypeScript
-  owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、
-  普通消息上的 `allowedChats`）、Windows Authenticode 签名、Rust `ps` 条目的
-  bot 名称补全，以及在线 keepalive watchdog（`lark-channel` 0.6 没有连接状态或
-  强制重连接口）。
-
-每项缺口的原因和当前状态见 [Rust 移植说明](./docs/RUST-PORT.md)。
+- **剩余边界**：普通消息上尚未生效的访问控制边界（owner 绕过、team 模式的
+  普通消息放行、按聊天的 `chatRequireMention` 覆盖、普通消息上的
+  `allowedChats`）、Windows Authenticode 签名、`ps` 条目的 bot 名称补全，以及
+  在线 keepalive watchdog（飞书 channel 没有连接状态或强制重连接口）。
 
 ## 常见问题
 
