@@ -378,7 +378,8 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 
 bridge 的出站 transport 可注入（`BridgeTransport`），并且有端到端 run-flow 测试
 （`crates/larkline-bridge/tests/run_flow.rs`），覆盖正常流程、`/stop`、空闲超时、
-markdown 模式和附件下载失败。目前只剩以下项目：
+markdown 模式、附件下载失败、8.5 分钟卡片接续，以及 Claude / Codex 授权卡片点击。
+目前只剩以下项目：
 
 - **Apple 发布 secrets**：macOS 发布流水线需要 Developer ID 签名和 notarize
   凭据，目前仍待配置；Windows Authenticode 签名也未配置。
@@ -388,6 +389,9 @@ markdown 模式和附件下载失败。目前只剩以下项目：
   私聊，不会发进会议来源话题。
 - **Session catalog**：不读也不写 `sessions.json.catalog.json`；恢复会话只按
   scope 和工作目录匹配。
+- **授权范围**：授权卡片只接入了 IM run loop；评论和会议任务仍保持原来的非交互
+  行为。暂不支持「本次会话都允许」按钮，也不支持编辑工具参数；群里只有本轮第一
+  条消息的发送者可以操作。
 - **非 TS 附加项与剩余边界**：普通消息上尚未生效的访问控制边界（TypeScript
   owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、
   普通消息上的 `allowedChats`）、Windows Authenticode 签名、Rust `ps` 条目的

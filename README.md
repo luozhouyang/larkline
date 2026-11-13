@@ -378,8 +378,9 @@ If both `~/.lark-channel` and `~/.larkline` exist, nothing is renamed; the exist
 
 The bridge has an injectable outbound transport (`BridgeTransport`) plus
 end-to-end run-flow tests (`crates/larkline-bridge/tests/run_flow.rs`) covering
-the happy path, `/stop`, the idle timeout, markdown mode and attachment
-failures. Only these items remain:
+the happy path, `/stop`, the idle timeout, markdown mode, attachment failures,
+8.5-minute card rollover, and Claude/Codex approval click-throughs. Only these
+items remain:
 
 - **Apple release secrets**: the macOS release job needs Developer ID signing
   and notarization credentials that are still pending; Windows Authenticode
@@ -390,6 +391,10 @@ failures. Only these items remain:
   origin chat or owner DM as top-level messages, not into the originating topic.
 - **Session catalog**: `sessions.json.catalog.json` is not written or read;
   resume is keyed by scope and working directory.
+- **Approval scope**: approval cards are wired into the IM run loop only;
+  comment and meeting runs keep the old non-interactive behavior. There is no
+  "allow for this session" button and no editable tool input, and in a group
+  only the run's first sender can approve.
 - **Non-TS extras and remaining parity edges**: access-control edges (the
   TypeScript owner bypass for ordinary messages, team-mode usage for ordinary
   messages, per-chat `chatRequireMention` overrides and `allowedChats` on
