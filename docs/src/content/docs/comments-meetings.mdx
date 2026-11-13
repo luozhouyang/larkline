@@ -1,0 +1,64 @@
+---
+title: Comments and meetings
+description: Use larkline from cloud-doc comments and inside Feishu meetings.
+sidebar:
+  order: 7
+---
+
+## Cloud-doc comments
+
+`@`-mention the bot in a supported document comment and it replies in the same
+comment thread. Supported targets are `doc`, `docx`, `sheet`, and `file`.
+
+The app must subscribe to `drive.notice.comment_add_v1`. Comment runs are
+abortable by an admin:
+
+```text
+/stop comment:<hash>
+```
+
+`/status` lists live scopes and their hashes.
+
+<Aside type="note">
+  `wiki` comment targets are logged and skipped. Approval and question cards
+  are not available in comment runs; they keep the agent's non-interactive
+  behavior.
+</Aside>
+
+## Meetings
+
+The in-meeting agent is opt-in. Add the meeting block to the profile and
+restart:
+
+```json
+{
+  "meeting": {
+    "enabled": true
+  }
+}
+```
+
+The app needs the VC bot scopes, and the tenant must support the VC bot
+capability.
+
+```text
+/meeting join <9-digit number>
+/meeting leave [meeting number]
+/meeting notes [meeting number]
+/meeting ask <question>
+/meeting transcript [meeting number]
+/meeting stop [meeting number]
+```
+
+- `/meeting join` joins a meeting by its 9-digit number.
+- In-meeting chat prefixed with the configured trigger can ask questions.
+- `/meeting notes` summarizes the live transcript.
+- `/meeting transcript` shows the context the agent actually receives.
+- `/meeting stop` interrupts the meeting's current run.
+
+End-of-meeting summaries go to the configured origin chat or owner DM as
+top-level messages, not into the originating topic. Meeting runs do not have
+approval cards; use full access for the profile when the agent must execute
+tools inside a meeting.
+
+All `/meeting` commands require `meeting.enabled`.

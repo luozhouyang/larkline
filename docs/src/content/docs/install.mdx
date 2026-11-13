@@ -1,0 +1,80 @@
+---
+title: Install
+description: Download a release binary, pin a version, and upgrade larkline.
+sidebar:
+  order: 1
+---
+
+larkline ships as a static binary. The installer downloads the asset for your
+platform, verifies it against the release `SHA256SUMS` when present, and writes
+it beside the final path before renaming it into place.
+
+## Install the latest release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luozhouyang/larkline/main/install.sh -o /tmp/larkline-install.sh
+sh /tmp/larkline-install.sh
+```
+
+The two steps are deliberate: inspect the script before running it. It never
+pipes the network response directly into a shell.
+
+The default directory is `~/.local/bin`; no `sudo` is required. If that
+directory is not on `PATH`, the installer prints the exact export line.
+
+## Choose a directory
+
+```bash
+LARKLINE_INSTALL_DIR="$HOME/bin" sh /tmp/larkline-install.sh
+# or
+sh /tmp/larkline-install.sh --dir "$HOME/bin"
+```
+
+## Pin a version
+
+```bash
+sh /tmp/larkline-install.sh --version <version>
+```
+
+A leading `v` is accepted. Pinning is useful for reproducible installs and
+rollbacks.
+
+## Platform assets
+
+| Platform | Asset | Notes |
+|---|---|---|
+| macOS (Apple Silicon + Intel) | `larkline-darwin-universal.zip` | Universal binary; signed and notarized when the release Apple secrets are configured |
+| Linux x86_64 | `larkline-linux-x86_64.tar.gz` | Static musl build, no glibc dependency |
+| Linux aarch64 | `larkline-linux-aarch64.tar.gz` | Static musl build |
+| Windows x86_64 | `larkline-windows-x86_64.zip` | Unsigned; SmartScreen may warn on first run |
+
+On Windows, extract `larkline.exe` from the zip and place it on `PATH`. The
+installer is a POSIX `sh` script.
+
+## Upgrade
+
+```bash
+larkline upgrade --check   # report the latest release
+larkline upgrade           # print the installer command for it
+```
+
+`upgrade` does not replace the binary underneath a running daemon. It reports
+the available version and the installer command; run the installer yourself,
+then restart the service.
+
+<Aside type="caution" title="Stop before replacing">
+  A running daemon keeps its old inode and finishes its current work. The next
+  start picks up the new binary. On Windows, replace `larkline.exe` from the
+  release zip instead.
+</Aside>
+
+## Uninstall
+
+```bash
+larkline stop
+larkline unregister
+rm "$(command -v larkline)"
+```
+
+Remove `~/.larkline` only if you also want to delete local profiles, sessions,
+and secrets.

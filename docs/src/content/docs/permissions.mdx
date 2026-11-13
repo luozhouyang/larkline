@@ -1,0 +1,97 @@
+---
+title: Permissions
+description: Approval cards, session grants, user questions, and the access model.
+sidebar:
+  order: 5
+---
+
+## Permission modes
+
+The profile's `permissions` block selects how much the agent can do and whether
+tool prompts become cards:
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "workspace",
+    "claude": { "permissionMode": "default" }
+  }
+}
+```
+
+- **Claude Code** with `default` or `acceptEdits` uses the stdio permission
+  prompt protocol. `plan` and `bypassPermissions` never ask and keep the
+  one-shot path.
+- **Codex** with `read-only` or `workspace-write` runs through `codex
+  app-server`, which can ask for approval. `danger-full-access` keeps `codex
+  exec` and never prompts.
+
+## Approval cards
+
+A tool prompt arrives as a separate card showing:
+
+- the agent and working directory;
+- the command or path;
+- collapsible parameters, shown in full up to a 12KB card budget;
+- **Allow this time**, **Allow for this session** (when supported), and **Deny**.
+
+Only the sender of the run's first message can answer. A click from anyone else
+is rejected. Ten minutes without a decision denies the tool automatically, and
+a card that cannot be sent is denied immediately.
+
+`Allow for this session` sends the CLI's session suggestion when one is
+available:
+
+- Claude: `updatedPermissions` from the CLI's `permission_suggestions`.
+- Codex: `acceptForSession`, or a session-scoped permission grant.
+
+The card is a normal message, so it is not affected by the streaming-card
+rollover. Other chat members can see the command and parameters; only the
+initiator can click. Do not use a group chat for approvals if the tool input is
+sensitive.
+
+<Aside type="caution">
+  Comment and meeting runs do not have an approval-card flow. They keep the
+  agent's non-interactive behavior; run those scopes with full access if the
+  agent needs to execute tools there.
+</Aside>
+
+## Agent questions
+
+Claude `AskUserQuestion` and Codex `request_user_input` use the same card
+channel:
+
+- Options become buttons.
+- Multiple questions are answered one by one.
+- Multi-select questions get a submit button.
+- Free-text questions render a Feishu form with input boxes.
+- Mixed option/free-text questions, including `isOther`, use a hybrid card with
+  buttons and inputs.
+
+Answers go back in the agent's native shape: Claude
+`updatedInput.answers`, Codex `answers[questionId].answers[]`.
+
+In a hybrid card, option clicks update the in-memory selection without
+re-rendering the card, so text already typed into the form is preserved. Press
+**Submit** to finalize the answer.
+
+## Access control
+
+- `access.allowedUsers` restricts who can trigger the bot in DMs, groups, and
+  comment threads. An empty list applies no user allowlist.
+- Group messages require an `@` mention by default. Set
+  `access.requireMentionInGroup` to `false` to change that.
+- `access.admins` gates `/config set`, `/meeting`, and `/stop <scope>`. While
+  the list is empty, `access.allowedUsers` acts as the admin set. The runtime
+  app owner is also accepted, resolved from the Applications API and cached for
+  30 minutes.
+- `access.allowedChats` is currently consulted only when verifying card-button
+  clicks, not for ordinary messages.
+
+`/invite` and `/remove` maintain the user, admin, and group lists.
+
+<Aside type="warning" title="Before sharing">
+  An empty `allowedUsers` list means anyone who can reach the app can DM it.
+  Set `allowedUsers` explicitly before sharing the bot.
+</Aside>

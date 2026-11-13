@@ -1,0 +1,64 @@
+---
+title: Sessions and queues
+description: Session continuity, message batching, persistence, and long-running cards.
+sidebar:
+  order: 6
+---
+
+## One session per scope
+
+A scope is a DM, a group, or a topic thread. Each scope keeps its own agent
+session and working directory.
+
+- A stored session is resumed only from the directory where it was created.
+- `/new` clears the session for the current scope.
+- `/resume` resumes the stored session for the current directory.
+- `/cd` changes the directory; the next turn starts a session for the new
+  directory.
+
+Sessions are stored in
+`~/.larkline/profiles/<profile>/sessions.json`.
+
+## Batching
+
+Messages sent in quick succession run as one turn. Messages that arrive during
+a run wait for the next turn.
+
+The pending queue is written through to
+`~/.larkline/profiles/<profile>/pending.json` and restored after a restart.
+Each message has its own 24-hour TTL, so a busy queue cannot keep an old message
+alive indefinitely. On restart, the chat gets a short restored-count notice.
+
+`/stop` aborts the current run and drops its queued batch. Chat commands bypass
+the debounce queue and drop anything already waiting for that scope.
+
+## Concurrency
+
+`preferences.maxConcurrentRuns` caps live agent runs across IM, comment, and
+meeting scopes (default 10, range 1–50).
+
+```bash
+/config set maxConcurrentRuns 6
+```
+
+Lowering the cap below the current number of live runs lets those runs finish
+and holds new starts until a slot frees.
+
+## Long-running cards
+
+Feishu force-finalizes a streaming card about 10 minutes after creation and
+drops later updates. larkline keeps updating until about 8.5 minutes, then:
+
+1. creates a fresh card;
+2. marks the old card `⏭ 过程已接续到下一张卡片`;
+3. continues on the new card with `↪ 接续上一张卡片`;
+4. writes the final answer on the latest card.
+
+If the new card cannot be created, the bridge stops updating and sends the
+final answer as a separate message. This is a server-side limit, so it applies
+to desktop and mobile clients alike.
+
+## Idle timeout
+
+A run with no output for the configured idle timeout is stopped with a terminal
+notice. Use `/config` to inspect the current preferences.

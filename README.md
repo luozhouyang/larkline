@@ -2,7 +2,7 @@
 
 larkline is a single, self-contained static binary that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. **No Node.js. No npm. One binary, at install time and at runtime.** Start the bridge, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
-[中文 README](./README.zh.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
+[Documentation](https://luozhouyang.github.io/larkline/) · [中文 README](./README.zh.md) · [Product walkthrough](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## What it does
 

@@ -1,0 +1,71 @@
+---
+title: Commands
+description: CLI commands and the commands you send to the bot in chat.
+sidebar:
+  order: 3
+---
+
+## CLI commands
+
+| Command | What it does |
+|---|---|
+| `larkline run [--cwd <path>] [--dry-run]` | Run the bridge in the foreground. `--dry-run` validates without connecting. |
+| `larkline doctor` | Check config, credentials, keystore, profiles, and agent binaries. |
+| `larkline onboard [--name <name>] [--agent claude\|codex] [--tenant feishu\|lark]` | Create a profile by scanning a QR code. |
+| `larkline profile list\|create\|use\|remove\|show` | Manage profiles. |
+| `larkline start\|stop\|restart\|status\|unregister` | Manage the OS-managed service for a profile. |
+| `larkline ps` | List bridge processes from the shared registry. |
+| `larkline kill <id\|#>` | Stop a registered bridge process. |
+| `larkline upgrade [--check]` | Report a new release or print the installer command. |
+
+Global flags:
+
+```text
+--home <path>       defaults to $LARKLINE_HOME or ~/.larkline
+--profile <name>    defaults to $LARKLINE_PROFILE or the active profile
+-v / -vv            more logging
+```
+
+## Chat commands
+
+| Command | Effect |
+|---|---|
+| `/new` | Start a fresh agent session for this scope. |
+| `/resume` | Resume the stored session for the current directory. |
+| `/cd <absolute path>` | Switch this chat or topic's working directory. |
+| `/pwd` | Show the effective working directory. |
+| `/status` | Show profile, agent, app id, tenant, cwd, reply mode, and live runs. |
+| `/config` | Show reply preferences and the concurrency cap. |
+| `/config set messageReply <card\|markdown\|text>` | Set the reply mode (admin). |
+| `/config set showToolCalls <true\|false>` | Show or hide tool summaries (admin). |
+| `/config set maxConcurrentRuns <1-50>` | Set the concurrency cap (admin). |
+| `/stop` | Abort the current run, including the card's stop button. |
+| `/stop <scope>` | Abort a specific live run (admin), such as `comment:<hash>`. |
+| `/help` | Show the command list. |
+
+<Aside type="note">
+  Commands bypass the debounce queue and drop anything already waiting for that
+  scope. Replies are plain text, not interactive cards.
+</Aside>
+
+## Mentions and admins
+
+- DMs do not need an `@` mention.
+- Groups require one by default; set `access.requireMentionInGroup` to `false`
+  to relax it.
+- Admin commands are `/config set`, `/meeting`, and `/stop <scope>`. They accept
+  senders in `access.admins`; while that list is empty, `access.allowedUsers`
+  is used instead. The runtime app owner is also accepted.
+- `/config` reads are open to any sender admitted by the message policy.
+
+## Reply modes
+
+`/config set messageReply` controls the final answer:
+
+- `card` — CardKit streaming card with a tool summary and stop button. Long runs
+  continue on a fresh card.
+- `markdown` — the default; the Rust build uses the card renderer and falls back
+  to a plain message when the card can no longer be updated.
+- `text` — one plain-text message when the run finishes.
+
+`showToolCalls` only affects the summary in the final card or text reply.

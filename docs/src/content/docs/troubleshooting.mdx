@@ -1,0 +1,91 @@
+---
+title: Troubleshooting
+description: Diagnose a silent bot, failed runs, stale processes, and card issues.
+sidebar:
+  order: 8
+---
+
+## Start with doctor
+
+```bash
+larkline doctor
+```
+
+It checks the state directory, config, active profile, app id, keystore
+decryption, the agent binary, and (as a warning) `lark-cli`. It exits non-zero
+when a required check fails.
+
+## The bot is silent
+
+1. Run `larkline doctor`.
+2. Confirm the agent CLI is installed and logged in:
+   ```bash
+   claude --version
+   codex --version
+   ```
+3. Send `/status` in the chat. Check the cwd and whether the session is
+   resumable.
+4. Try `/new` to clear a stale session.
+5. If you are in a group, confirm you `@`-mentioned the bot (unless
+   `access.requireMentionInGroup` is `false`).
+
+For a foreground run, check the terminal output. For a service, read the daemon
+logs:
+
+```text
+~/.larkline/profiles/<profile>/logs/daemon/
+```
+
+## The card stopped updating
+
+If a run passed about 8.5 minutes, look for a newer card in the same chat. The
+bridge rolls progress over to a fresh card and puts the final answer there.
+
+Only if the new card could not be created does it fall back to sending the
+final answer as a separate message.
+
+## The agent asks for permission but nothing happens
+
+- Approval and question cards are available in IM runs only, not comment or
+  meeting runs.
+- The first sender of the run can click; other members cannot.
+- Unanswered cards are denied after ten minutes.
+- Check that the installed Claude Code or Codex supports the approval protocol.
+  `doctor` does not probe it; an outdated CLI reports its own error.
+
+## `larkline ps` shows stale entries
+
+A process killed with SIGKILL or a crash cannot unregister itself. The next
+`larkline run` prunes dead pids. Until then `ps` marks them `(stale)` and `kill`
+refuses to signal them.
+
+## Windows SmartScreen warning
+
+The Windows binary is not code-signed yet. SmartScreen may warn on first run.
+
+## Service does not find the agent
+
+The service records the invoking shell's `PATH`. If `claude` or `codex` lives
+in a directory that is only added by an interactive shell profile, reinstall
+the service from a shell where the binary is on `PATH`:
+
+```bash
+larkline unregister
+larkline start
+```
+
+## Change the App Secret
+
+```bash
+larkline secrets set app-<app_id>
+larkline restart
+```
+
+The config reference stays the same.
+
+## Still stuck?
+
+Open an issue with the `larkline doctor` output (redact app ids and secrets),
+the platform, the agent version, and the relevant daemon log lines:
+
+[github.com/luozhouyang/larkline/issues](https://github.com/luozhouyang/larkline/issues)

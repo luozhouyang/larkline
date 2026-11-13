@@ -1,0 +1,103 @@
+---
+title: Configuration
+description: Profiles, config layout, environment variables, and working directories.
+sidebar:
+  order: 4
+---
+
+## Profiles
+
+A profile is one bot identity: its app credentials, agent kind, preferences,
+access lists, sessions, and working directory. `config.json` uses schema v2 with
+an `activeProfile` and a `profiles` map.
+
+```json
+{
+  "agentKind": "claude",
+  "accounts": {
+    "app": {
+      "id": "cli_xxx",
+      "tenant": "feishu",
+      "secret": {
+        "source": "exec",
+        "provider": "bridge",
+        "id": "app-cli_xxx"
+      }
+    }
+  },
+  "preferences": {
+    "messageReply": "card",
+    "showToolCalls": true,
+    "maxConcurrentRuns": 10
+  },
+  "workspaces": {
+    "default": "/Users/me/projects/app"
+  }
+}
+```
+
+Edit the matching profile; do not replace the whole `config.json` with this
+fragment. The binary preserves fields it does not read yet, so a round-trip
+never drops settings.
+
+## Working directories
+
+`/cd` sets the directory for one chat or topic thread. It must be absolute and
+exist; larkline canonicalizes it. `/pwd` prints the effective directory.
+
+- A session is only resumed from the directory it was created in.
+- `/new` clears the session for the scope.
+- `/resume` resumes the stored session for the current directory.
+
+## Reply preferences
+
+| Field | Values | Meaning |
+|---|---|---|
+| `preferences.messageReply` | `card`, `markdown`, `text` | Final answer delivery. |
+| `preferences.showToolCalls` | boolean | Include the tool summary. |
+| `preferences.maxConcurrentRuns` | 1–50 | Global live-run cap. |
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `LARKLINE_HOME` | State root; defaults to `~/.larkline`. `--home` wins. |
+| `LARKLINE_PROFILE` | Profile for this process. `--profile` wins. |
+| `LARKLINE_CALLBACK_SECRET` | Optional HMAC key for card-button tokens. Defaults to the profile App Secret. |
+
+Legacy names `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE`, and
+`LARK_CHANNEL_CALLBACK_SECRET` are still read when the new names are absent.
+
+## Keystore
+
+`profile create` and `onboard` encrypt the App Secret into the profile's
+`secrets.enc` using AES-256-GCM. The config stores only a reference; plaintext
+never appears in `config.json`.
+
+```bash
+larkline secrets list
+larkline secrets set app-cli_xxx
+larkline secrets remove app-cli_xxx
+```
+
+The encryption key is derived from the machine hostname and your user name,
+plus a per-profile salt in `.keystore.salt`. Copying only `secrets.enc` to a
+different machine generally will not decrypt; re-enter the secret there.
+
+## Data directory
+
+| Path | Content |
+|---|---|
+| `~/.larkline/config.json` | Root config and profiles |
+| `~/.larkline/profiles/<profile>/sessions.json` | Resumable session per scope |
+| `~/.larkline/profiles/<profile>/workspaces.json` | Per-scope working directories |
+| `~/.larkline/profiles/<profile>/pending.json` | Durable queue, per-message 24-hour TTL |
+| `~/.larkline/profiles/<profile>/secrets.enc` | Encrypted secrets |
+| `~/.larkline/profiles/<profile>/logs/daemon/` | Daemon logs |
+| `~/.larkline/registry/processes.json` | Process registry for `ps` / `kill` |
+
+<Aside type="caution" title="Access lists">
+  An empty `access.allowedUsers` list applies no user allowlist. Set it
+  explicitly before sharing the bot. See [Permissions](/permissions/) for the
+  full access model.
+</Aside>

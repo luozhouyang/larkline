@@ -2,7 +2,7 @@
 
 larkline 是一个自包含的单个静态二进制文件，用来把飞书 / Lark 消息和本机 Claude Code 或 Codex CLI 打通。**不依赖 Node.js，不需要 npm；安装和运行时都只需要这一个二进制。** 启动 bridge，扫码绑定 PersonalAgent 应用，就可以在飞书里和本机编程助手对话。
 
-[English README](./README.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
+[文档](https://luozhouyang.github.io/larkline/) · [English README](./README.md) · [产品说明](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## 主要功能
 

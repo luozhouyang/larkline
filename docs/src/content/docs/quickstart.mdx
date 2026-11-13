@@ -1,0 +1,121 @@
+---
+title: Quick start
+description: Create a profile, check it, run the bridge, and install the OS service.
+sidebar:
+  order: 2
+---
+
+This walkthrough takes you from a fresh install to a bot you can message in
+Feishu / Lark.
+
+## 1. Create a profile
+
+The easiest path creates a PersonalAgent app through the QR device flow:
+
+```bash
+larkline onboard
+```
+
+A QR code appears in the terminal. Scan it with Feishu / Lark and confirm the
+app. The profile is written to `~/.larkline/config.json`.
+
+The default profile name is `bot` (then `bot-2`, `bot-3`, ...). Useful flags:
+
+```bash
+larkline onboard --name work --agent codex --tenant lark
+```
+
+- `--agent claude|codex` chooses the local coding agent.
+- `--tenant feishu|lark` chooses the Feishu or Lark global environment.
+- `--no-use` creates the profile without making it active.
+
+If you already have a PersonalAgent app:
+
+```bash
+larkline profile create claude --app-id cli_xxx
+```
+
+The command prompts for the App Secret without echoing it. Use `--app-secret`
+for non-interactive setup, `--agent codex` for Codex, and `--tenant lark` for a
+Lark global app.
+
+You do not need to choose a project directory up front. The profile gets a
+managed default workspace; switch to a real project later with `/cd`.
+
+## 2. Check the setup
+
+```bash
+larkline doctor
+```
+
+`doctor` checks the state directory, config, active profile, app id, keystore
+decryption, the agent binary, and (as a warning) `lark-cli`. It exits non-zero
+when a required check fails.
+
+## 3. Run in the foreground
+
+```bash
+larkline run
+```
+
+`run` prints the profile, app, tenant, agent, and workspace, then connects to
+the Feishu / Lark long connection. Send a DM or `@`-mention the bot in a group.
+
+Press `Ctrl-C` to stop. For a configuration check without connecting:
+
+```bash
+larkline run --dry-run
+```
+
+Use `--cwd` when the profile should use a specific directory for this run.
+
+## 4. Install the service
+
+Stop the foreground process first, then install and start the per-profile
+daemon:
+
+```bash
+larkline start
+larkline status
+```
+
+`start` installs or updates the OS service definition if needed, stops a live
+instance, and starts the new one. The service records the binary path, profile,
+and the invoking shell's `PATH`, so `claude` and `codex` stay discoverable after
+logout.
+
+Do not run `larkline run` and the daemon against the same app at the same time.
+
+```bash
+larkline start [--profile <name>]
+larkline stop [--profile <name>]
+larkline restart [--profile <name>]
+larkline status [--profile <name>]
+larkline unregister [--profile <name>]
+```
+
+Platform mapping:
+
+| Platform | Service |
+|---|---|
+| macOS | launchd user agent `ai.larkline.bot.<profile>` |
+| Linux | systemd user unit `larkline.bot.<profile>.service` |
+| Windows | Task Scheduler task `Larkline.Bot.<profile>` |
+
+Daemon logs are under `~/.larkline/profiles/<profile>/logs/daemon/`.
+
+## 5. Talk to it
+
+In a DM, send a message. In a group, `@`-mention the bot. Try:
+
+```text
+/status
+```
+
+`/status` shows the profile, agent, cwd, reply mode, and whether the session is
+resumable. Use `/help` for the command list.
+
+<Aside type="tip" title="Switch projects">
+  Use `/cd /absolute/path/to/project` to point the current chat or topic at a
+  real repository. `/pwd` prints the effective directory.
+</Aside>

@@ -1,0 +1,63 @@
+---
+title: Architecture
+description: The Rust workspace, transport boundary, and development commands.
+sidebar:
+  order: 9
+---
+
+## Workspace
+
+larkline is a Rust workspace with five crates:
+
+| Crate | Responsibility |
+|---|---|
+| `larkline-core` | Config, keystore, paths, sessions, workspaces, locks |
+| `larkline-lark` | Feishu / Lark REST and WebSocket transport, cards, comments, meetings |
+| `larkline-agent` | Claude Code and Codex process adapters and protocol translation |
+| `larkline-bridge` | IM/comment/meeting run loop, cards, queue, approvals, policy |
+| `larkline-cli` | `larkline` binary, commands, onboarding, daemons |
+
+The bridge talks to Feishu / Lark through a `BridgeTransport` trait. Tests use
+an injectable fake transport and a fake agent, so the full run loop can be
+exercised without a tenant.
+
+## State and compatibility
+
+The state layout under `~/.larkline`, config schema v2, and the AES-256-GCM
+keystore are stable across releases. Older `~/.lark-channel` directories are
+renamed on first launch with the default home when `~/.larkline` does not
+exist.
+
+Sessions are keyed by scope and working directory. The queue uses
+`queuedAtMs` per message for its 24-hour TTL.
+
+## Development
+
+```bash
+cargo build --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+./target/release/larkline doctor
+```
+
+Rust 1.85 or newer is required.
+
+CI runs the test suite on macOS, Ubuntu, and Windows. Formatting and clippy run
+on Linux. Releases are tag-driven: pushing a `v*` tag formats, tests, builds
+static musl Linux binaries, a signed/notarized macOS universal binary, and a
+Windows x86_64 zip, then publishes the assets with `SHA256SUMS`.
+
+## Documentation
+
+This site is a Nimbus project under `docs/`:
+
+```bash
+cd docs
+npm install
+npm run dev
+npm run build
+```
+
+It is built with `base: "/larkline"` and deployed to GitHub Pages by the docs
+workflow on every push to `main`.

@@ -1,0 +1,97 @@
+---
+title: larkline
+description: One static binary between Feishu / Lark and your local Claude Code or Codex CLI.
+sidebar:
+  order: 0
+---
+
+larkline bridges Feishu / Lark messages with a coding agent running on your
+machine. You talk to a bot in a DM, group, or topic thread; larkline runs
+Claude Code or Codex in a local working directory and streams the answer back
+into the chat.
+
+It is a single, self-contained static binary. There is no Node.js, npm, or
+language runtime at install time or at runtime.
+
+<Aside type="tip" title="Start here">
+  New to larkline? Follow [Install](/install/) and [Quick start](/quickstart/).
+  The bot setup takes one QR scan.
+</Aside>
+
+## What it does
+
+- **Streaming cards.** The answer and a compact tool summary update on one
+  Lark card while the agent works. A long run rolls over to a fresh card
+  before Feishu's streaming-card limit is reached.
+- **Per-chat sessions.** Every DM, group, or topic thread keeps its own agent
+  session and working directory. Resume is scoped to the directory it was
+  created in.
+- **Queued turns.** Messages that arrive during a run wait for the next turn.
+  The queue is persisted across restarts.
+- **Approval cards.** When the agent asks for permission, the tool prompt
+  becomes a card with Allow, Allow for this session, and Deny buttons.
+- **Question cards.** Claude `AskUserQuestion` and Codex `request_user_input`
+  become option buttons and free-text forms.
+- **One binary, many profiles.** Run separate bots for different apps, agents,
+  sessions, and workspaces on one machine.
+
+## Requirements
+
+- macOS, Linux, or Windows.
+- A local coding agent installed and logged in:
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)
+  - [Codex CLI](https://developers.openai.com/codex/cli)
+- A Feishu / Lark **PersonalAgent** app. `larkline onboard` can create and bind
+  one through the QR device flow.
+- Network access from the bridge host to Feishu / Lark.
+
+The agent CLI is a separate tool and keeps its own requirements. larkline only
+spawns the local binary.
+
+## Get something working
+
+<Steps>
+  <Step title="Install the binary">
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/luozhouyang/larkline/main/install.sh -o /tmp/larkline-install.sh
+    sh /tmp/larkline-install.sh
+    ```
+  </Step>
+  <Step title="Create a profile">
+    ```bash
+    larkline onboard
+    ```
+    Scan the QR code, confirm the app, and the profile is written under
+    `~/.larkline`.
+  </Step>
+  <Step title="Check and run">
+    ```bash
+    larkline doctor
+    larkline run
+    ```
+    Send a DM or `@`-mention the bot in a group.
+  </Step>
+</Steps>
+
+## Explore
+
+<CardGrid>
+  <Card title="Install" icon="ph:download-simple" href="/install/">
+    Release assets, version pinning, and upgrades.
+  </Card>
+  <Card title="Quick start" icon="ph:rocket-launch" href="/quickstart/">
+    Create a profile, run the bridge, and install the service.
+  </Card>
+  <Card title="Permissions" icon="ph:shield-check" href="/permissions/">
+    Approval cards, session grants, and agent questions.
+  </Card>
+  <Card title="Troubleshooting" icon="ph:lifebuoy" href="/troubleshooting/">
+    Doctor checks, silent bots, and card rollover.
+  </Card>
+</CardGrid>
+
+## Project links
+
+- [GitHub repository](https://github.com/luozhouyang/larkline)
+- [Chinese README](https://github.com/luozhouyang/larkline/blob/main/README.zh.md)
+- [MIT license](https://github.com/luozhouyang/larkline/blob/main/LICENSE)
