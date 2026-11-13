@@ -315,7 +315,7 @@ profile 的 `permissions` 块决定 agent 的访问级别，以及工具调用�
 
 - **Claude Code** 在 `default` 或 `acceptEdits` 下使用 stdio 权限询问协议。工具调用会发来一张独立卡片，展示 agent、工作目录、命令/路径，并可展开参数。点「允许本次」会原样放行；点「本次会话都允许」会在 CLI 提供会话建议时发送；点「拒绝」会告诉模型用户拒绝了该操作。`plan` 和 `bypassPermissions` 不会询问，保持原来的一次性 stdin 路径。参数在 12KB 卡片预算内完整展示，超出时会带明显提示截断。
 - **Codex** 在 `read-only` 或 `workspace-write` 下改用 `codex app-server`（`codex exec` 协议没有反向授权通道）。命令执行、文件修改和额外权限请求都走同一张授权卡片。`danger-full-access` 仍然使用 `codex exec`，不会询问。
-- **用户选择题**（`AskUserQuestion` 和 Codex `request_user_input`）走同一套卡片：选项变成按钮；多个问题逐个回答；多选问题提供提交按钮；自由文本问题会渲染带输入框的飞书表单。答案会按 agent 原生格式回传。
+- **用户选择题**（`AskUserQuestion` 和 Codex `request_user_input`）走同一套卡片：选项变成按钮；多个问题逐个回答；多选问题提供提交按钮；自由文本问题会渲染带输入框的飞书表单；选项和文本混合（包括 `isOther`）使用按钮 + 输入框的混合卡片。答案会按 agent 原生格式回传。
 - 只有本轮第一条消息的发送者可以点击按钮；其他人的点击会被拒绝。10 分钟未处理会自动拒绝；如果卡片发送失败，也会立即拒绝，避免 agent 一直卡住。授权/问题卡片是普通非流式消息，不受 8.5 分钟流式卡片限制影响。
 - 卡片发在当前聊天里，所以其他群成员也能看到命令和工具参数（只有发起人能点击）。如果工具参数敏感，请不要在群里做授权。
 - 评论和会议任务没有授权卡片流程，保持 agent 的非交互行为；如果这些场景需要执行工具，请为对应 profile 使用 full access。
@@ -392,8 +392,7 @@ markdown 模式、附件下载失败、8.5 分钟卡片接续，以及 Claude / 
 - **Session catalog**：不读也不写 `sessions.json.catalog.json`；恢复会话只按
   scope 和工作目录匹配。
 - **授权范围**：授权和问题卡片只接入了 IM run loop；评论和会议任务仍保持原来的
-  非交互行为。暂无编辑工具参数；选项和自由文本混合的问题会退化为提示；群里只有
-  本轮第一条消息的发送者可以操作。
+  非交互行为。暂无编辑工具参数；群里只有本轮第一条消息的发送者可以操作。
 - **非 TS 附加项与剩余边界**：普通消息上尚未生效的访问控制边界（TypeScript
   owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、
   普通消息上的 `allowedChats`）、Windows Authenticode 签名、Rust `ps` 条目的

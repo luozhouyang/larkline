@@ -140,9 +140,10 @@ Ported:
 - user questions: Claude `AskUserQuestion` and Codex `item/tool/requestUserInput`
   become option cards (one request at a time, multiple questions on the card,
   multi-select with a submit button); free-text questions use a Feishu form
-  with input boxes. Claude answers travel in `updatedInput.answers`; Codex
-  answers use the `answers[questionId].answers[]` payload. Mixed
-  option/free-text questions fall back to a notice for now. Approval parameters are
+  with input boxes, and mixed option/free-text (including `isOther`) questions
+  use a hybrid card with buttons plus inputs. Claude answers travel in
+  `updatedInput.answers`; Codex answers use the
+  `answers[questionId].answers[]` payload. Approval parameters are
   shown in full up to the Feishu card budget (12KB of raw JSON); larger inputs
   are truncated with a notice
 - Codex app-server transport for `read-only`/`workspace-write`: `codex

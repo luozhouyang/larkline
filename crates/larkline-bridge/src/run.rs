@@ -126,9 +126,9 @@ use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
     ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, QuestionCardInput,
-    QuestionTextCardInput, RunView, approval_card, approval_decided_card, card_status,
-    card_summary, question_card, question_card_questions, question_decided_card,
-    question_text_card, render_card,
+    QuestionHybridCardInput, QuestionTextCardInput, RunView, approval_card, approval_decided_card,
+    card_status, card_summary, question_card, question_card_questions, question_decided_card,
+    question_hybrid_card, question_text_card, render_card,
 };
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
@@ -3819,6 +3819,213 @@ impl Bridge {
             .collect()
     }
 
+    /// Collect a mix of option clicks and free-text input in one card.
+    ///
+    /// Option clicks only update in-memory state; they do not re-render the
+    /// card because that would clear text the user has already typed. The
+    /// form submit carries the text inputs and finalizes the answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_hybrid_question(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        operator: &str,
+        run_id: u64,
+        process: &mut AgentProcess,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<InteractionDecision>,
+        interrupt: &Arc<RunInterrupt>,
+        question: &mut PendingQuestion,
+    ) -> QuestionOutcome {
+        let submit_action = answer_action(&question.request_id, 0, 0, true, operator, run_id);
+        let submit_token = self.tokens.sign(scope, &submit_action);
+        let option_actions: Vec<Vec<(String, String)>> = question
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(question_index, item)| {
+                item.options
+                    .iter()
+                    .enumerate()
+                    .map(|(option_index, _)| {
+                        let action = answer_action(
+                            &question.request_id,
+                            question_index,
+                            option_index,
+                            false,
+                            operator,
+                            run_id,
+                        );
+                        let token = self.tokens.sign(scope, &action);
+                        (action, token)
+                    })
+                    .collect()
+            })
+            .collect();
+        let timeout_minutes = self.approval_timeout.as_secs().div_ceil(60).max(1);
+        let value = question_hybrid_card(&QuestionHybridCardInput {
+            scope,
+            operator,
+            run_id,
+            request_id: &question.request_id,
+            questions: &question.questions,
+            selected: &question.selected,
+            option_actions: &option_actions,
+            submit_action: &submit_action,
+            submit_token: &submit_token,
+            timeout_minutes,
+        });
+        let Ok(card) = lark_channel::Card::from_value(value) else {
+            let _ = reply::send_text(
+                &*self.transport,
+                scope,
+                chat_id,
+                Some(source_message_id),
+                "无法创建问题卡片，已跳过本次提问。",
+            )
+            .await;
+            let _ = process
+                .respond_to_question(&question.request_id, &question.raw_input, &[])
+                .await;
+            return QuestionOutcome::Answered;
+        };
+        let message_id = match reply::send_card(
+            &*self.transport,
+            scope,
+            chat_id,
+            Some(source_message_id),
+            &card,
+        )
+        .await
+        {
+            Ok(id) => id.0,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot send the hybrid question card");
+                let _ = process
+                    .respond_to_question(&question.request_id, &question.raw_input, &[])
+                    .await;
+                return QuestionOutcome::Answered;
+            }
+        };
+        question.card_message_id = Some(message_id.clone());
+        let deadline = tokio::time::Instant::now() + self.approval_timeout;
+        loop {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => {
+                    let card = question_decided_card("⏹ 已停止", &[]);
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::Interrupted;
+                }
+                decision = rx.recv() => {
+                    let Some(decision) = decision else {
+                        return QuestionOutcome::Interrupted;
+                    };
+                    let InteractionDecision::Answer {
+                        request_id,
+                        question_index,
+                        option_index,
+                        submit,
+                        texts,
+                        by,
+                    } = decision else {
+                        continue;
+                    };
+                    if request_id != question.request_id {
+                        continue;
+                    }
+                    if !submit {
+                        let Some(item) = question.questions.get(question_index) else {
+                            continue;
+                        };
+                        if option_index >= item.options.len() {
+                            continue;
+                        }
+                        if item.multi_select {
+                            if let Some(selected) = question.selected.get_mut(question_index) {
+                                if let Some(position) =
+                                    selected.iter().position(|index| *index == option_index)
+                                {
+                                    selected.remove(position);
+                                } else {
+                                    selected.push(option_index);
+                                }
+                            }
+                        } else if let Some(selected) = question.selected.get_mut(question_index) {
+                            *selected = vec![option_index];
+                        }
+                        // Do not refresh the card: it would drop text already
+                        // typed into the form inputs.
+                        continue;
+                    }
+                    if texts.len() != question.questions.len() {
+                        continue;
+                    }
+                    let mut incomplete = false;
+                    for (index, item) in question.questions.iter().enumerate() {
+                        let typed = texts[index].trim();
+                        if item.options.is_empty() {
+                            if typed.is_empty() {
+                                incomplete = true;
+                                break;
+                            }
+                        } else if question.selected[index].is_empty() && typed.is_empty() {
+                            incomplete = true;
+                            break;
+                        }
+                    }
+                    if incomplete {
+                        // Keep the form (and its inputs) intact for a retry.
+                        let _ = reply::send_text(
+                            &*self.transport,
+                            scope,
+                            chat_id,
+                            Some(source_message_id),
+                            "请为每个问题选择选项或填写回答后再提交。",
+                        )
+                        .await;
+                        continue;
+                    }
+                    question.text_answers = texts;
+                    let answers = Self::question_answers(question);
+                    if let Err(err) = process
+                        .respond_to_question(&question.request_id, &question.raw_input, &answers)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "cannot deliver the hybrid answer");
+                        return QuestionOutcome::Interrupted;
+                    }
+                    tracing::info!(
+                        scope,
+                        request_id = %question.request_id,
+                        by,
+                        "hybrid question answered"
+                    );
+                    let card = question_decided_card(
+                        "✅ 已回答",
+                        &Self::question_answer_pairs(question),
+                    );
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::Answered;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = process
+                        .respond_to_question(&question.request_id, &question.raw_input, &[])
+                        .await;
+                    let card = question_decided_card("⌛ 超时未回答", &[]);
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::TimedOut;
+                }
+            }
+        }
+    }
+
     /// Collect free-text answers in a Feishu form card.
     #[allow(clippy::too_many_arguments)]
     async fn run_text_question(
@@ -3975,11 +4182,30 @@ impl Bridge {
         interrupt: &Arc<RunInterrupt>,
         question: &mut PendingQuestion,
     ) -> QuestionOutcome {
-        if question
+        let has_options = question
             .questions
             .iter()
-            .all(|item| item.options.is_empty())
-        {
+            .any(|item| !item.options.is_empty());
+        let has_text = question
+            .questions
+            .iter()
+            .any(|item| item.options.is_empty() || item.is_other);
+        if has_options && has_text {
+            return self
+                .run_hybrid_question(
+                    scope,
+                    chat_id,
+                    source_message_id,
+                    operator,
+                    run_id,
+                    process,
+                    rx,
+                    interrupt,
+                    question,
+                )
+                .await;
+        }
+        if !has_options {
             return self
                 .run_text_question(
                     scope,
@@ -3993,28 +4219,6 @@ impl Bridge {
                     question,
                 )
                 .await;
-        }
-        if question
-            .questions
-            .iter()
-            .any(|item| item.options.is_empty())
-        {
-            let _ = reply::send_text(
-                &*self.transport,
-                scope,
-                chat_id,
-                Some(source_message_id),
-                "该问题需要自由文本回答，当前卡片暂不支持；已跳过本次提问。",
-            )
-            .await;
-            if let Err(err) = process
-                .respond_to_question(&question.request_id, &question.raw_input, &[])
-                .await
-            {
-                tracing::warn!(error = %err, "cannot skip the text-only question");
-                return QuestionOutcome::Interrupted;
-            }
-            return QuestionOutcome::Answered;
         }
         let Some(message_id) = self
             .send_question_card(

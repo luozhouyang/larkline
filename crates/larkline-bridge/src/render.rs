@@ -1600,6 +1600,148 @@ pub fn question_decided_card(status: &str, answers: &[(String, String)]) -> Valu
     })
 }
 
+/// A hybrid card: option buttons plus text inputs, used when a question set
+/// mixes choices and free text (including `isOther`).
+pub struct QuestionHybridCardInput<'a> {
+    pub scope: &'a str,
+    pub operator: &'a str,
+    pub run_id: u64,
+    pub request_id: &'a str,
+    pub questions: &'a [UserQuestion],
+    pub selected: &'a [Vec<usize>],
+    pub option_actions: &'a [Vec<(String, String)>],
+    pub submit_action: &'a str,
+    pub submit_token: &'a str,
+    pub timeout_minutes: u64,
+}
+
+pub fn question_hybrid_card(input: &QuestionHybridCardInput<'_>) -> Value {
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": "🙋 **需要你的选择或回答**",
+    })];
+    let mut form_elements = Vec::new();
+    for (index, question) in input.questions.iter().enumerate() {
+        if !question.header.trim().is_empty() {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("**{}**", mask_emails(&question.header)),
+                "text_size": "notation",
+            }));
+        }
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("{}. {}", index + 1, mask_emails(&question.question)),
+        }));
+        if !question.options.is_empty() {
+            let actions = input.option_actions.get(index);
+            for (option_index, option) in question.options.iter().enumerate() {
+                let selected = input
+                    .selected
+                    .get(index)
+                    .is_some_and(|selected| selected.contains(&option_index));
+                let (action, token) = actions
+                    .and_then(|actions| actions.get(option_index))
+                    .cloned()
+                    .unwrap_or_default();
+                elements.push(json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": format!("{} {}", if selected { "✅" } else { "" }, option.label).trim().to_string() },
+                    "type": if selected { "primary" } else { "default" },
+                    "behaviors": [{ "type": "callback", "value": {
+                        "__bridge_cb": true,
+                        "action": action,
+                        "scope": input.scope,
+                        "operator": input.operator,
+                        "run_id": input.run_id,
+                        "request_id": input.request_id,
+                        "question_index": index,
+                        "option_index": option_index,
+                        "submit": false,
+                        "token": token,
+                    } }]
+                }));
+                if !option.description.trim().is_empty() {
+                    elements.push(json!({
+                        "tag": "markdown",
+                        "content": mask_emails(&option.description),
+                        "text_size": "notation",
+                    }));
+                }
+            }
+        }
+        let needs_text = question.options.is_empty() || question.is_other;
+        if needs_text {
+            let label = if question.options.is_empty() {
+                if question.header.trim().is_empty() {
+                    format!("问题 {} 的回答", index + 1)
+                } else {
+                    mask_emails(&question.header)
+                }
+            } else {
+                format!(
+                    "{}（其他回答，可选）",
+                    if question.header.trim().is_empty() {
+                        format!("问题 {}", index + 1)
+                    } else {
+                        mask_emails(&question.header)
+                    }
+                )
+            };
+            form_elements.push(json!({
+                "tag": "input",
+                "name": format!("q_{index}"),
+                "label": { "tag": "plain_text", "content": label },
+                "placeholder": { "tag": "plain_text", "content": if question.options.is_empty() { "输入你的回答" } else { "也可以输入其他回答" } },
+                "max_length": 1_000,
+                "required": question.options.is_empty(),
+            }));
+        }
+    }
+    form_elements.push(json!({
+        "tag": "button",
+        "name": "submit",
+        "text": { "tag": "plain_text", "content": "提交回答" },
+        "type": "primary",
+        "form_action_type": "submit",
+        "behaviors": [{ "type": "callback", "value": {
+            "__bridge_cb": true,
+            "action": input.submit_action,
+            "scope": input.scope,
+            "operator": input.operator,
+            "run_id": input.run_id,
+            "request_id": input.request_id,
+            "question_count": input.questions.len(),
+            "question_index": 0,
+            "option_index": 0,
+            "submit": true,
+            "token": input.submit_token,
+        } }]
+    }));
+    elements.push(json!({
+        "tag": "form",
+        "name": "question_form",
+        "elements": form_elements,
+    }));
+    elements.push(json!({
+        "tag": "markdown",
+        "content": format!(
+            "仅发起本次任务的用户可以操作；{} 分钟内未处理将自动拒绝。选择选项后点「提交回答」生效；其他回答可填在输入框。",
+            input.timeout_minutes
+        ),
+        "text_size": "notation"
+    }));
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": "等待你的选择或回答" }
+        },
+        "body": { "elements": elements }
+    })
+}
+
 /// A form card for questions that need free-text answers (Codex
 /// `request_user_input` without options, or any question with no options).
 pub struct QuestionTextCardInput<'a> {

@@ -350,8 +350,14 @@ fn parse_user_questions(input: &Value) -> Option<Vec<crate::types::UserQuestion>
                 .get("multiSelect")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            is_other: false,
-            is_secret: false,
+            is_other: object
+                .get("isOther")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            is_secret: object
+                .get("isSecret")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
     (!parsed.is_empty()).then_some(parsed)

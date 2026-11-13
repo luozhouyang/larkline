@@ -315,7 +315,7 @@ The profile's `permissions` block selects the agent's access and whether tool pr
 
 - **Claude Code** with `default` or `acceptEdits` uses its stdio permission-prompt protocol. A tool prompt arrives as a separate card showing the agent and working directory, the command/path, and a collapsible parameters panel. `允许本次` echoes the original input; `本次会话都允许` sends the CLI's session suggestion when one is available; `拒绝` tells the model the user refused. `plan` and `bypassPermissions` never ask and keep the one-shot path. Parameters are shown in full up to a 12KB card budget; oversized inputs are cut with a visible notice.
 - **Codex** with `read-only` or `workspace-write` runs through `codex app-server` (the plain `codex exec` protocol has no way to ask for approval). Command, file-change and additional-permission requests use the same card. `danger-full-access` keeps `codex exec` and never prompts.
-- **User questions** (`AskUserQuestion` and Codex `request_user_input`) use the same card channel: options become buttons, multiple questions are answered one by one, multi-select questions get a submit button, and free-text questions render a Feishu form with input boxes. Answers go back to the agent in its native shape.
+- **User questions** (`AskUserQuestion` and Codex `request_user_input`) use the same card channel: options become buttons, multiple questions are answered one by one, multi-select questions get a submit button, and free-text questions render a Feishu form with input boxes. Mixed option/free-text questions (and `isOther` choices) use a hybrid card with both buttons and inputs. Answers go back to the agent in its native shape.
 - Only the sender of the run's first message can answer; a click from anyone else is rejected. Ten minutes without a decision denies the tool/question automatically, and a card that cannot be sent is denied immediately. The approval/question card is a normal (non-streaming) message, so it is not affected by the 8.5-minute progress-card limit.
 - The card is posted in the chat, so other chat members can see the command and tool parameters (only the initiator can click). Do not use a group chat for approvals if the tool input is sensitive.
 - Comment and meeting runs do not have an approval-card flow; they keep the agent's non-interactive behavior. Run those scopes with full access if the agent needs to execute tools there.
@@ -395,8 +395,8 @@ items remain:
   resume is keyed by scope and working directory.
 - **Approval scope**: approval and question cards are wired into the IM run
   loop only; comment and meeting runs keep the old non-interactive behavior.
-  Tool input is not editable, mixed option/free-text questions fall back to a
-  notice, and in a group only the run's first sender can approve.
+  Tool input is not editable, and in a group only the run's first sender can
+  approve.
 - **Non-TS extras and remaining parity edges**: access-control edges (the
   TypeScript owner bypass for ordinary messages, team-mode usage for ordinary
   messages, per-chat `chatRequireMention` overrides and `allowedChats` on

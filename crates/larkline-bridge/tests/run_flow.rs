@@ -1994,3 +1994,113 @@ printf '%s\n' '{"type":"result","session_id":"sess-text"}'
         .expect("the fake agent recorded the free-text answer");
     assert!(decision.contains("project-x"), "{decision}");
 }
+
+#[tokio::test]
+async fn question_card_mixes_options_and_free_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-hybrid"}'
+printf '%s\n' '{"type":"control_request","request_id":"req-hybrid","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Pick A or B","header":"Q1","multiSelect":false,"isOther":true,"options":[{"label":"A","description":"first"},{"label":"B","description":"second"}]},{"question":"Pick C or D, or type one","header":"Q2","multiSelect":false,"isOther":true,"options":[{"label":"C","description":"third"},{"label":"D","description":"fourth"}]},{"question":"Free text please","header":"Q3","multiSelect":false,"options":[]}]},"requires_user_interaction":true}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/hybrid-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after hybrid"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-hybrid"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+    bridge
+        .handle_message(message("om_hybrid", "oc_flow", "mixed"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| match frame {
+            Frame::Card { card, .. } => card_json(card).contains("answer:req-hybrid"),
+            _ => false,
+        })
+    })
+    .await;
+    let (message_id, card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("answer:req-hybrid") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("hybrid question card");
+    let option = card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| {
+            element["behaviors"][0]["value"]["question_index"] == 0
+                && element["behaviors"][0]["value"]["option_index"] == 0
+                && element["behaviors"][0]["value"]["submit"] == false
+        })
+        .expect("first option button");
+    let event = card_click(
+        option["behaviors"][0]["value"].clone(),
+        &message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已记录选择。")
+    );
+
+    let form = card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| element["tag"] == "form")
+        .expect("hybrid form");
+    let submit = form["elements"]
+        .as_array()
+        .expect("form elements")
+        .iter()
+        .find(|element| element["behaviors"][0]["value"]["submit"] == true)
+        .expect("hybrid submit");
+    let mut event = card_click(
+        submit["behaviors"][0]["value"].clone(),
+        &message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    event.action.form_value = Some(json!({ "q_0": "", "q_1": "custom", "q_2": "free" }));
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已提交。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after hybrid"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("hybrid-decision.json"))
+        .expect("the fake agent recorded the hybrid answer");
+    assert!(decision.contains("A"), "{decision}");
+    assert!(decision.contains("custom"), "{decision}");
+    assert!(decision.contains("free"), "{decision}");
+}
