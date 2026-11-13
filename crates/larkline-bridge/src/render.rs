@@ -1641,7 +1641,7 @@ pub fn question_text_card(input: &QuestionTextCardInput<'_>) -> Value {
             "name": format!("q_{index}"),
             "label": { "tag": "plain_text", "content": label },
             "placeholder": { "tag": "plain_text", "content": "输入你的回答" },
-            "max_length": 2_000,
+            "max_length": 1_000,
             "required": true,
         }));
     }
