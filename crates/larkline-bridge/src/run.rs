@@ -2303,11 +2303,9 @@ impl Bridge {
             operator,
             "approval decision accepted"
         );
-        Some(match choice {
-            PermissionChoice::Allow => "已允许，继续执行。".to_string(),
-            PermissionChoice::AllowSession => "已允许，本次会话不再询问。".to_string(),
-            PermissionChoice::Deny => "已拒绝。".to_string(),
-        })
+        // The card is updated by the run task with the actual outcome; do not
+        // claim the tool was allowed here, because a click can race the timeout.
+        Some("已收到你的选择。".to_string())
     }
 
     /// Handle a click on a user-question option or its submit button.

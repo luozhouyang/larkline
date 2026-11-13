@@ -1241,7 +1241,7 @@ printf '%s\n' '{"type":"result","session_id":"sess-appr"}'
     let event = card_click(button_value, &approval_message_id, "oc_flow", "ou_user");
     assert_eq!(
         bridge.handle_card_action(&event).await.as_deref(),
-        Some("已允许，继续执行。")
+        Some("已收到你的选择。")
     );
 
     wait_for(&transport, Duration::from_secs(4), |frames| {
@@ -1470,7 +1470,7 @@ for line in sys.stdin:
     );
     assert_eq!(
         bridge.handle_card_action(&event).await.as_deref(),
-        Some("已允许，本次会话不再询问。")
+        Some("已收到你的选择。")
     );
 
     wait_for(&transport, Duration::from_secs(4), |frames| {
@@ -1758,7 +1758,7 @@ printf '%s\n' '{"type":"result","session_id":"sess-session"}'
     );
     assert_eq!(
         bridge.handle_card_action(&event).await.as_deref(),
-        Some("已允许，本次会话不再询问。")
+        Some("已收到你的选择。")
     );
 
     wait_for(&transport, Duration::from_secs(4), |frames| {
