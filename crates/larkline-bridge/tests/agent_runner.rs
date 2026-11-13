@@ -407,6 +407,13 @@ for line in sys.stdin:
     }
     assert_eq!(view.best_answer(), "resumed");
     assert_eq!(view.session_key(), Some("thr_fallback"));
+    assert!(
+        view.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("无法恢复")),
+        "{:?}",
+        view.notice
+    );
     process.close_stdin().await;
     process.finish().await;
 

@@ -1904,3 +1904,93 @@ printf '%s\n' '{"type":"result","session_id":"sess-multi"}'
     assert!(decision.contains("A"), "{decision}");
     assert!(decision.contains("B"), "{decision}");
 }
+
+#[tokio::test]
+async fn question_card_collects_free_text_in_a_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/bin/sh
+read prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-text"}'
+printf '%s\n' '{"type":"control_request","request_id":"req-free","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"What should I name it?","header":"Name","multiSelect":false,"options":[]}]},"requires_user_interaction":true}}'
+read response
+printf '%s\n' "$response" > "$(dirname "$0")/free-decision.json"
+printf '%s\n' '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done after free text"}]}}'
+printf '%s\n' '{"type":"result","session_id":"sess-text"}'
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace",
+            "claude": { "permissionMode": "default" }
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+    bridge
+        .handle_message(message("om_free", "oc_flow", "name it"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| match frame {
+            Frame::Card { card, .. } => {
+                let text = card_json(card);
+                text.contains("\"tag\":\"form\"") && text.contains("answer:req-free")
+            }
+            _ => false,
+        })
+    })
+    .await;
+    let (message_id, card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("answer:req-free") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("text question card");
+    let form = card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| element["tag"] == "form")
+        .expect("question form");
+    let submit = form["elements"]
+        .as_array()
+        .expect("form elements")
+        .iter()
+        .find(|element| element["behaviors"][0]["value"]["submit"] == true)
+        .expect("form submit button");
+    let mut event = card_click(
+        submit["behaviors"][0]["value"].clone(),
+        &message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    event.action.form_value = Some(json!({ "q_0": "project-x" }));
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已提交。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after free text"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("free-decision.json"))
+        .expect("the fake agent recorded the free-text answer");
+    assert!(decision.contains("project-x"), "{decision}");
+}

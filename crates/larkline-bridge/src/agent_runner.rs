@@ -533,6 +533,7 @@ impl AgentProcess {
             model: spec.model.clone(),
             developer_instructions: Some(system_prompt),
         };
+        let mut resume_notice = None;
         let thread_id = match spec.session_id.as_deref() {
             Some(session_id) => {
                 let id = server.alloc_id();
@@ -550,6 +551,10 @@ impl AgentProcess {
                             error = %err,
                             "cannot resume the codex thread; starting a new one"
                         );
+                        let reason: String = err.to_string().chars().take(300).collect();
+                        resume_notice = Some(format!(
+                            "上次 Codex 会话无法恢复，已开启新会话。原因：{reason}"
+                        ));
                         let id = server.alloc_id();
                         let response = server
                             .request(thread_start_request(id, &config), SETUP_TIMEOUT)
@@ -587,6 +592,11 @@ impl AgentProcess {
             cwd: Some(spec.cwd.to_string_lossy().into_owned()),
             model: spec.model,
         });
+        if let Some(message) = resume_notice {
+            server
+                .pending_events
+                .push_back(AgentEvent::Notice { message });
+        }
 
         Ok(Self {
             child,

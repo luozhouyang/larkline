@@ -11,7 +11,7 @@ larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zar
 - 把飞书 / Lark 消息转发给本机 Claude Code 或 Codex CLI。可以私聊 bot，也可以在群里 `@bot`。
 - **流式卡片**：agent 工作期间，答案和工具摘要持续更新在同一张飞书卡片上；运行中的卡片带停止按钮。超过约 8.5 分钟后会自动接到一张新卡片继续展示，而不是静默停在旧卡片。
 - **会话延续**：每个聊天或话题线程恢复自己的 agent 会话；只有会话创建时使用的工作目录一致，才会恢复。
-- **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮，并写入磁盘，重启后自动恢复；`/stop` 会中断当前任务并丢弃排队消息。
+- **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮，并写入磁盘，重启后自动恢复，同时在聊天里提示恢复条数；`/stop` 会中断当前任务并丢弃排队消息。
 - **全局并发上限**：同一时间最多运行 `preferences.maxConcurrentRuns` 个 agent 任务（默认 10），超出的消息继续排队。
 - **按聊天/话题切换工作目录**：用 `/cd` 切换当前聊天或话题的工作目录，用 `/pwd` 查看。
 - **云文档评论**：在支持的文档评论（`doc`、`docx`、`sheet` 或 `file`）里 `@bot`，bridge 会在同一个评论线程里回复。评论任务可以由管理员用 `/stop comment:<hash>` 中断。应用需要订阅 `drive.notice.comment_add_v1` 事件。
@@ -313,9 +313,9 @@ profile 的 `permissions` 块决定 agent 的访问级别，以及工具调用�
 }
 ```
 
-- **Claude Code** 在 `default` 或 `acceptEdits` 下使用 stdio 权限询问协议。工具调用会发来一张独立卡片，展示命令/路径，并可展开参数。点「允许本次」会原样放行；点「本次会话都允许」会在 CLI 提供会话建议时发送；点「拒绝」会告诉模型用户拒绝了该操作。`plan` 和 `bypassPermissions` 不会询问，保持原来的一次性 stdin 路径。参数在 12KB 卡片预算内完整展示，超出时会带明显提示截断。
+- **Claude Code** 在 `default` 或 `acceptEdits` 下使用 stdio 权限询问协议。工具调用会发来一张独立卡片，展示 agent、工作目录、命令/路径，并可展开参数。点「允许本次」会原样放行；点「本次会话都允许」会在 CLI 提供会话建议时发送；点「拒绝」会告诉模型用户拒绝了该操作。`plan` 和 `bypassPermissions` 不会询问，保持原来的一次性 stdin 路径。参数在 12KB 卡片预算内完整展示，超出时会带明显提示截断。
 - **Codex** 在 `read-only` 或 `workspace-write` 下改用 `codex app-server`（`codex exec` 协议没有反向授权通道）。命令执行、文件修改和额外权限请求都走同一张授权卡片。`danger-full-access` 仍然使用 `codex exec`，不会询问。
-- **用户选择题**（`AskUserQuestion` 和 Codex `request_user_input`）走同一套卡片：选项变成按钮；多个问题逐个回答；多选问题提供提交按钮。答案会按 agent 原生格式回传。
+- **用户选择题**（`AskUserQuestion` 和 Codex `request_user_input`）走同一套卡片：选项变成按钮；多个问题逐个回答；多选问题提供提交按钮；自由文本问题会渲染带输入框的飞书表单。答案会按 agent 原生格式回传。
 - 只有本轮第一条消息的发送者可以点击按钮；其他人的点击会被拒绝。10 分钟未处理会自动拒绝；如果卡片发送失败，也会立即拒绝，避免 agent 一直卡住。授权/问题卡片是普通非流式消息，不受 8.5 分钟流式卡片限制影响。
 - 卡片发在当前聊天里，所以其他群成员也能看到命令和工具参数（只有发起人能点击）。如果工具参数敏感，请不要在群里做授权。
 - 评论和会议任务没有授权卡片流程，保持 agent 的非交互行为；如果这些场景需要执行工具，请为对应 profile 使用 full access。
@@ -392,8 +392,8 @@ markdown 模式、附件下载失败、8.5 分钟卡片接续，以及 Claude / 
 - **Session catalog**：不读也不写 `sessions.json.catalog.json`；恢复会话只按
   scope 和工作目录匹配。
 - **授权范围**：授权和问题卡片只接入了 IM run loop；评论和会议任务仍保持原来的
-  非交互行为。暂无编辑工具参数；没有选项、需要自由文本的问题会带提示跳过；群里
-  只有本轮第一条消息的发送者可以操作。
+  非交互行为。暂无编辑工具参数；选项和自由文本混合的问题会退化为提示；群里只有
+  本轮第一条消息的发送者可以操作。
 - **非 TS 附加项与剩余边界**：普通消息上尚未生效的访问控制边界（TypeScript
   owner 绕过、team 模式的普通消息放行、按聊天的 `chatRequireMention` 覆盖、
   普通消息上的 `allowedChats`）、Windows Authenticode 签名、Rust `ps` 条目的

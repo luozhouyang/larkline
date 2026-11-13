@@ -125,9 +125,10 @@ use crate::pending_store::PendingStore;
 use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
-    ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, QuestionCardInput, RunView,
-    approval_card, approval_decided_card, card_status, card_summary, question_card,
-    question_card_questions, question_decided_card, render_card,
+    ApprovalCardInput, Block, CardRenderOptions, MAX_CARD_TEXT_CHARS, QuestionCardInput,
+    QuestionTextCardInput, RunView, approval_card, approval_decided_card, card_status,
+    card_summary, question_card, question_card_questions, question_decided_card,
+    question_text_card, render_card,
 };
 use crate::reply;
 use crate::run_limit::{RunLimiter, RunPermit};
@@ -370,6 +371,7 @@ enum InteractionDecision {
         question_index: usize,
         option_index: usize,
         submit: bool,
+        texts: Vec<String>,
         by: String,
     },
 }
@@ -405,6 +407,8 @@ struct PendingQuestion {
     selected: Vec<Vec<usize>>,
     /// Single-select questions already answered.
     locked: Vec<bool>,
+    /// Free-text answers for form questions, in question order.
+    text_answers: Vec<String>,
     card_message_id: Option<String>,
 }
 
@@ -1440,8 +1444,29 @@ impl Bridge {
     /// see them immediately) but does not spawn a task in a constructor. The
     /// CLI calls this once the bridge is inside its runtime.
     pub fn resume_pending(self: &Arc<Self>) {
-        if lock(&self.pending).queued_scopes().is_empty() {
+        let scopes = lock(&self.pending).queued_scopes();
+        if scopes.is_empty() {
             return;
+        }
+        // Tell each conversation that the bridge is continuing work queued
+        // before a restart. This is best effort and must never delay the run.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let bridge = Arc::clone(self);
+            tokio::spawn(async move {
+                for (scope, count) in scopes {
+                    let chat_id = scope.split(':').next().unwrap_or(scope.as_str());
+                    let text = format!("🔄 已恢复 {count} 条重启前排队的消息，正在继续处理。");
+                    if let Err(err) =
+                        reply::send_text(&*bridge.transport, &scope, chat_id, None, text).await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            scope,
+                            "cannot announce the restored pending queue"
+                        );
+                    }
+                }
+            });
         }
         self.ensure_pending_driver();
         self.pending_wakeup.notify_one();
@@ -2192,7 +2217,14 @@ impl Bridge {
                 }
                 name if name.starts_with("answer:") => {
                     let clicker = action.operator.open_id.as_deref().unwrap_or_default();
-                    self.handle_answer_action(scope, name, value, clicker).await
+                    self.handle_answer_action(
+                        scope,
+                        name,
+                        value,
+                        action.action.form_value.as_ref(),
+                        clicker,
+                    )
+                    .await
                 }
                 _ => None,
             };
@@ -2284,6 +2316,7 @@ impl Bridge {
         scope: &str,
         action_name: &str,
         value: &serde_json::Map<String, Value>,
+        form_value: Option<&Value>,
         clicker: &str,
     ) -> Option<String> {
         let request_id = value.get("request_id").and_then(Value::as_str)?;
@@ -2295,6 +2328,23 @@ impl Bridge {
             .get("submit")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let question_count = value
+            .get("question_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let texts: Vec<String> = if submit && question_count > 0 {
+            let form = form_value.and_then(Value::as_object);
+            (0..question_count)
+                .map(|index| {
+                    form.and_then(|form| form.get(&format!("q_{index}")))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if answer_action(
             request_id,
             question_index,
@@ -2330,6 +2380,7 @@ impl Bridge {
                 question_index,
                 option_index,
                 submit,
+                texts,
                 by: clicker.to_string(),
             })
             .is_err()
@@ -2858,6 +2909,7 @@ impl Bridge {
                                 raw_input: raw_input.clone(),
                                 selected: vec![Vec::new(); questions.len()],
                                 locked: vec![false; questions.len()],
+                                text_answers: Vec::new(),
                                 card_message_id: None,
                             });
                         }
@@ -2927,6 +2979,7 @@ impl Bridge {
                                 &last_message_id,
                                 run_id,
                                 &operator,
+                                &format!("{} · {}", profile.agent_kind.display_name(), cwd_str),
                                 &request,
                                 allow_session,
                             )
@@ -3446,6 +3499,7 @@ impl Bridge {
         source_message_id: &str,
         run_id: u64,
         operator: &str,
+        context: &str,
         request: &PendingApproval,
         allow_session: bool,
     ) -> Option<String> {
@@ -3465,6 +3519,7 @@ impl Bridge {
             run_id,
             request_id: &request.request_id,
             tool_name: &request.tool_name,
+            context: Some(context),
             description: request.description.as_deref(),
             input_preview: &input_preview,
             input_json: &input_json,
@@ -3506,6 +3561,46 @@ impl Bridge {
         }
     }
 
+    /// Deliver one approval choice and build the wait outcome. Used by both
+    /// the normal decision branch and the timeout-boundary drain.
+    async fn finish_approval(
+        &self,
+        process: &mut AgentProcess,
+        request: &PendingApproval,
+        allow_session: bool,
+        choice: PermissionChoice,
+        by: String,
+    ) -> ApprovalWait {
+        let effective_choice = if choice == PermissionChoice::AllowSession && !allow_session {
+            PermissionChoice::Deny
+        } else {
+            choice
+        };
+        let response = match effective_choice {
+            PermissionChoice::Allow => PermissionResponse::Allow {
+                updated_input: request.input.clone(),
+            },
+            PermissionChoice::AllowSession => PermissionResponse::AllowForSession {
+                updated_input: request.input.clone(),
+                updated_permissions: request.suggestions.clone(),
+            },
+            PermissionChoice::Deny => PermissionResponse::Deny {
+                message: "用户拒绝了该操作。".to_string(),
+            },
+        };
+        if let Err(err) = process
+            .respond_to_permission(&request.request_id, response)
+            .await
+        {
+            tracing::warn!(error = %err, "cannot deliver the approval decision");
+            return ApprovalWait::Interrupted;
+        }
+        ApprovalWait::Answered {
+            choice: effective_choice,
+            by,
+        }
+    }
+
     /// Wait for the user's decision, the timeout, or `/stop`.
     ///
     /// The run loop is not reading stdout here: the agent is blocked on the
@@ -3525,7 +3620,43 @@ impl Bridge {
             tokio::select! {
                 biased;
                 _ = interrupt.wait() => return ApprovalWait::Interrupted,
+                decision = rx.recv() => {
+                    let Some(decision) = decision else {
+                        // The broker was dropped (run removed): treat it as a
+                        // stop so the loop kills the child and finalizes.
+                        return ApprovalWait::Interrupted;
+                    };
+                    let InteractionDecision::Approval { request_id, choice, by } = decision else {
+                        // A stale question click, or an answer for another
+                        // interaction; only one is active at a time.
+                        continue;
+                    };
+                    if request_id != request.request_id {
+                        // A stale click for an already-answered request.
+                        continue;
+                    }
+                    return self
+                        .finish_approval(process, request, allow_session, choice, by)
+                        .await;
+                }
                 _ = tokio::time::sleep_until(deadline) => {
+                    // A click can race the timeout; prefer a decision already
+                    // sitting in the channel before writing the denial.
+                    while let Ok(decision) = rx.try_recv() {
+                        if let InteractionDecision::Approval { request_id, choice, by } = decision {
+                            if request_id == request.request_id {
+                                return self
+                                    .finish_approval(
+                                        process,
+                                        request,
+                                        allow_session,
+                                        choice,
+                                        by,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
                     if let Err(err) = process
                         .respond_to_permission(
                             &request.request_id,
@@ -3543,52 +3674,6 @@ impl Bridge {
                         "approval timed out; denied automatically"
                     );
                     return ApprovalWait::TimedOut;
-                }
-                decision = rx.recv() => {
-                    let Some(decision) = decision else {
-                        // The broker was dropped (run removed): treat it as a
-                        // stop so the loop kills the child and finalizes.
-                        return ApprovalWait::Interrupted;
-                    };
-                    let InteractionDecision::Approval { request_id, choice, by } = decision else {
-                        // A stale question click, or an answer for another
-                        // interaction; only one is active at a time.
-                        continue;
-                    };
-                    if request_id != request.request_id {
-                        // A stale click for an already-answered request.
-                        continue;
-                    }
-                    let effective_choice = if choice == PermissionChoice::AllowSession
-                        && !allow_session
-                    {
-                        PermissionChoice::Deny
-                    } else {
-                        choice
-                    };
-                    let response = match effective_choice {
-                        PermissionChoice::Allow => PermissionResponse::Allow {
-                            updated_input: request.input.clone(),
-                        },
-                        PermissionChoice::AllowSession => PermissionResponse::AllowForSession {
-                            updated_input: request.input.clone(),
-                            updated_permissions: request.suggestions.clone(),
-                        },
-                        PermissionChoice::Deny => PermissionResponse::Deny {
-                            message: "用户拒绝了该操作。".to_string(),
-                        },
-                    };
-                    if let Err(err) = process
-                        .respond_to_permission(&request.request_id, response)
-                        .await
-                    {
-                        tracing::warn!(error = %err, "cannot deliver the approval decision");
-                        return ApprovalWait::Interrupted;
-                    }
-                    return ApprovalWait::Answered {
-                        choice: effective_choice,
-                        by,
-                    };
                 }
             }
         }
@@ -3690,13 +3775,24 @@ impl Bridge {
             .questions
             .iter()
             .enumerate()
-            .map(|(index, item)| QuestionAnswer {
-                question_id: item.id.clone(),
-                answers: question.selected[index]
-                    .iter()
-                    .filter_map(|option| item.options.get(*option))
-                    .map(|option| option.label.clone())
-                    .collect(),
+            .map(|(index, item)| {
+                let text = question
+                    .text_answers
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default();
+                QuestionAnswer {
+                    question_id: item.id.clone(),
+                    answers: if text.trim().is_empty() {
+                        question.selected[index]
+                            .iter()
+                            .filter_map(|option| item.options.get(*option))
+                            .map(|option| option.label.clone())
+                            .collect()
+                    } else {
+                        vec![text]
+                    },
+                }
             })
             .collect()
     }
@@ -3707,15 +3803,162 @@ impl Bridge {
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let answer = question.selected[index]
-                    .iter()
-                    .filter_map(|option| item.options.get(*option))
-                    .map(|option| option.label.clone())
-                    .collect::<Vec<_>>()
-                    .join("、");
+                let answer = question
+                    .text_answers
+                    .get(index)
+                    .cloned()
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        question.selected[index]
+                            .iter()
+                            .filter_map(|option| item.options.get(*option))
+                            .map(|option| option.label.clone())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    });
                 (item.question.clone(), answer)
             })
             .collect()
+    }
+
+    /// Collect free-text answers in a Feishu form card.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_text_question(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        operator: &str,
+        run_id: u64,
+        process: &mut AgentProcess,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<InteractionDecision>,
+        interrupt: &Arc<RunInterrupt>,
+        question: &mut PendingQuestion,
+    ) -> QuestionOutcome {
+        let action = answer_action(&question.request_id, 0, 0, true, operator, run_id);
+        let token = self.tokens.sign(scope, &action);
+        let timeout_minutes = self.approval_timeout.as_secs().div_ceil(60).max(1);
+        let value = question_text_card(&QuestionTextCardInput {
+            scope,
+            operator,
+            run_id,
+            request_id: &question.request_id,
+            questions: &question.questions,
+            submit_action: &action,
+            submit_token: &token,
+            timeout_minutes,
+        });
+        let Ok(card) = lark_channel::Card::from_value(value) else {
+            let _ = reply::send_text(
+                &*self.transport,
+                scope,
+                chat_id,
+                Some(source_message_id),
+                "无法创建文本回答卡片，已跳过本次提问。",
+            )
+            .await;
+            let _ = process
+                .respond_to_question(&question.request_id, &question.raw_input, &[])
+                .await;
+            return QuestionOutcome::Answered;
+        };
+        let message_id = match reply::send_card(
+            &*self.transport,
+            scope,
+            chat_id,
+            Some(source_message_id),
+            &card,
+        )
+        .await
+        {
+            Ok(id) => id.0,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot send the text question card");
+                let _ = process
+                    .respond_to_question(&question.request_id, &question.raw_input, &[])
+                    .await;
+                return QuestionOutcome::Answered;
+            }
+        };
+        question.card_message_id = Some(message_id.clone());
+        let deadline = tokio::time::Instant::now() + self.approval_timeout;
+        loop {
+            tokio::select! {
+                biased;
+                _ = interrupt.wait() => {
+                    let card = question_decided_card("⏹ 已停止", &[]);
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::Interrupted;
+                }
+                decision = rx.recv() => {
+                    let Some(decision) = decision else {
+                        return QuestionOutcome::Interrupted;
+                    };
+                    let InteractionDecision::Answer {
+                        request_id,
+                        submit,
+                        texts,
+                        by,
+                        ..
+                    } = decision else {
+                        continue;
+                    };
+                    if request_id != question.request_id || !submit {
+                        continue;
+                    }
+                    if texts.len() != question.questions.len()
+                        || texts.iter().any(|text| text.trim().is_empty())
+                    {
+                        // Keep the form intact so the user can retry; replacing
+                        // it with a status card would remove the input boxes.
+                        let _ = reply::send_text(
+                            &*self.transport,
+                            scope,
+                            chat_id,
+                            Some(source_message_id),
+                            "请填写所有问题后再提交。",
+                        )
+                        .await;
+                        continue;
+                    }
+                    question.text_answers = texts;
+                    let answers = Self::question_answers(question);
+                    if let Err(err) = process
+                        .respond_to_question(&question.request_id, &question.raw_input, &answers)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "cannot deliver the text answer");
+                        return QuestionOutcome::Interrupted;
+                    }
+                    tracing::info!(
+                        scope,
+                        request_id = %question.request_id,
+                        by,
+                        "text question answered"
+                    );
+                    let card = question_decided_card(
+                        "✅ 已回答",
+                        &Self::question_answer_pairs(question),
+                    );
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::Answered;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = process
+                        .respond_to_question(&question.request_id, &question.raw_input, &[])
+                        .await;
+                    let card = question_decided_card("⌛ 超时未回答", &[]);
+                    if let Ok(card) = lark_channel::Card::from_value(card) {
+                        let _ = self.transport.update_card_message(&message_id, &card).await;
+                    }
+                    return QuestionOutcome::TimedOut;
+                }
+            }
+        }
     }
 
     /// Collect answers to one question request. Cards are updated after every
@@ -3734,6 +3977,25 @@ impl Bridge {
         interrupt: &Arc<RunInterrupt>,
         question: &mut PendingQuestion,
     ) -> QuestionOutcome {
+        if question
+            .questions
+            .iter()
+            .all(|item| item.options.is_empty())
+        {
+            return self
+                .run_text_question(
+                    scope,
+                    chat_id,
+                    source_message_id,
+                    operator,
+                    run_id,
+                    process,
+                    rx,
+                    interrupt,
+                    question,
+                )
+                .await;
+        }
         if question
             .questions
             .iter()
@@ -3816,6 +4078,7 @@ impl Bridge {
                         question_index,
                         option_index,
                         submit,
+                        texts: _,
                         by,
                     } = decision else {
                         continue;
@@ -4617,6 +4880,17 @@ fn build_markdown_card(
             format!("⏳ 等待授权：{tool}\n\n{body}")
         };
     }
+    if let Some(notice) = view
+        .notice
+        .as_deref()
+        .filter(|notice| !notice.trim().is_empty())
+    {
+        body = if body.trim().is_empty() {
+            format!("⚠️ {notice}")
+        } else {
+            format!("⚠️ {notice}\n\n{body}")
+        };
+    }
     if paused {
         body = append_pause_note(body);
     }
@@ -4783,6 +5057,15 @@ fn text_final_body(profile: &ProfileConfig, view: &RunView) -> String {
         ..text_render_options(profile)
     };
     let body = render_text(view, options);
+    let body = if let Some(notice) = view
+        .notice
+        .as_deref()
+        .filter(|notice| !notice.trim().is_empty())
+    {
+        format!("⚠️ {notice}\n\n{body}")
+    } else {
+        body
+    };
     if body.trim().is_empty() {
         "（没有输出）".to_string()
     } else {
@@ -4819,6 +5102,15 @@ fn markdown_final_body(profile: &ProfileConfig, view: &RunView) -> String {
         ..markdown_render_options(profile)
     };
     let body = render_text(view, options);
+    let body = if let Some(notice) = view
+        .notice
+        .as_deref()
+        .filter(|notice| !notice.trim().is_empty())
+    {
+        format!("⚠️ {notice}\n\n{body}")
+    } else {
+        body
+    };
     if body.trim().is_empty() {
         "（没有输出）".to_string()
     } else {

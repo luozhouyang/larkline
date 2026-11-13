@@ -256,6 +256,28 @@ impl CodexAppServerTranslator {
                     }
                 }
             }
+            "error" => {
+                let message = params
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex returned an error");
+                let will_retry = params
+                    .get("willRetry")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if will_retry {
+                    vec![AgentEvent::Notice {
+                        message: format!("Codex：{}（将自动重试）", truncate_chars(message, 300)),
+                    }]
+                } else {
+                    self.finished = true;
+                    vec![AgentEvent::Error {
+                        message: truncate_chars(message, 400),
+                        termination_reason: TerminationReason::Failed,
+                    }]
+                }
+            }
             "item/agentMessage/delta" => {
                 let Some(delta) = params.get("delta").and_then(Value::as_str) else {
                     return Vec::new();
@@ -927,6 +949,43 @@ mod tests {
             }),
         );
         assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn error_notifications_are_retry_notices_or_terminal_errors() {
+        let mut translator = CodexAppServerTranslator::new();
+        let retry = translator.translate_notification(
+            "error",
+            &json!({
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "willRetry": true,
+                "error": { "message": "model overloaded" }
+            }),
+        );
+        assert!(
+            matches!(&retry[0], AgentEvent::Notice { message } if message.contains("model overloaded"))
+        );
+        assert!(!translator.is_finished());
+
+        let mut translator = CodexAppServerTranslator::new();
+        let failed = translator.translate_notification(
+            "error",
+            &json!({
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "willRetry": false,
+                "error": { "message": "auth failed" }
+            }),
+        );
+        assert!(matches!(
+            &failed[0],
+            AgentEvent::Error {
+                termination_reason: TerminationReason::Failed,
+                ..
+            }
+        ));
+        assert!(translator.is_finished());
     }
 
     #[test]

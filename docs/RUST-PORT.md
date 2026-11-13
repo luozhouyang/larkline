@@ -125,21 +125,24 @@ Ported:
 - workspace store per scope (`/cd`, `/pwd`), working reaction, pending queue
   with the 600 ms merge window, persisted through `pending.json` and restored
   on the next start (`Bridge::resume_pending` starts its driver after the
-  runtime is live)
+  runtime is live and posts a restored-count notice per scope)
 - IM approval cards for Claude Code `default`/`acceptEdits`: the adapter keeps
   stdin open and passes `--permission-prompt-tool stdio`; `can_use_tool`
   control requests become a standalone non-streaming card with signed
-  Allow/Allow-for-session/Deny buttons. Only the run's initiator can answer, a
-  click writes the `control_response` and resumes the CLI, ten minutes deny
-  automatically, and a failed card send denies immediately. Allow-for-session
+  Allow/Allow-for-session/Deny buttons and a short agent/cwd context line.
+  Only the run's initiator can answer, a click writes the `control_response`
+  and resumes the CLI, ten minutes deny automatically (a click already queued
+  at the boundary wins), and a failed card send posts a text fallback then
+  denies immediately. Allow-for-session
   sends the CLI's `permission_suggestions` as `updatedPermissions`.
   `plan`/`bypassPermissions` keep the one-shot path; comment/meeting runs set
   `AgentSpec.approvals = false` and keep their old one-shot behavior
 - user questions: Claude `AskUserQuestion` and Codex `item/tool/requestUserInput`
-  become option cards (one request at a time, multiple questions on the card, multi-select with a submit
-  button). Claude answers travel in `updatedInput.answers`; Codex answers use
-  the `answers[questionId].answers[]` payload. Free-text questions without
-  options are skipped with a visible notice for now. Approval parameters are
+  become option cards (one request at a time, multiple questions on the card,
+  multi-select with a submit button); free-text questions use a Feishu form
+  with input boxes. Claude answers travel in `updatedInput.answers`; Codex
+  answers use the `answers[questionId].answers[]` payload. Mixed
+  option/free-text questions fall back to a notice for now. Approval parameters are
   shown in full up to the Feishu card budget (12KB of raw JSON); larger inputs
   are truncated with a notice
 - Codex app-server transport for `read-only`/`workspace-write`: `codex
@@ -147,8 +150,9 @@ Ported:
   requests can reach the same approval card. The bridge initializes, starts or
   resumes the thread (`thread/start`/`thread/resume`), starts the turn and
   translates notifications into the shared event vocabulary; the thread id is
-  saved as the session. A failed resume falls back to a new thread, and
-  unsupported server requests are answered immediately. `danger-full-access`
+  saved as the session. A failed resume falls back to a new thread and posts a
+  visible notice; Codex `error` notifications become retry notices or terminal
+  failures. Unsupported server requests are answered immediately. `danger-full-access`
   keeps `codex exec --json` and `approval_policy=never`
 - in-chat commands: `/new`, `/reset`, `/cd`, `/pwd`, `/status`, `/config`,
   `/meeting`, `/stop`, `/stop <scope>`, `/timeout`, `/help`; `/cd` (admin) expands `~`,

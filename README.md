@@ -11,7 +11,7 @@ larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com
 - Forwards Feishu / Lark messages to a local Claude Code or Codex CLI. DM the bot directly, or `@`-mention it in a group.
 - **Streaming card**: the answer and a tool summary update on one Lark card while the agent works. Running cards carry a stop button. After about 8.5 minutes the run rolls over to a fresh card instead of going silent.
 - **Session continuity**: each chat or topic thread resumes its own agent session. A session is only resumed from the working directory it was created in.
-- **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. The queue is written through to disk and restored after a restart. `/stop` aborts the current run and drops its queued batch.
+- **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. The queue is written through to disk and restored after a restart; the chat gets a short restored-count notice. `/stop` aborts the current run and drops its queued batch.
 - **Global concurrency cap**: at most `preferences.maxConcurrentRuns` agent runs (default 10) are live at once; excess messages stay queued.
 - **Per-chat/topic working directory**: use `/cd` to switch the directory for the current chat or topic, and `/pwd` to inspect it.
 - **Cloud-doc comments**: `@`-mention the bot in a supported document comment (`doc`, `docx`, `sheet` or `file`) and it replies in the same thread. Comment runs are abortable by an admin with `/stop comment:<hash>`. The app must subscribe to `drive.notice.comment_add_v1`.
@@ -313,9 +313,9 @@ The profile's `permissions` block selects the agent's access and whether tool pr
 }
 ```
 
-- **Claude Code** with `default` or `acceptEdits` uses its stdio permission-prompt protocol. A tool prompt arrives as a separate card with the command/path and a collapsible parameters panel. `允许本次` echoes the original input; `本次会话都允许` sends the CLI's session suggestion when one is available; `拒绝` tells the model the user refused. `plan` and `bypassPermissions` never ask and keep the one-shot path. Parameters are shown in full up to a 12KB card budget; oversized inputs are cut with a visible notice.
+- **Claude Code** with `default` or `acceptEdits` uses its stdio permission-prompt protocol. A tool prompt arrives as a separate card showing the agent and working directory, the command/path, and a collapsible parameters panel. `允许本次` echoes the original input; `本次会话都允许` sends the CLI's session suggestion when one is available; `拒绝` tells the model the user refused. `plan` and `bypassPermissions` never ask and keep the one-shot path. Parameters are shown in full up to a 12KB card budget; oversized inputs are cut with a visible notice.
 - **Codex** with `read-only` or `workspace-write` runs through `codex app-server` (the plain `codex exec` protocol has no way to ask for approval). Command, file-change and additional-permission requests use the same card. `danger-full-access` keeps `codex exec` and never prompts.
-- **User questions** (`AskUserQuestion` and Codex `request_user_input`) use the same card channel: options become buttons, multiple questions are answered one by one, and multi-select questions get a submit button. Answers go back to the agent in its native shape.
+- **User questions** (`AskUserQuestion` and Codex `request_user_input`) use the same card channel: options become buttons, multiple questions are answered one by one, multi-select questions get a submit button, and free-text questions render a Feishu form with input boxes. Answers go back to the agent in its native shape.
 - Only the sender of the run's first message can answer; a click from anyone else is rejected. Ten minutes without a decision denies the tool/question automatically, and a card that cannot be sent is denied immediately. The approval/question card is a normal (non-streaming) message, so it is not affected by the 8.5-minute progress-card limit.
 - The card is posted in the chat, so other chat members can see the command and tool parameters (only the initiator can click). Do not use a group chat for approvals if the tool input is sensitive.
 - Comment and meeting runs do not have an approval-card flow; they keep the agent's non-interactive behavior. Run those scopes with full access if the agent needs to execute tools there.
@@ -395,8 +395,8 @@ items remain:
   resume is keyed by scope and working directory.
 - **Approval scope**: approval and question cards are wired into the IM run
   loop only; comment and meeting runs keep the old non-interactive behavior.
-  Tool input is not editable, free-text questions without options are skipped
-  with a notice, and in a group only the run's first sender can approve.
+  Tool input is not editable, mixed option/free-text questions fall back to a
+  notice, and in a group only the run's first sender can approve.
 - **Non-TS extras and remaining parity edges**: access-control edges (the
   TypeScript owner bypass for ordinary messages, team-mode usage for ordinary
   messages, per-chat `chatRequireMention` overrides and `allowedChats` on

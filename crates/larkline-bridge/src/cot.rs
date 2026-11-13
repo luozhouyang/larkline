@@ -240,7 +240,8 @@ impl CotStream {
             AgentEvent::FinalText { .. } => Vec::new(),
             AgentEvent::PermissionRequest { .. }
             | AgentEvent::QuestionRequest { .. }
-            | AgentEvent::PermissionCancelled { .. } => Vec::new(),
+            | AgentEvent::PermissionCancelled { .. }
+            | AgentEvent::Notice { .. } => Vec::new(),
             AgentEvent::Done { .. } | AgentEvent::Error { .. } => Vec::new(),
         }
     }

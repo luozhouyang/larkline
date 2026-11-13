@@ -267,6 +267,9 @@ pub struct RunView {
     /// Tool name while the run is blocked on an approval card. Drives the
     /// "⏳ 等待授权" line in the progress card; cleared when the decision lands.
     pub pending_approval: Option<String>,
+    /// Non-terminal warning shown above the run content (Codex retry, failed
+    /// resume, ...); final cards keep it so the user knows what happened.
+    pub notice: Option<String>,
     /// Minutes reported by the idle-timeout notice (TS `state.idleTimeoutMinutes`).
     pub idle_timeout_minutes: Option<u64>,
     pub session_id: Option<String>,
@@ -292,6 +295,7 @@ impl Default for RunView {
             footer_status: Some(FooterStatus::Thinking),
             continuation_note: None,
             pending_approval: None,
+            notice: None,
             idle_timeout_minutes: None,
             session_id: None,
             thread_id: None,
@@ -437,6 +441,9 @@ impl RunView {
             }
             // Approval prompts are rendered as a separate card and tracked by
             // the run loop; they do not change the agent output view.
+            AgentEvent::Notice { message } => {
+                self.notice = Some(message.clone());
+            }
             AgentEvent::PermissionRequest { .. }
             | AgentEvent::QuestionRequest { .. }
             | AgentEvent::PermissionCancelled { .. } => {}
@@ -761,6 +768,13 @@ fn build_elements(view: &RunView, options: &CardRenderOptions, detail: CardDetai
         {
             elements.push(notation(format!("⏳ 等待授权：{tool}")));
         }
+    }
+    if let Some(notice) = view
+        .notice
+        .as_deref()
+        .filter(|notice| !notice.trim().is_empty())
+    {
+        elements.push(notation(format!("⚠️ {}", mask_emails(notice))));
     }
 
     if options.reasoning {
@@ -1266,6 +1280,8 @@ pub struct ApprovalCardInput<'a> {
     pub run_id: u64,
     pub request_id: &'a str,
     pub tool_name: &'a str,
+    /// Short run context (`Claude Code · /work/repo`).
+    pub context: Option<&'a str>,
     pub description: Option<&'a str>,
     /// One-line command/path preview shown above the full input.
     pub input_preview: &'a str,
@@ -1301,6 +1317,13 @@ pub fn approval_card(input: &ApprovalCardInput<'_>) -> Value {
         "tag": "markdown",
         "content": format!("🔐 **需要授权：{}**", input.tool_name),
     })];
+    if let Some(context) = input.context.filter(|text| !text.trim().is_empty()) {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": mask_emails(context),
+            "text_size": "notation",
+        }));
+    }
     if let Some(description) = input.description.filter(|text| !text.trim().is_empty()) {
         elements.push(json!({
             "tag": "markdown",
@@ -1574,6 +1597,95 @@ pub fn question_decided_card(status: &str, answers: &[(String, String)]) -> Valu
             "summary": { "content": status }
         },
         "body": { "elements": elements }
+    })
+}
+
+/// A form card for questions that need free-text answers (Codex
+/// `request_user_input` without options, or any question with no options).
+pub struct QuestionTextCardInput<'a> {
+    pub scope: &'a str,
+    pub operator: &'a str,
+    pub run_id: u64,
+    pub request_id: &'a str,
+    pub questions: &'a [UserQuestion],
+    pub submit_action: &'a str,
+    pub submit_token: &'a str,
+    pub timeout_minutes: u64,
+}
+
+pub fn question_text_card(input: &QuestionTextCardInput<'_>) -> Value {
+    let mut intro = vec![json!({
+        "tag": "markdown",
+        "content": "🙋 **需要你的回答**",
+    })];
+    let mut form_elements = Vec::new();
+    for (index, question) in input.questions.iter().enumerate() {
+        if !question.header.trim().is_empty() {
+            intro.push(json!({
+                "tag": "markdown",
+                "content": format!("**{}**", mask_emails(&question.header)),
+                "text_size": "notation",
+            }));
+        }
+        intro.push(json!({
+            "tag": "markdown",
+            "content": format!("{}. {}", index + 1, mask_emails(&question.question)),
+        }));
+        let label = if question.header.trim().is_empty() {
+            format!("问题 {}", index + 1)
+        } else {
+            mask_emails(&question.header)
+        };
+        form_elements.push(json!({
+            "tag": "input",
+            "name": format!("q_{index}"),
+            "label": { "tag": "plain_text", "content": label },
+            "placeholder": { "tag": "plain_text", "content": "输入你的回答" },
+            "max_length": 2_000,
+            "required": true,
+        }));
+    }
+    form_elements.push(json!({
+        "tag": "button",
+        "name": "submit",
+        "text": { "tag": "plain_text", "content": "提交回答" },
+        "type": "primary",
+        "form_action_type": "submit",
+        "behaviors": [{ "type": "callback", "value": {
+            "__bridge_cb": true,
+            "action": input.submit_action,
+            "scope": input.scope,
+            "operator": input.operator,
+            "run_id": input.run_id,
+            "request_id": input.request_id,
+            "question_count": input.questions.len(),
+            "question_index": 0,
+            "option_index": 0,
+            "submit": true,
+            "token": input.submit_token,
+        } }]
+    }));
+    intro.push(json!({
+        "tag": "form",
+        "name": "question_form",
+        "elements": form_elements,
+    }));
+    intro.push(json!({
+        "tag": "markdown",
+        "content": format!(
+            "仅发起本次任务的用户可以操作；{} 分钟内未回答将自动拒绝。",
+            input.timeout_minutes
+        ),
+        "text_size": "notation"
+    }));
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "streaming_mode": false,
+            "summary": { "content": "等待你的回答" }
+        },
+        "body": { "elements": intro }
     })
 }
 
@@ -2755,6 +2867,7 @@ mod tests {
             run_id: 7,
             request_id: "req-1",
             tool_name: "Bash",
+            context: Some("Claude Code · /work"),
             description: Some("run a command"),
             input_preview: "echo me@example.com",
             input_json: r#"{"command":"echo me@example.com"}"#,

@@ -152,6 +152,9 @@ pub enum AgentEvent {
         /// echo the questions alongside the `answers` map.
         raw_input: Value,
     },
+    /// A non-terminal warning worth showing to the user (for example a Codex
+    /// error that will be retried, or a failed thread resume).
+    Notice { message: String },
     /// A pending permission/question request was withdrawn by the agent.
     PermissionCancelled { request_id: String },
     /// The final answer, when the protocol distinguishes it from commentary.
