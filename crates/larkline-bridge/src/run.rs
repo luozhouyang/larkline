@@ -3327,7 +3327,7 @@ impl Bridge {
                         }
                     } else {
                         PermissionResponse::Deny {
-                            message: format!("用户（{}）拒绝了该操作。", decision.by),
+                            message: "用户拒绝了该操作。".to_string(),
                         }
                     };
                     if let Err(err) = process

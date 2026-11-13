@@ -317,6 +317,7 @@ The profile's `permissions` block selects the agent's access and whether tool pr
 - **Codex** with `read-only` or `workspace-write` runs through `codex app-server` (the plain `codex exec` protocol has no way to ask for approval). Command, file-change and additional-permission requests use the same card. `danger-full-access` keeps `codex exec` and never prompts.
 - Only the sender of the run's first message can answer; a click from anyone else is rejected. Ten minutes without a decision denies the tool automatically, and a card that cannot be sent is denied immediately. The approval card is a normal (non-streaming) message, so it is not affected by the 8.5-minute progress-card limit.
 - Comment and meeting runs do not have an approval-card flow; they keep the agent's non-interactive behavior. Run those scopes with full access if the agent needs to execute tools there.
+- This needs a recent Claude Code with the stdio permission-prompt protocol, or a recent Codex with `codex app-server`. `larkline doctor` does not probe the approval protocol; if the installed CLI is too old, the run reports the CLI's error instead of silently auto-approving.
 
 ### Access control
 

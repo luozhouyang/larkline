@@ -317,6 +317,7 @@ profile 的 `permissions` 块决定 agent 的访问级别，以及工具调用�
 - **Codex** 在 `read-only` 或 `workspace-write` 下改用 `codex app-server`（`codex exec` 协议没有反向授权通道）。命令执行、文件修改和额外权限请求都走同一张授权卡片。`danger-full-access` 仍然使用 `codex exec`，不会询问。
 - 只有本轮第一条消息的发送者可以点击按钮；其他人的点击会被拒绝。10 分钟未处理会自动拒绝；如果授权卡片发送失败，也会立即拒绝，避免 agent 一直卡住。授权卡片是普通非流式消息，不受 8.5 分钟流式卡片限制影响。
 - 评论和会议任务没有授权卡片流程，保持 agent 的非交互行为；如果这些场景需要执行工具，请为对应 profile 使用 full access。
+- 需要较新的 Claude Code（支持 stdio 权限询问协议）或较新的 Codex（支持 `codex app-server`）。`larkline doctor` 不会探测授权协议；如果本地 CLI 版本太旧，run 会直接报出 CLI 的错误，而不是静默自动放行。
 
 ### 访问控制
 
