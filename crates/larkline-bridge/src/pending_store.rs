@@ -23,10 +23,9 @@
 //!   session and callback-nonce stores.
 //! * A corrupt, unreadable or future-version file is logged and treated as
 //!   empty. Persistence must never stop the bridge from starting.
-//! * TTL is measured from the file's `savedAt`. The bridge rewrites the file
-//!   on every queue change, so the age of a restored batch is bounded by the
-//!   queue's last mutation; a profile that has been down longer than the TTL
-//!   starts with an empty queue.
+//! * TTL is measured per message from its first enqueue (`queuedAtMs`), not
+//!   from the file's `savedAt`. Re-saving an older message keeps its original
+//!   timestamp, so a busy queue cannot keep stale work alive indefinitely.
 //!
 //! ## Delivery semantics
 //!
@@ -36,9 +35,10 @@
 //! it and producing a duplicate answer. This mirrors the user's expectation
 //! that a resend is safer than a duplicate turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lark_channel::message::NormalizedMessage;
@@ -96,10 +96,16 @@ pub struct LoadedPending {
 }
 
 /// File-backed pending queue.
+///
+/// `queued_at` is tracked per message, not per file: the bridge rewrites the
+/// file on every queue mutation, and using the file's `savedAt` would let an
+/// old message survive indefinitely while other messages keep the queue busy.
+/// The map is shared by clones because the store is small and process-local.
 #[derive(Debug, Clone)]
 pub struct PendingStore {
     path: PathBuf,
     ttl: Duration,
+    queued_at: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl PendingStore {
@@ -108,6 +114,7 @@ impl PendingStore {
         Self {
             path: path.into(),
             ttl: DEFAULT_PENDING_TTL,
+            queued_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,6 +138,12 @@ impl PendingStore {
     /// logged and treated as empty so a bad state file can never block the
     /// bridge from starting.
     pub fn load(&self, now_ms: i64) -> LoadedPending {
+        // A previous load's timestamps must not leak into this one; every
+        // early return (missing, corrupt, future version) starts clean.
+        self.queued_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let mut loaded = LoadedPending::default();
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -170,24 +183,31 @@ impl PendingStore {
             loaded.stats.corrupt = true;
             return loaded;
         }
-        if !self.ttl.is_zero() && file.saved_at_ms > 0 {
-            let age_ms = now_ms.saturating_sub(file.saved_at_ms);
-            if age_ms > self.ttl.as_millis() as i64 {
-                tracing::info!(
-                    age_ms,
-                    ttl_ms = self.ttl.as_millis() as i64,
-                    "pending queue is older than its TTL; dropping it"
-                );
-                loaded.stats.expired = file.scopes.values().map(|messages| messages.len()).sum();
-                return loaded;
-            }
-        }
-
+        let ttl_ms = self.ttl.as_millis() as i64;
+        let mut timestamps = self
+            .queued_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (scope, stored) in file.scopes {
             let mut messages = Vec::with_capacity(stored.len());
             for entry in stored {
+                // Older files (or hand-written tests) may omit queuedAtMs;
+                // fall back to the file timestamp so they still age out.
+                let queued_at = if entry.queued_at_ms > 0 {
+                    entry.queued_at_ms
+                } else {
+                    file.saved_at_ms
+                };
+                if !self.ttl.is_zero() && queued_at > 0 && now_ms.saturating_sub(queued_at) > ttl_ms
+                {
+                    loaded.stats.expired += 1;
+                    continue;
+                }
                 match serde_json::from_value::<NormalizedMessage>(entry.message) {
-                    Ok(message) => messages.push(message),
+                    Ok(message) => {
+                        timestamps.insert(message.message_id.clone(), queued_at);
+                        messages.push(message);
+                    }
                     Err(err) => {
                         loaded.stats.invalid += 1;
                         tracing::warn!(
@@ -221,12 +241,23 @@ impl PendingStore {
             saved_at_ms: now_ms,
             scopes: BTreeMap::new(),
         };
+        let mut timestamps = self
+            .queued_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut live_ids = HashSet::new();
         for (scope, messages) in scopes {
             if messages.is_empty() {
                 continue;
             }
             let mut stored = Vec::with_capacity(messages.len());
             for message in messages {
+                let queued_at = timestamps
+                    .get(&message.message_id)
+                    .copied()
+                    .unwrap_or(now_ms);
+                live_ids.insert(message.message_id.clone());
+                timestamps.insert(message.message_id.clone(), queued_at);
                 let mut value = serde_json::to_value(message)
                     .map_err(|err| format!("cannot serialize a pending message: {err}"))?;
                 if let Some(object) = value.as_object_mut() {
@@ -235,12 +266,15 @@ impl PendingStore {
                     }
                 }
                 stored.push(StoredMessage {
-                    queued_at_ms: now_ms,
+                    queued_at_ms: queued_at,
                     message: value,
                 });
             }
             file.scopes.insert(scope.clone(), stored);
         }
+        // Keep only messages still waiting; once a batch is claimed it must
+        // not resurrect a stale timestamp on a later enqueue with the same id.
+        timestamps.retain(|id, _| live_ids.contains(id));
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|err| format!("cannot encode the pending queue: {err}"))?;
         write_atomic(&self.path, &bytes, PENDING_FILE_MODE)
@@ -329,6 +363,45 @@ mod tests {
         let loaded = store.load(then + 61_000);
         assert!(loaded.scopes.is_empty());
         assert_eq!(loaded.stats.expired, 1);
+    }
+
+    #[test]
+    fn expires_each_message_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            PendingStore::new(dir.path().join("pending.json")).with_ttl(Duration::from_secs(60));
+        let then = 1_700_000_000_000;
+        store
+            .save(
+                &[("oc_a".to_string(), vec![message("om_old", "oc_a", "old")])],
+                then,
+            )
+            .unwrap();
+        // A later queue mutation must not refresh the old message's age.
+        store
+            .save(
+                &[(
+                    "oc_a".to_string(),
+                    vec![
+                        message("om_old", "oc_a", "old"),
+                        message("om_new", "oc_a", "new"),
+                    ],
+                )],
+                then + 120_000,
+            )
+            .unwrap();
+
+        let loaded = store.load(then + 130_000);
+        assert_eq!(loaded.stats.expired, 1);
+        assert_eq!(loaded.stats.restored, 1);
+        assert_eq!(loaded.scopes.len(), 1);
+        let (_, messages) = &loaded.scopes[0];
+        assert_eq!(messages[0].text, "new");
+
+        let raw_file = fs::read_to_string(store.path()).unwrap();
+        let parsed: Value = serde_json::from_str(&raw_file).unwrap();
+        assert_eq!(parsed["scopes"]["oc_a"][0]["queuedAtMs"], then);
+        assert_eq!(parsed["scopes"]["oc_a"][1]["queuedAtMs"], then + 120_000);
     }
 
     #[test]
