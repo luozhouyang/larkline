@@ -2940,6 +2940,14 @@ impl Bridge {
                                 request_id = %request.request_id,
                                 "cannot present an approval card; denying the tool"
                             );
+                            let _ = reply::send_text(
+                                &*self.transport,
+                                &scope,
+                                &chat_id,
+                                Some(&last_message_id),
+                                "无法创建授权卡片，已自动拒绝本次工具调用。",
+                            )
+                            .await;
                             if let Err(err) = process
                                 .respond_to_permission(
                                     &request.request_id,

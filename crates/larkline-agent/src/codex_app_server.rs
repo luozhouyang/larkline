@@ -377,10 +377,15 @@ impl CodexAppServerTranslator {
                         .and_then(Value::as_array)
                         .map(|changes| changes.len())
                         .unwrap_or(0);
+                    let (output, is_error) = match status {
+                        "completed" => (format!("已应用 {files} 个文件变更"), false),
+                        "declined" => ("用户拒绝了文件变更".to_string(), true),
+                        _ => (format!("文件变更失败（{files} 个文件）"), true),
+                    };
                     vec![AgentEvent::ToolResult {
                         id: id.to_string(),
-                        output: format!("已应用 {files} 个文件变更"),
-                        is_error: status == "failed",
+                        output,
+                        is_error,
                     }]
                 } else {
                     if !self.started_items.insert(id.to_string()) {
@@ -417,7 +422,7 @@ impl CodexAppServerTranslator {
                     vec![AgentEvent::ToolResult {
                         id: id.to_string(),
                         output: truncate_chars(&output, 2_000),
-                        is_error: status == "failed",
+                        is_error: status != "completed",
                     }]
                 } else {
                     if !self.started_items.insert(id.to_string()) {
