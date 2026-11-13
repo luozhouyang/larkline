@@ -9,14 +9,15 @@ larkline is a fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com
 ## What it does
 
 - Forwards Feishu / Lark messages to a local Claude Code or Codex CLI. DM the bot directly, or `@`-mention it in a group.
-- **Streaming card**: the answer and a tool summary update on one Lark card while the agent works. Running cards carry a stop button.
+- **Streaming card**: the answer and a tool summary update on one Lark card while the agent works. Running cards carry a stop button. After about 8.5 minutes the run rolls over to a fresh card instead of going silent.
 - **Session continuity**: each chat or topic thread resumes its own agent session. A session is only resumed from the working directory it was created in.
-- **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. `/stop` aborts the current run and drops its queued batch.
+- **Queueing and batching**: messages sent in quick succession run as one turn; messages that arrive during a run wait for the next one. The queue is written through to disk and restored after a restart. `/stop` aborts the current run and drops its queued batch.
 - **Global concurrency cap**: at most `preferences.maxConcurrentRuns` agent runs (default 10) are live at once; excess messages stay queued.
 - **Per-chat/topic working directory**: use `/cd` to switch the directory for the current chat or topic, and `/pwd` to inspect it.
 - **Cloud-doc comments**: `@`-mention the bot in a supported document comment (`doc`, `docx`, `sheet` or `file`) and it replies in the same thread. Comment runs are abortable by an admin with `/stop comment:<hash>`. The app must subscribe to `drive.notice.comment_add_v1`.
 - **In-meeting agent (opt-in)**: join a Feishu meeting, answer in-meeting or over IM, and produce notes from the live transcript. Meeting runs are abortable by an admin with `/stop meeting:<id>`.
-- **Long-running tasks**: Feishu stops accepting updates for a streaming card after about 10 minutes. larkline stops updating at 8.5 minutes and sends the final answer as a separate message, so a long run never ends silently.
+- **Approval cards**: when the agent works with a non-skip permission mode, tool prompts become a card with Allow/Deny buttons. Only the person who started the run can answer; unanswered prompts are denied after ten minutes. See [Permissions and approvals](#permissions-and-approvals).
+- **Long-running tasks**: Feishu stops accepting updates for a streaming card after about 10 minutes. larkline rolls the progress over to a new card at 8.5 minutes, so a long run keeps showing progress and the final answer lands on the latest card.
 - **OS-managed service**: run in the foreground for debugging, then install a per-profile launchd, systemd or Task Scheduler service.
 - **Multiple profiles**: keep separate PersonalAgent apps, agents, sessions and workspaces on one machine.
 - **Encrypted App Secret**: the App Secret is stored in a local encrypted keystore, never in plaintext in `config.json`.
@@ -216,13 +217,13 @@ Notes:
 
 `/config set messageReply` controls how the final answer is delivered:
 
-- **`card`** — one CardKit streaming card is created and updated while the agent runs. The card shows the answer and a compact tool summary, plus a stop button while the run is live.
+- **`card`** — a CardKit streaming card is created and updated while the agent runs. The card shows the answer and a compact tool summary, plus a stop button while the run is live. A run longer than about 8.5 minutes continues on a fresh card.
 - **`markdown`** — the default. The current Rust build also uses the card renderer for this mode, and falls back to a plain message when the card can no longer be updated.
 - **`text`** — no card. The bridge sends one plain-text message when the run finishes.
 
 `showToolCalls` controls whether the tool summary appears in the final card or text reply. It does not change what the agent does.
 
-Feishu force-finalizes a streaming card about 10 minutes after creation and drops later updates. larkline keeps updating until 8.5 minutes, then stops and delivers the final answer as a new message. This is a server-side limit, so it applies to desktop and mobile clients alike.
+Feishu force-finalizes a streaming card about 10 minutes after creation and drops later updates. larkline keeps updating until 8.5 minutes, then starts a new card, marks the old one `⏭ 过程已接续到下一张卡片`, and continues with `↪ 接续上一张卡片` on the new card. The final answer is written on the latest card. If the new card cannot be created, the bridge falls back to stopping updates and sending the final answer as a separate message. This is a server-side limit, so it applies to desktop and mobile clients alike.
 
 ### Concurrency
 
@@ -298,6 +299,25 @@ The profile may define a default working directory at `workspaces.default`. If i
 
 The working directory is the current directory for an agent run, not a filesystem sandbox. Actual file access still depends on the agent process and its permissions.
 
+### Permissions and approvals
+
+The profile's `permissions` block selects the agent's access and whether tool prompts become cards:
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "workspace",
+    "claude": { "permissionMode": "default" }
+  }
+}
+```
+
+- **Claude Code** with `default` or `acceptEdits` uses its stdio permission-prompt protocol. A tool prompt arrives as a separate card with the command/path and a collapsible full-parameters panel. `Allow` echoes the original input; `Deny` tells the model the user refused. `plan` and `bypassPermissions` never ask and keep the one-shot path.
+- **Codex** with `read-only` or `workspace-write` runs through `codex app-server` (the plain `codex exec` protocol has no way to ask for approval). Command, file-change and additional-permission requests use the same card. `danger-full-access` keeps `codex exec` and never prompts.
+- Only the sender of the run's first message can answer; a click from anyone else is rejected. Ten minutes without a decision denies the tool automatically, and a card that cannot be sent is denied immediately. The approval card is a normal (non-streaming) message, so it is not affected by the 8.5-minute progress-card limit.
+- Comment and meeting runs do not have an approval-card flow; they keep the agent's non-interactive behavior. Run those scopes with full access if the agent needs to execute tools there.
+
 ### Access control
 
 The Rust bridge implements a subset of the TypeScript access model:
@@ -330,6 +350,7 @@ The app needs the VC bot scopes, and the tenant must support the VC bot capabili
 | `~/.larkline/config.json` | Root config: `activeProfile` and `profiles` |
 | `~/.larkline/profiles/<profile>/sessions.json` | Resumable session per chat/topic scope |
 | `~/.larkline/profiles/<profile>/workspaces.json` | Per-scope working directory overrides |
+| `~/.larkline/profiles/<profile>/pending.json` | Durable per-scope message queue (24-hour TTL, mode 0600) |
 | `~/.larkline/profiles/<profile>/secrets.enc` | Encrypted App Secret and other secrets |
 | `~/.larkline/profiles/<profile>/.keystore.salt` | Per-profile keystore salt |
 | `~/.larkline/profiles/<profile>/logs/daemon/` | Daemon stdout/stderr logs |
@@ -381,7 +402,7 @@ See [Rust port notes](./docs/RUST-PORT.md) for the current status and the reason
 
 **The bot is silent, or the local agent never replies.** Run `larkline doctor` first. Then check that the agent CLI is installed and logged in, and send `/status` to see the current cwd and whether a session is resumable. `/new` often fixes a stale session.
 
-**The card stops updating and no answer arrives.** If the run passed about 8.5 minutes, this is the card-lifetime guard: the bridge stops updating the card and sends the final answer as a new message. Wait for the run to finish instead of expecting further card updates.
+**The card stops updating and no answer arrives.** If the run passed about 8.5 minutes, look for a newer card in the same chat: the bridge rolls the progress over to a fresh card and puts the final answer there. Only if that new card could not be created does it fall back to sending the final answer as a separate message.
 
 **Can I use Claude Code for one bot and Codex for another?** Yes. Create two profiles with different `--agent` values and run one service per profile. The agent kind is set at profile creation; create a new profile if you need to switch it.
 

@@ -23,8 +23,13 @@ in [`README.md`](../README.md) and [`README.zh.md`](../README.zh.md).
 
 1. **State directory** — same as `src/config/app-paths.ts`:
    `config.json`, `profiles/<name>/{sessions.json,workspaces.json,
-   callback-nonces.json,secrets.enc,.keystore.salt,logs}`,
-   `registry/{processes.json,locks}` and the `secrets-getter` wrapper. `~/.lark-channel` is renamed to `~/.larkline` on
+   pending.json,callback-nonces.json,secrets.enc,.keystore.salt,logs}`,
+   `registry/{processes.json,locks}` and the `secrets-getter` wrapper.
+   `pending.json` is a write-through copy of the per-scope debounce queue
+   (mode 0600, 24-hour TTL, raw platform payload stripped, corrupt files
+   treated as empty); a restart re-checks the access policy and resumes the
+   queue. Delivery is at-most-once: a claimed batch leaves the file before the
+   agent starts. `~/.lark-channel` is renamed to `~/.larkline` on
    first start with the default home when the new directory is absent.
    `LARKLINE_HOME` / `LARK_CHANNEL_HOME` and `LARKLINE_PROFILE` /
    `LARK_CHANNEL_PROFILE` both work.
@@ -64,8 +69,11 @@ Ported:
   progress message (`card` = rich card, `markdown` = one-element streaming
   markdown card, `text` = final message only) -> agent process -> event
   translation -> throttled updates -> session persistence; at the 8.5-minute
-  card safe age the progress frame is paused once (streaming off, no button,
-  pause note) and the full answer is sent separately when the run finishes
+  card safe age a fresh streaming card is created and the run continues there
+  (the old card is finalized with a `⏭ 过程已接续到下一张卡片` note, the new
+  one starts with `↪ 接续上一张卡片`, and the final answer lands on the new
+  card). If the new card cannot be created the old pause behavior remains:
+  streaming off, no button, a pause note, and the full answer sent separately
 - rich card content model (port of `src/card/run-renderer.ts` and
   `src/card/tool-render.ts`): reasoning panel (open while thinking, 3000-char
   body), one collapsible panel per tool call (✅/❌/⏳ header, red error border,
@@ -115,7 +123,25 @@ Ported:
   mid-run update failure also sends the TS degraded notice
   (`COT 过程消息更新失败…`)
 - workspace store per scope (`/cd`, `/pwd`), working reaction, pending queue
-  with the 600 ms merge window
+  with the 600 ms merge window, persisted through `pending.json` and restored
+  on the next start (`Bridge::resume_pending` starts its driver after the
+  runtime is live)
+- IM approval cards for Claude Code `default`/`acceptEdits`: the adapter keeps
+  stdin open and passes `--permission-prompt-tool stdio`; `can_use_tool`
+  control requests become a standalone non-streaming card with signed
+  Allow/Deny buttons. Only the run's initiator can answer, a click writes the
+  `control_response` and resumes the CLI, ten idle minutes deny automatically,
+  and a failed card send denies immediately. `plan` and `bypassPermissions`
+  keep the one-shot path; comment/meeting runs set `AgentSpec.approvals =
+  false` and keep their old one-shot behavior
+- Codex app-server transport for `read-only`/`workspace-write`: `codex
+  app-server` replaces `codex exec` so command, file-change and permission
+  requests can reach the same approval card. The bridge initializes, starts or
+  resumes the thread (`thread/start`/`thread/resume`), starts the turn and
+  translates notifications into the shared event vocabulary; the thread id is
+  saved as the session. A failed resume falls back to a new thread, and
+  unsupported server requests are answered immediately. `danger-full-access`
+  keeps `codex exec --json` and `approval_policy=never`
 - in-chat commands: `/new`, `/reset`, `/cd`, `/pwd`, `/status`, `/config`,
   `/meeting`, `/stop`, `/stop <scope>`, `/timeout`, `/help`; `/cd` (admin) expands `~`,
   interrupts the live run and resets the session; `/new` interrupts before
@@ -156,7 +182,13 @@ Ported:
   answer), cooperative `/stop` (terminal `⏹ 已被中断` card with the partial
   answer and no live button), idle-watchdog timeout (terminal notice, no
   button), markdown mode (one markdown element, no tool panel/footer element or
-  stop button) and a failing attachment download that does not fail the run
+  stop button), a failing attachment download that does not fail the run, the
+  8.5-minute card rollover, a Claude approval click-through plus a
+  non-initiator rejection, the ten-minute auto-deny, and a Codex app-server
+  command approval click-through
+- agent-runner integration tests cover the Claude control frames and the Codex
+  app-server JSON-RPC round trip, including resume fallback when a thread is
+  gone
 
 ## Remaining gaps
 

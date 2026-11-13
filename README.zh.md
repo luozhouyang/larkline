@@ -9,14 +9,15 @@ larkline fork 自 [zarazhangrui/lark-coding-agent-bridge](https://github.com/zar
 ## 主要功能
 
 - 把飞书 / Lark 消息转发给本机 Claude Code 或 Codex CLI。可以私聊 bot，也可以在群里 `@bot`。
-- **流式卡片**：agent 工作期间，答案和工具摘要持续更新在同一张飞书卡片上；运行中的卡片带停止按钮。
+- **流式卡片**：agent 工作期间，答案和工具摘要持续更新在同一张飞书卡片上；运行中的卡片带停止按钮。超过约 8.5 分钟后会自动接到一张新卡片继续展示，而不是静默停在旧卡片。
 - **会话延续**：每个聊天或话题线程恢复自己的 agent 会话；只有会话创建时使用的工作目录一致，才会恢复。
-- **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮；`/stop` 会中断当前任务并丢弃排队消息。
+- **排队与消息合并**：短时间连续发送的消息会作为一轮处理；运行中收到的消息排队到下一轮，并写入磁盘，重启后自动恢复；`/stop` 会中断当前任务并丢弃排队消息。
 - **全局并发上限**：同一时间最多运行 `preferences.maxConcurrentRuns` 个 agent 任务（默认 10），超出的消息继续排队。
 - **按聊天/话题切换工作目录**：用 `/cd` 切换当前聊天或话题的工作目录，用 `/pwd` 查看。
 - **云文档评论**：在支持的文档评论（`doc`、`docx`、`sheet` 或 `file`）里 `@bot`，bridge 会在同一个评论线程里回复。评论任务可以由管理员用 `/stop comment:<hash>` 中断。应用需要订阅 `drive.notice.comment_add_v1` 事件。
 - **会议智能体（可选）**：让 bot 入会，在会中或通过私聊回答问题，并基于实时字幕生成纪要。会议任务可以由管理员用 `/stop meeting:<id>` 中断。
-- **长任务保护**：飞书会在流式卡片创建约 10 分钟后停止接受更新。larkline 在约 8.5 分钟时停止更新卡片，等任务结束后把最终答案作为一条新消息单独发送，避免长任务静默丢失结果。
+- **授权卡片**：当 agent 使用非 skip 的权限模式时，工具调用会变成带「允许 / 拒绝」按钮的卡片。只有发起本次任务的用户可以操作；10 分钟未处理会自动拒绝。见[权限与授权](#权限与授权)。
+- **长任务保护**：飞书会在流式卡片创建约 10 分钟后停止接受更新。larkline 在约 8.5 分钟时创建一张新卡片继续展示进度，最终答案落在最新卡片上，避免长任务静默丢失结果。
 - **系统服务**：可以前台调试，也可以安装按 profile 隔离的 launchd、systemd 或 Task Scheduler 服务。
 - **多 profile**：同一台机器上可以维护多套 PersonalAgent 应用、agent、会话和工作目录。
 - **加密 App Secret**：App Secret 存在本地加密 keystore 中，不会明文写进 `config.json`。
@@ -216,13 +217,13 @@ daemon 的 stdout / stderr 日志在 `~/.larkline/profiles/<profile>/logs/daemon
 
 `/config set messageReply` 控制最终答案的发送方式：
 
-- **`card`**：创建一张 CardKit 流式卡片，agent 运行期间持续更新。卡片展示答案和精简工具摘要，运行中还有停止按钮。
+- **`card`**：创建一张 CardKit 流式卡片，agent 运行期间持续更新。卡片展示答案和精简工具摘要，运行中还有停止按钮。超过约 8.5 分钟的长任务会接到一张新卡片继续展示。
 - **`markdown`**：默认值。当前 Rust 实现也走卡片渲染；卡片无法继续更新时回退为普通消息。
 - **`text`**：不创建卡片，run 结束后发送一条纯文本消息。
 
 `showToolCalls` 控制最终卡片或文本回复里是否展示工具摘要，不影响 agent 实际执行的操作。
 
-飞书会在流式卡片创建约 10 分钟后强制结束卡片并丢弃后续更新。larkline 会更新到约 8.5 分钟，然后停止更新，并在任务结束后把最终答案作为一条新消息发送。这是服务端限制，桌面端和手机端都一样。
+飞书会在流式卡片创建约 10 分钟后强制结束卡片并丢弃后续更新。larkline 会更新到约 8.5 分钟，然后创建一张新卡片，在旧卡片上标注 `⏭ 过程已接续到下一张卡片`，新卡片以 `↪ 接续上一张卡片` 开头继续展示；最终答案写在最新卡片上。如果新卡片创建失败，才回退为停止更新、任务结束后单独发送最终答案。这是服务端限制，桌面端和手机端都一样。
 
 ### 并发
 
@@ -298,6 +299,25 @@ profile 可以通过 `workspaces.default` 指定默认工作目录。没有指�
 
 工作目录只是 agent run 的当前目录，不是文件系统 sandbox；agent 实际能访问哪些文件仍取决于它自己的权限。
 
+### 权限与授权
+
+profile 的 `permissions` 块决定 agent 的访问级别，以及工具调用是否需要用户授权：
+
+```json
+{
+  "permissions": {
+    "defaultAccess": "workspace",
+    "maxAccess": "workspace",
+    "claude": { "permissionMode": "default" }
+  }
+}
+```
+
+- **Claude Code** 在 `default` 或 `acceptEdits` 下使用 stdio 权限询问协议。工具调用会发来一张独立卡片，展示命令/路径，并可展开完整参数。点「允许」会原样放行；点「拒绝」会告诉模型用户拒绝了该操作。`plan` 和 `bypassPermissions` 不会询问，保持原来的一次性 stdin 路径。
+- **Codex** 在 `read-only` 或 `workspace-write` 下改用 `codex app-server`（`codex exec` 协议没有反向授权通道）。命令执行、文件修改和额外权限请求都走同一张授权卡片。`danger-full-access` 仍然使用 `codex exec`，不会询问。
+- 只有本轮第一条消息的发送者可以点击按钮；其他人的点击会被拒绝。10 分钟未处理会自动拒绝；如果授权卡片发送失败，也会立即拒绝，避免 agent 一直卡住。授权卡片是普通非流式消息，不受 8.5 分钟流式卡片限制影响。
+- 评论和会议任务没有授权卡片流程，保持 agent 的非交互行为；如果这些场景需要执行工具，请为对应 profile 使用 full access。
+
 ### 访问控制
 
 Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
@@ -330,6 +350,7 @@ Rust bridge 目前实现了 TypeScript 访问模型的一个子集：
 | `~/.larkline/config.json` | root config：`activeProfile` 和 `profiles` |
 | `~/.larkline/profiles/<profile>/sessions.json` | 每个聊天/话题 scope 的可恢复会话 |
 | `~/.larkline/profiles/<profile>/workspaces.json` | 按 scope 保存的工作目录覆盖 |
+| `~/.larkline/profiles/<profile>/pending.json` | 持久化的按 scope 排队消息（24 小时 TTL，权限 0600） |
 | `~/.larkline/profiles/<profile>/secrets.enc` | 加密的 App Secret 和其他 secret |
 | `~/.larkline/profiles/<profile>/.keystore.salt` | 每个 profile 的 keystore salt |
 | `~/.larkline/profiles/<profile>/logs/daemon/` | daemon 的 stdout / stderr 日志 |
@@ -378,7 +399,7 @@ markdown 模式和附件下载失败。目前只剩以下项目：
 
 **bot 没反应，或者本机 agent 一直不回复。** 先运行 `larkline doctor`。然后确认 agent CLI 已安装并登录，再发 `/status` 查看当前 cwd 和会话是否可恢复。`/new` 通常可以解决过期会话。
 
-**卡片停在某一帧，之后收不到答案。** 如果 run 已经超过约 8.5 分钟，这是卡片生命周期保护：bridge 停止更新卡片，并在任务结束后单独发送最终答案。等 run 结束即可，不要期待卡片继续更新。
+**卡片停在某一帧，之后收不到答案。** 如果 run 已经超过约 8.5 分钟，先找同聊天里的新卡片：bridge 会把进度接到新卡片，最终答案写在新卡片上。只有新卡片创建失败时，才会回退为任务结束后单独发送最终答案。
 
 **可以让一个 bot 用 Claude Code，另一个用 Codex 吗？** 可以。用不同的 `--agent` 创建两个 profile，然后各跑一个服务。agent 类型在创建 profile 时确定；需要换类型时请新建 profile。
 
