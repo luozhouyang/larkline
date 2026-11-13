@@ -2417,6 +2417,9 @@ mod tests {
         let bridge = test_bridge(root.path(), profile);
         let cwd = root.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
+        // The store canonicalizes paths; compare against the same form
+        // (`/private/var` on macOS, a verbatim prefix on Windows).
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
         bridge
             .workspace_store()
             .lock()
@@ -2570,6 +2573,9 @@ mod tests {
         let bridge = test_bridge(root.path(), admin_profile());
         let cwd = root.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
+        // Match the canonical form the store persists (`/private/var` on
+        // macOS, a verbatim prefix on Windows).
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
         bridge
             .workspace_store()
             .lock()
