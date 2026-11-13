@@ -92,6 +92,13 @@ pub async fn execute(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         Some(secret.as_str()),
     )?);
     println!("sessions: {}", bridge.sessions_path().display());
+    let restored = bridge.restored_pending_count();
+    if restored > 0 {
+        println!("pending: {restored} restored message(s)");
+    }
+    // `Bridge::new` restored the persisted queue but does not spawn tasks in a
+    // constructor; the runtime is live here, so start the driver now.
+    bridge.resume_pending();
 
     // Register this process before connecting so `larkline ps` / `kill` can see
     // it from the moment it starts talking to Feishu. Registration prunes dead

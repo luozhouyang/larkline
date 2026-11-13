@@ -85,7 +85,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,7 @@ use crate::media::{
 use crate::meeting::{self, AgentSettings, MeetingHandle, MeetingHost, MeetingManager};
 use crate::owner::{self, OwnerGate, RestOwnerSource};
 use crate::pending::{PendingQueue, QueueLimits};
+use crate::pending_store::PendingStore;
 use crate::permissions::RunPermissions;
 use crate::policy;
 use crate::render::{
@@ -305,6 +306,12 @@ pub struct Bridge {
     /// (or paused). Production uses [`CARD_SAFE_AGE`]; run-flow tests shorten
     /// it to exercise the rollover without waiting 8.5 minutes.
     card_safe_age: Duration,
+    /// Durable copy of the pending queue. Written through on every queue
+    /// mutation so a process restart (or a crash followed by the service
+    /// manager's restart) does not silently lose queued messages.
+    pending_store: PendingStore,
+    /// Messages restored from `pending.json` at startup, for diagnostics.
+    restored_pending: AtomicUsize,
 }
 
 /// The running VC-bot manager and the handle that stops its poll task.
@@ -761,6 +768,47 @@ impl Bridge {
         let workspaces = WorkspaceStore::load_with_default(&paths.workspaces_file, &default_dir)
             .with_context(|| format!("cannot load {}", paths.workspaces_file.display()))?;
 
+        // Restore messages queued by the previous process. The access policy is
+        // re-checked so a user removed from the allowlist cannot replay a
+        // prompt, and a corrupt/expired file is treated as empty.
+        let pending_store = PendingStore::new(paths.pending_file.clone());
+        let loaded_pending = pending_store.load(chrono::Utc::now().timestamp_millis());
+        let mut pending =
+            PendingQueue::with_limits(DEBOUNCE, QueueLimits::per_scope(MAX_PENDING_PER_SCOPE));
+        let mut restored_pending = 0usize;
+        let mut restored_denied = 0usize;
+        for (scope, messages) in loaded_pending.scopes {
+            let kept: Vec<NormalizedMessage> = messages
+                .into_iter()
+                .filter(|message| {
+                    if policy::allowed(&profile, message, bot_open_id.as_deref()) {
+                        true
+                    } else {
+                        restored_denied += 1;
+                        false
+                    }
+                })
+                .collect();
+            restored_pending += kept.len();
+            pending.restore(&scope, kept, Instant::now());
+        }
+        if restored_pending > 0
+            || restored_denied > 0
+            || loaded_pending.stats.corrupt
+            || loaded_pending.stats.expired > 0
+            || loaded_pending.stats.invalid > 0
+        {
+            tracing::info!(
+                path = %paths.pending_file.display(),
+                restored = restored_pending,
+                denied = restored_denied,
+                expired = loaded_pending.stats.expired,
+                invalid = loaded_pending.stats.invalid,
+                corrupt = loaded_pending.stats.corrupt,
+                "pending queue restored"
+            );
+        }
+
         let mut callback_auth = CallbackAuth::from_profile_and_app_secret(&profile, app_secret);
         if let Some(auth) = callback_auth.as_mut() {
             // Durable replay protection (TS `CallbackNonceStore`): load the
@@ -813,10 +861,7 @@ impl Bridge {
             workspaces: Mutex::new(workspaces),
             media,
             active: StdMutex::new(HashMap::new()),
-            pending: StdMutex::new(PendingQueue::with_limits(
-                DEBOUNCE,
-                QueueLimits::per_scope(MAX_PENDING_PER_SCOPE),
-            )),
+            pending: StdMutex::new(pending),
             pending_wakeup: Notify::new(),
             pending_driver_started: AtomicBool::new(false),
             next_run_id: AtomicU64::new(1),
@@ -825,6 +870,8 @@ impl Bridge {
             cot_transport,
             idle_timeout_unit: Duration::from_secs(60),
             card_safe_age: CARD_SAFE_AGE,
+            pending_store,
+            restored_pending: AtomicUsize::new(restored_pending),
         })
     }
 
@@ -1285,8 +1332,45 @@ impl Bridge {
             );
         }
         tracing::debug!(scope = %scope, queued = outcome.queued, "message queued");
+        self.persist_pending();
         self.ensure_pending_driver();
         self.pending_wakeup.notify_one();
+    }
+
+    /// Start the queue driver when a persisted batch was restored at startup.
+    ///
+    /// [`Bridge::new`] restores the messages eagerly (so `/ps` and `/status`
+    /// see them immediately) but does not spawn a task in a constructor. The
+    /// CLI calls this once the bridge is inside its runtime.
+    pub fn resume_pending(self: &Arc<Self>) {
+        if lock(&self.pending).queued_scopes().is_empty() {
+            return;
+        }
+        self.ensure_pending_driver();
+        self.pending_wakeup.notify_one();
+        tracing::info!(
+            restored = self.restored_pending.load(Ordering::Relaxed),
+            "resuming the persisted pending queue"
+        );
+    }
+
+    /// Messages restored from the previous process, for diagnostics.
+    pub fn restored_pending_count(&self) -> usize {
+        self.restored_pending.load(Ordering::Relaxed)
+    }
+
+    /// Write the in-memory queue through to disk.
+    ///
+    /// Best effort: a failed write is logged and must never fail the run or
+    /// the inbound message that triggered it.
+    fn persist_pending(&self) {
+        let snapshot = lock(&self.pending).snapshot();
+        if let Err(err) = self
+            .pending_store
+            .save(&snapshot, chrono::Utc::now().timestamp_millis())
+        {
+            tracing::warn!(error = %err, "cannot persist the pending queue");
+        }
     }
 
     /// Queue a message and block its scope so no run starts.
@@ -1458,6 +1542,9 @@ impl Bridge {
         );
         drop(active);
         drop(pending);
+        // The batch is now owned by the run; remove it from the durable queue
+        // before the agent starts (at-most-once delivery).
+        self.persist_pending();
         let _ = start.send(());
         BatchStart::Started
     }
@@ -1651,6 +1738,9 @@ impl Bridge {
             pending.unblock(scope, Instant::now());
         }
         drop(pending);
+        if dropped > 0 {
+            self.persist_pending();
+        }
         self.pending_wakeup.notify_one();
         (stopped, dropped)
     }
@@ -1686,6 +1776,9 @@ impl Bridge {
             let mut pending = lock(&self.pending);
             pending.cancel(scope).len()
         };
+        if dropped > 0 {
+            self.persist_pending();
+        }
         self.pending_wakeup.notify_one();
         dropped
     }
@@ -7385,6 +7478,53 @@ mod tests {
         assert!(
             take_batch(&bridge).is_empty(),
             "a denied click must never be queued for the agent"
+        );
+    }
+    #[tokio::test]
+    async fn pending_queue_survives_a_bridge_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let message: NormalizedMessage = serde_json::from_value(json!({
+            "message_id": "om_persisted",
+            "chat_id": "oc_1",
+            "chat_type": "p2p",
+            "sender_id": "ou_user",
+            "sender": { "open_id": "ou_user", "sender_type": "user" },
+            "text": "queued while the agent was busy",
+        }))
+        .expect("message fixture");
+        {
+            let bridge = test_bridge(root.path(), profile());
+            {
+                let mut pending = lock(&bridge.pending);
+                pending.push("oc_1", message, Instant::now());
+            }
+            bridge.persist_pending();
+            let file = AppPaths::resolve(root.path(), "test")
+                .expect("paths")
+                .pending_file;
+            assert!(file.exists(), "the queue was written through");
+        }
+
+        // A fresh bridge on the same state directory restores the message.
+        let bridge = test_bridge(root.path(), profile());
+        assert_eq!(bridge.restored_pending_count(), 1);
+        assert_eq!(
+            bridge.queued_scope_list(),
+            vec![("oc_1".to_string(), 1)],
+            "the restored batch keeps its scope"
+        );
+
+        // The access policy is re-checked on restore.
+        let mut denied = profile();
+        denied.access = Some(Access {
+            allowed_users: vec!["ou_someone_else".into()],
+            ..Access::default()
+        });
+        let denied_bridge = test_bridge(root.path(), denied);
+        assert_eq!(
+            denied_bridge.restored_pending_count(),
+            0,
+            "a sender removed from the allowlist is not replayed"
         );
     }
 }

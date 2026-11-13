@@ -258,6 +258,54 @@ impl<T> PendingQueue<T> {
     }
 }
 
+impl<T: Clone> PendingQueue<T> {
+    /// Snapshot every queued message, ordered by scope.
+    ///
+    /// Used by the pending store when the bridge writes the queue through to
+    /// disk; the queue itself stays free of I/O and serialization types.
+    pub fn snapshot(&self) -> Vec<(String, Vec<T>)> {
+        let mut scopes: Vec<(String, Vec<T>)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.messages.is_empty())
+            .map(|(scope, entry)| (scope.clone(), entry.messages.iter().cloned().collect()))
+            .collect();
+        scopes.sort_by(|a, b| a.0.cmp(&b.0));
+        scopes
+    }
+
+    /// Re-insert messages loaded from disk after a process restart.
+    ///
+    /// The restored scope is never blocked: a fresh process has no live run,
+    /// so the quiet window is armed immediately (the driver still staggers
+    /// starts through the run limiter). The per-scope limit is applied like a
+    /// push, dropping the oldest messages if the file exceeds the cap.
+    pub fn restore(&mut self, scope: &str, messages: Vec<T>, now: Instant) {
+        if messages.is_empty() {
+            return;
+        }
+        let blocked = self.blocked.contains(scope);
+        let entry = self
+            .entries
+            .entry(scope.to_string())
+            .or_insert_with(|| Entry {
+                messages: VecDeque::new(),
+                deadline: None,
+            });
+        for message in messages {
+            if let Some(max) = self.limits.max_per_scope {
+                while entry.messages.len() >= max {
+                    entry.messages.pop_front();
+                }
+            }
+            entry.messages.push_back(message);
+        }
+        if !blocked && !entry.messages.is_empty() {
+            entry.deadline = Some(now + self.delay);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
