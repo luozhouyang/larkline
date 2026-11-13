@@ -218,6 +218,15 @@ impl RunPermissions {
         }
     }
 
+    /// Whether Codex needs the app-server transport.
+    ///
+    /// `codex exec` has no inbound approval channel; under read-only or
+    /// workspace-write it is replaced by `codex app-server` so prompts can
+    /// become cards. Full access keeps the simpler `exec --json` path.
+    pub fn codex_approvals_enabled(self) -> bool {
+        self.effective_access() != AccessMode::Full
+    }
+
     /// Whether Claude should route permission prompts to the bridge.
     ///
     /// `default` asks for anything that would need approval and `acceptEdits`

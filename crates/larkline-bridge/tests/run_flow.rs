@@ -35,7 +35,9 @@ use larkline_bridge::{
     Bridge, BridgeStream, BridgeTransport, MediaCache, MediaError, ReactionTransport,
     ResourceDownloader, StreamTarget,
 };
-use larkline_core::{AppPaths, MessageReplyMode, Preferences, ProfileConfig, TenantBrand};
+use larkline_core::{
+    AgentKind, AppPaths, MessageReplyMode, Preferences, ProfileConfig, TenantBrand,
+};
 use larkline_lark::{LarkResult, RestClient, RestResult};
 use serde_json::{Value, json};
 
@@ -1364,4 +1366,123 @@ printf '%s\n' '{"type":"result","session_id":"sess-timeout"}'
         .expect("the fake agent recorded the timeout denial");
     assert!(decision.contains("\"behavior\":\"deny\""), "{decision}");
     assert!(decision.contains("审批超时"), "{decision}");
+}
+
+/// Codex under workspace-write uses `codex app-server`; its command approval
+/// request becomes the same approval card and the decision resumes the turn.
+#[tokio::test]
+async fn codex_app_server_approval_card_resumes_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+def send(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        send({"id": req_id, "result": {"userAgent": "fake"}})
+    elif method == "thread/start":
+        send({"id": req_id, "result": {"thread": {"id": "thr_codex"}}})
+    elif method == "turn/start":
+        send({"id": req_id, "result": {"turn": {"id": "turn_1", "status": "inProgress", "items": []}}})
+        send({"method": "item/started", "params": {"threadId": "thr_codex", "turnId": "turn_1", "item": {
+            "id": "cmd_1", "type": "commandExecution", "command": "pwd", "cwd": "/work",
+            "commandActions": [], "status": "inProgress"}}})
+        send({"id": 77, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "thr_codex", "turnId": "turn_1", "itemId": "cmd_1",
+            "command": "pwd", "cwd": "/work", "reason": "test approval"}})
+    elif req_id == 77:
+        with open(os.path.join(here, "codex-decision.json"), "w") as handle:
+            json.dump(msg, handle)
+        send({"method": "item/completed", "params": {"threadId": "thr_codex", "turnId": "turn_1", "item": {
+            "id": "cmd_1", "type": "commandExecution", "command": "pwd", "cwd": "/work",
+            "commandActions": [], "status": "completed", "aggregatedOutput": "/work\n", "exitCode": 0}}})
+        send({"method": "item/agentMessage/delta", "params": {"threadId": "thr_codex", "turnId": "turn_1", "itemId": "m", "delta": "done after codex approval"}})
+        send({"method": "item/completed", "params": {"threadId": "thr_codex", "turnId": "turn_1", "item": {
+            "id": "m", "type": "agentMessage", "text": "done after codex approval"}}})
+        send({"method": "turn/completed", "params": {"threadId": "thr_codex", "turn": {"id": "turn_1", "status": "completed", "items": []}}})
+"#;
+    let agent = fake_agent(dir.path(), body);
+    let mut profile = card_profile();
+    profile.agent_kind = AgentKind::Codex;
+    profile.extra.insert(
+        "permissions".into(),
+        json!({
+            "defaultAccess": "workspace",
+            "maxAccess": "workspace"
+        }),
+    );
+    let (bridge, transport) = test_bridge(
+        dir.path(),
+        profile,
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        None,
+    );
+
+    bridge
+        .handle_message(message("om_codex", "oc_flow", "run pwd"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Card { card, .. } if card_json(card).contains("approval:allow:77")
+            )
+        })
+    })
+    .await;
+    let (approval_message_id, approval_card) = transport
+        .frames()
+        .into_iter()
+        .find_map(|frame| match frame {
+            Frame::Card {
+                message_id, card, ..
+            } if card_json(&card).contains("approval:allow:77") => Some((message_id, card)),
+            _ => None,
+        })
+        .expect("approval card");
+    let button = approval_card["body"]["elements"]
+        .as_array()
+        .expect("elements")
+        .iter()
+        .find(|element| {
+            element["tag"] == "button" && element["behaviors"][0]["value"]["decision"] == "allow"
+        })
+        .expect("allow button");
+    let event = card_click(
+        button["behaviors"][0]["value"].clone(),
+        &approval_message_id,
+        "oc_flow",
+        "ou_user",
+    );
+    assert_eq!(
+        bridge.handle_card_action(&event).await.as_deref(),
+        Some("已允许，继续执行。")
+    );
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        stream_cards(frames)
+            .last()
+            .is_some_and(|card| card_json(card).contains("done after codex approval"))
+    })
+    .await;
+    let decision = std::fs::read_to_string(dir.path().join("codex-decision.json"))
+        .expect("the fake app-server recorded the decision");
+    assert!(
+        decision.contains("\"decision\": \"accept\"")
+            || decision.contains("\"decision\":\"accept\""),
+        "{decision}"
+    );
 }

@@ -5,18 +5,23 @@
 //! The process is killed when the handle is dropped, which is what makes
 //! `/stop` and daemon shutdown predictable.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use larkline_agent::{
-    AgentEvent, BridgePromptContext, ClaudeArgsInput, ClaudeStreamTranslator, CodexArgsInput,
-    CodexFinishReason, CodexJsonlTranslator, PermissionResponse, build_bridge_system_prompt,
-    build_claude_args, build_codex_args, prefix_bridge_system_prompt, user_message_json,
+    AgentEvent, BridgePromptContext, ClaudeArgsInput, ClaudeStreamTranslator,
+    CodexAppServerTranslator, CodexArgsInput, CodexFinishReason, CodexJsonlTranslator,
+    CodexThreadConfig, PermissionResponse, approval_response, build_bridge_system_prompt,
+    build_claude_args, build_codex_args, error_response, initialize_request, permissions_response,
+    prefix_bridge_system_prompt, request_id_string, thread_resume_request, thread_start_request,
+    turn_start_request, user_message_json,
 };
 use larkline_core::AgentKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::permissions::RunPermissions;
 
@@ -65,14 +70,206 @@ impl Translator {
 
 pub struct AgentProcess {
     child: Child,
-    stdout: BufReader<ChildStdout>,
-    translator: Translator,
-    /// Kept open for the Claude permission-prompt control protocol. `None`
-    /// when the prompt was a one-shot write and stdin was already closed
-    /// (Codex and Claude runs without approvals).
-    stdin: Option<tokio::process::ChildStdin>,
+    transport: Transport,
     /// Removed on drop: the agent has already read it by then.
     _system_prompt: Option<TempFile>,
+}
+
+enum Transport {
+    /// `claude -p` or `codex exec --json`: newline-delimited output, optional
+    /// control-protocol stdin for Claude approvals.
+    Line {
+        stdout: BufReader<ChildStdout>,
+        translator: Translator,
+        stdin: Option<ChildStdin>,
+    },
+    /// `codex app-server`: JSON-RPC over stdio with server-initiated approval
+    /// requests.
+    CodexAppServer(CodexAppServer),
+}
+
+struct CodexServerRequest {
+    id: serde_json::Value,
+    method: String,
+    params: serde_json::Value,
+}
+
+struct CodexAppServer {
+    /// `None` after the run closes stdin (dropping the handle is what lets the
+    /// child see EOF; `shutdown` alone does not close a process pipe).
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    translator: CodexAppServerTranslator,
+    /// Server requests waiting for a card decision, keyed by the request id as
+    /// rendered into the card payload.
+    pending: HashMap<String, CodexServerRequest>,
+    /// Messages read while waiting for a setup response; processed in order by
+    /// `next_events` so nothing is lost.
+    buffered: std::collections::VecDeque<serde_json::Value>,
+    /// A synthetic `System` event emitted after `thread/start` succeeds.
+    pending_events: std::collections::VecDeque<AgentEvent>,
+    next_id: u64,
+}
+
+impl CodexAppServer {
+    fn new(stdin: ChildStdin, stdout: BufReader<ChildStdout>) -> Self {
+        Self {
+            stdin: Some(stdin),
+            stdout,
+            translator: CodexAppServerTranslator::new(),
+            pending: HashMap::new(),
+            buffered: std::collections::VecDeque::new(),
+            pending_events: std::collections::VecDeque::new(),
+            // 1 is used by `initialize`.
+            next_id: 2,
+        }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    async fn send(&mut self, frame: &serde_json::Value) -> anyhow::Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            anyhow::bail!("codex app-server stdin is closed");
+        };
+        let mut line = frame.to_string();
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("failed to write a codex app-server frame")?;
+        stdin.flush().await.ok();
+        Ok(())
+    }
+
+    async fn read_value(&mut self) -> anyhow::Result<serde_json::Value> {
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .await
+            .context("failed to read codex app-server stdout")?;
+        if read == 0 {
+            anyhow::bail!("codex app-server closed stdout");
+        }
+        serde_json::from_str(line.trim())
+            .with_context(|| format!("invalid codex app-server JSON: {}", line.trim()))
+    }
+
+    /// Send one request and wait for its response, buffering notifications and
+    /// server requests that arrive in between.
+    async fn request(
+        &mut self,
+        frame: serde_json::Value,
+        timeout: Duration,
+    ) -> anyhow::Result<serde_json::Value> {
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        self.send(&frame).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let value = tokio::time::timeout_at(deadline, self.read_value())
+                .await
+                .context("timed out waiting for a codex app-server response")??;
+            if value.get("method").is_none() && value.get("id") == Some(&id) {
+                if let Some(error) = value.get("error") {
+                    anyhow::bail!("codex app-server error: {error}");
+                }
+                return Ok(value);
+            }
+            self.buffered.push_back(value);
+        }
+    }
+
+    async fn respond_to_permission(
+        &mut self,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.pending.remove(request_id) else {
+            anyhow::bail!("no pending codex approval request with id {request_id}");
+        };
+        let allow = matches!(response, PermissionResponse::Allow { .. });
+        let frame = match pending.method.as_str() {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                approval_response(&pending.id, allow)
+            }
+            "item/permissions/requestApproval" => permissions_response(
+                &pending.id,
+                allow,
+                pending
+                    .params
+                    .get("permissions")
+                    .unwrap_or(&serde_json::Value::Null),
+            ),
+            other => error_response(
+                &pending.id,
+                -32601,
+                &format!("unsupported codex approval request: {other}"),
+            ),
+        };
+        self.send(&frame).await
+    }
+
+    async fn next_events(&mut self) -> Option<Vec<AgentEvent>> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(vec![event]);
+        }
+        loop {
+            let value = if let Some(value) = self.buffered.pop_front() {
+                value
+            } else {
+                match self.read_value().await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "codex app-server read failed");
+                        return None;
+                    }
+                }
+            };
+            let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
+                // A response to a client request that setup did not consume.
+                tracing::debug!(?value, "unexpected codex app-server response");
+                continue;
+            };
+            let params = value
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(id) = value.get("id") {
+                let key = request_id_string(id);
+                self.pending.insert(
+                    key.clone(),
+                    CodexServerRequest {
+                        id: id.clone(),
+                        method: method.to_string(),
+                        params: params.clone(),
+                    },
+                );
+                if let Some(event) = self
+                    .translator
+                    .translate_server_request(id, method, &params)
+                {
+                    return Some(vec![event]);
+                }
+                // A request the bridge cannot surface still needs an answer,
+                // otherwise the turn waits forever.
+                let response =
+                    error_response(id, -32601, "larkline does not support this codex request");
+                if let Err(err) = self.send(&response).await {
+                    tracing::warn!(error = %err, "cannot decline an unsupported codex request");
+                }
+                self.pending.remove(&key);
+                continue;
+            }
+            let events = self.translator.translate_notification(method, &params);
+            if !events.is_empty() {
+                return Some(events);
+            }
+        }
+    }
 }
 
 /// Build the adapter argv and the stdin prompt for one run.
@@ -131,6 +328,13 @@ fn build_agent_args(
     }
 }
 
+fn response_thread_id(response: &serde_json::Value) -> Option<String> {
+    response
+        .pointer("/result/thread/id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 impl AgentProcess {
     pub async fn spawn(spec: AgentSpec) -> anyhow::Result<Self> {
         let system_prompt = build_bridge_system_prompt(Some(&BridgePromptContext {
@@ -139,6 +343,9 @@ impl AgentProcess {
         }));
 
         let system_prompt_file = TempFile::new(&system_prompt)?;
+        if spec.kind == AgentKind::Codex && spec.permissions.codex_approvals_enabled() {
+            return Self::spawn_codex_app_server(spec, system_prompt, system_prompt_file).await;
+        }
         let (args, stdin_prompt) = build_agent_args(&spec, &system_prompt_file.path)?;
 
         tracing::info!(
@@ -209,29 +416,221 @@ impl AgentProcess {
 
         Ok(Self {
             child,
-            stdout: BufReader::new(stdout),
-            translator,
-            stdin,
+            transport: Transport::Line {
+                stdout: BufReader::new(stdout),
+                translator,
+                stdin,
+            },
+            _system_prompt: Some(system_prompt_file),
+        })
+    }
+
+    /// Start `codex app-server`, initialize it, open (or resume) a thread and
+    /// start the turn. The prompt travels in `turn/start`, not on stdin.
+    async fn spawn_codex_app_server(
+        spec: AgentSpec,
+        system_prompt: String,
+        system_prompt_file: TempFile,
+    ) -> anyhow::Result<Self> {
+        tracing::info!(
+            agent = "codex",
+            cwd = %spec.cwd.display(),
+            resume = spec.session_id.is_some(),
+            access = spec.permissions.effective_access().as_str(),
+            sandbox = spec.permissions.sandbox().as_str(),
+            approval_policy = "on-request",
+            "spawning codex app-server"
+        );
+        let args = vec!["app-server".to_string()];
+        let mut command = command_for(&spec.binary, &args, &spec.cwd);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn {} app-server", spec.binary.display()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("codex app-server stdout was not captured"))?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if !line.trim().is_empty() {
+                        tracing::warn!(target: "agent", line = %line, "codex app-server stderr");
+                    }
+                }
+            });
+        }
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("codex app-server stdin was not captured"))?;
+        let mut server = CodexAppServer::new(stdin, BufReader::new(stdout));
+
+        const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+        server
+            .request(initialize_request(1), SETUP_TIMEOUT)
+            .await
+            .context("codex app-server initialize failed")?;
+
+        let config = CodexThreadConfig {
+            cwd: spec.cwd.to_string_lossy().into_owned(),
+            sandbox: spec.permissions.sandbox(),
+            model: spec.model.clone(),
+            developer_instructions: Some(system_prompt),
+        };
+        let thread_id = match spec.session_id.as_deref() {
+            Some(session_id) => {
+                let id = server.alloc_id();
+                match server
+                    .request(
+                        thread_resume_request(id, session_id, &config),
+                        SETUP_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(response) => response_thread_id(&response)
+                        .ok_or_else(|| anyhow!("codex app-server resume returned no thread id"))?,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "cannot resume the codex thread; starting a new one"
+                        );
+                        let id = server.alloc_id();
+                        let response = server
+                            .request(thread_start_request(id, &config), SETUP_TIMEOUT)
+                            .await
+                            .context("codex app-server thread/start failed")?;
+                        response_thread_id(&response).ok_or_else(|| {
+                            anyhow!("codex app-server start returned no thread id")
+                        })?
+                    }
+                }
+            }
+            None => {
+                let id = server.alloc_id();
+                let response = server
+                    .request(thread_start_request(id, &config), SETUP_TIMEOUT)
+                    .await
+                    .context("codex app-server thread/start failed")?;
+                response_thread_id(&response)
+                    .ok_or_else(|| anyhow!("codex app-server start returned no thread id"))?
+            }
+        };
+
+        let turn_request_id = server.alloc_id();
+        server
+            .request(
+                turn_start_request(turn_request_id, &thread_id, &spec.prompt, &spec.images),
+                SETUP_TIMEOUT,
+            )
+            .await
+            .context("codex app-server turn/start failed")?;
+
+        server.pending_events.push_back(AgentEvent::System {
+            session_id: Some(thread_id.clone()),
+            thread_id: Some(thread_id),
+            cwd: Some(spec.cwd.to_string_lossy().into_owned()),
+            model: spec.model,
+        });
+
+        Ok(Self {
+            child,
+            transport: Transport::CodexAppServer(server),
             _system_prompt: Some(system_prompt_file),
         })
     }
 
     /// Next translated event batch, or `None` at EOF.
     pub async fn next_events(&mut self) -> Option<Vec<AgentEvent>> {
-        let mut line = String::new();
-        match self.stdout.read_line(&mut line).await {
-            Ok(0) => None,
-            Ok(_) => Some(self.translator.translate(line.trim_end())),
-            Err(err) => {
-                tracing::warn!(error = %err, "agent stdout read failed");
-                None
+        match &mut self.transport {
+            Transport::Line {
+                stdout, translator, ..
+            } => {
+                let mut line = String::new();
+                match stdout.read_line(&mut line).await {
+                    Ok(0) => None,
+                    Ok(_) => Some(translator.translate(line.trim_end())),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "agent stdout read failed");
+                        None
+                    }
+                }
+            }
+            Transport::CodexAppServer(server) => server.next_events().await,
+        }
+    }
+
+    /// Answer a pending permission prompt.
+    pub async fn respond_to_permission(
+        &mut self,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> anyhow::Result<()> {
+        match &mut self.transport {
+            Transport::Line { stdin, .. } => {
+                let Some(stdin) = stdin.as_mut() else {
+                    anyhow::bail!("agent stdin is closed; cannot answer the permission request");
+                };
+                let decision = match response {
+                    PermissionResponse::Allow { updated_input } => {
+                        serde_json::json!({ "behavior": "allow", "updatedInput": updated_input })
+                    }
+                    PermissionResponse::Deny { message } => {
+                        serde_json::json!({ "behavior": "deny", "message": message })
+                    }
+                };
+                let frame = serde_json::json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": decision
+                    }
+                });
+                let mut line = frame.to_string();
+                line.push('\n');
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .context("failed to write a permission response to agent stdin")?;
+                stdin.flush().await.ok();
+                Ok(())
+            }
+            Transport::CodexAppServer(server) => {
+                server.respond_to_permission(request_id, response).await
+            }
+        }
+    }
+
+    /// Close the agent stdin so a finished process can exit.
+    ///
+    /// Idempotent; a non-approval run already closed stdin at spawn.
+    pub async fn close_stdin(&mut self) {
+        match &mut self.transport {
+            Transport::Line { stdin, .. } => {
+                if let Some(mut stdin) = stdin.take() {
+                    stdin.shutdown().await.ok();
+                }
+            }
+            Transport::CodexAppServer(server) => {
+                if let Some(mut stdin) = server.stdin.take() {
+                    stdin.shutdown().await.ok();
+                }
             }
         }
     }
 
     /// Flush a terminal event when the child exits without one.
     pub async fn finish(&mut self) -> Vec<AgentEvent> {
-        let events = self.translator.finish();
+        let events = match &mut self.transport {
+            Transport::Line { translator, .. } => translator.finish(),
+            Transport::CodexAppServer(server) => server.translator.finish(),
+        };
         match self.child.wait().await {
             Ok(status) => tracing::info!(%status, "agent exited"),
             Err(err) => tracing::warn!(error = %err, "agent wait failed"),
@@ -239,52 +638,7 @@ impl AgentProcess {
         events
     }
 
-    /// Answer a pending permission prompt over the Claude control protocol.
-    pub async fn respond_to_permission(
-        &mut self,
-        request_id: &str,
-        response: PermissionResponse,
-    ) -> anyhow::Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            anyhow::bail!("agent stdin is closed; cannot answer the permission request");
-        };
-        let decision = match response {
-            PermissionResponse::Allow { updated_input } => {
-                serde_json::json!({ "behavior": "allow", "updatedInput": updated_input })
-            }
-            PermissionResponse::Deny { message } => {
-                serde_json::json!({ "behavior": "deny", "message": message })
-            }
-        };
-        let frame = serde_json::json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": decision
-            }
-        });
-        let mut line = frame.to_string();
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .context("failed to write a permission response to agent stdin")?;
-        stdin.flush().await.ok();
-        Ok(())
-    }
-
-    /// Close the control-protocol stdin so a finished Claude process can exit.
-    ///
-    /// Idempotent; a run without approvals already closed stdin at spawn.
-    pub async fn close_stdin(&mut self) {
-        if let Some(mut stdin) = self.stdin.take() {
-            stdin.shutdown().await.ok();
-        }
-    }
-
     pub async fn kill(&mut self) {
-        self.stdin = None;
         let _ = self.child.kill().await;
     }
 }

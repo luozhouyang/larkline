@@ -7,12 +7,18 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codex_app_server;
 pub mod detect;
 pub mod prompt;
 pub mod types;
 
 pub use claude::{ClaudeArgsInput, ClaudeStreamTranslator, build_claude_args, user_message_json};
 pub use codex::{CodexArgsInput, CodexFinishReason, CodexJsonlTranslator, build_codex_args};
+pub use codex_app_server::{
+    CodexAppServerTranslator, CodexThreadConfig, approval_response, error_response,
+    initialize_request, permissions_response, request_id_string, success_response,
+    thread_resume_request, thread_start_request, turn_interrupt_request, turn_start_request,
+};
 pub use detect::{ResolvedBinary, resolve_executable};
 pub use prompt::{
     BridgePromptContext, PromptAttachment, PromptContext, PromptMention, build_agent_prompt,
