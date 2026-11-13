@@ -352,7 +352,10 @@ mod tests {
         assert!(unit.contains("After=network-online.target"));
         assert!(unit.contains("Wants=network-online.target"));
         assert!(unit.contains("[Service]\nType=simple"));
-        assert!(unit.contains("ExecStart=\"/opt/larkline\" \"run\" \"--profile\" \"claude\""));
+        assert!(unit.contains(&format!(
+            "ExecStart=\"{}\" \"run\" \"--profile\" \"claude\"",
+            spec.program.display()
+        )));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=5"));
         assert!(unit.contains(&format!(
@@ -363,7 +366,10 @@ mod tests {
             "StandardError=append:{}",
             spec.stderr_log.display()
         )));
-        assert!(unit.contains("Environment=\"LARKLINE_HOME=/home/u/.larkline\""));
+        assert!(unit.contains(&format!(
+            "Environment=\"LARKLINE_HOME={}\"",
+            spec.env_value("LARKLINE_HOME").unwrap()
+        )));
         assert!(unit.contains("Environment=\"LARKLINE_PROFILE=claude\""));
         assert!(unit.contains("Environment=\"PATH=/usr/local/bin:/usr/bin\""));
         assert!(unit.contains("[Install]\nWantedBy=default.target"));
@@ -373,8 +379,9 @@ mod tests {
 
     #[test]
     fn renders_working_directory_when_set() {
-        let unit = render_unit(&spec().with_working_dir("/home/u/work dir"));
-        assert!(unit.contains("WorkingDirectory=\"/home/u/work dir\""));
+        let work = std::path::absolute("/home/u/work dir").unwrap();
+        let unit = render_unit(&spec().with_working_dir(work.clone()));
+        assert!(unit.contains(&format!("WorkingDirectory=\"{}\"", work.display())));
     }
 
     #[test]
@@ -383,7 +390,10 @@ mod tests {
             .unwrap()
             .with_env("CUSTOM", "100%");
         let unit = render_unit(&spec);
-        assert!(unit.contains("ExecStart=\"/opt/my larkline\" \"run\" \"--profile\" \"claude\""));
+        assert!(unit.contains(&format!(
+            "ExecStart=\"{}\" \"run\" \"--profile\" \"claude\"",
+            spec.program.display()
+        )));
         assert!(unit.contains("Environment=\"CUSTOM=100%%\""));
     }
 

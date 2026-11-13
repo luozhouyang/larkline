@@ -368,7 +368,10 @@ mod tests {
         assert!(plist.contains("<plist version=\"1.0\">"));
         assert!(plist.contains("<key>Label</key>\n    <string>ai.larkline.bot.claude</string>"));
         assert!(plist.contains("<key>ProgramArguments</key>\n    <array>"));
-        assert!(plist.contains("        <string>/opt/larkline</string>"));
+        assert!(plist.contains(&format!(
+            "        <string>{}</string>",
+            spec.program.display()
+        )));
         assert!(plist.contains("        <string>run</string>"));
         assert!(plist.contains("        <string>--profile</string>"));
         assert!(plist.contains("        <string>claude</string>"));
@@ -383,7 +386,10 @@ mod tests {
             spec.stderr_log.display()
         )));
         assert!(plist.contains("<key>LARKLINE_HOME</key>"));
-        assert!(plist.contains("<string>/home/u/.larkline</string>"));
+        assert!(plist.contains(&format!(
+            "<string>{}</string>",
+            spec.env_value("LARKLINE_HOME").unwrap()
+        )));
         assert!(plist.contains("<key>LARKLINE_PROFILE</key>"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(!plist.contains("<key>WorkingDirectory</key>"));
@@ -392,9 +398,13 @@ mod tests {
 
     #[test]
     fn renders_working_directory_when_set() {
-        let spec = spec().with_working_dir("/home/u/work");
+        let work = std::path::absolute("/home/u/work").unwrap();
+        let spec = spec().with_working_dir(work.clone());
         let plist = render_plist(&spec);
-        assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/home/u/work</string>"));
+        assert!(plist.contains(&format!(
+            "<key>WorkingDirectory</key>\n    <string>{}</string>",
+            work.display()
+        )));
     }
 
     #[test]

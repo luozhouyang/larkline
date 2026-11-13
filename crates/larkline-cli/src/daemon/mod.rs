@@ -841,31 +841,36 @@ mod tests {
     #[test]
     fn profile_spec_shape() {
         let spec = spec();
+        let root = std::path::absolute("/home/u/.larkline").unwrap();
         assert_eq!(spec.id, "claude");
         assert_eq!(spec.service_id, "claude");
         assert_eq!(spec.label, "ai.larkline.bot.claude");
         assert_eq!(spec.name, "larkline.bot.claude");
         assert_eq!(spec.args, ["run", "--profile", "claude"]);
-        assert_eq!(spec.program, PathBuf::from("/opt/larkline"));
-        assert_eq!(spec.env_value("LARKLINE_HOME"), Some("/home/u/.larkline"));
+        assert_eq!(spec.program, std::path::absolute("/opt/larkline").unwrap());
+        assert_eq!(
+            spec.env_value("LARKLINE_HOME"),
+            Some(root.to_string_lossy().as_ref())
+        );
         assert_eq!(spec.env_value("LARKLINE_PROFILE"), Some("claude"));
         assert_eq!(
             spec.stdout_log,
-            PathBuf::from("/home/u/.larkline/profiles/claude/logs/daemon/daemon-stdout.log")
+            root.join("profiles/claude/logs/daemon/daemon-stdout.log")
         );
         assert_eq!(
             spec.stderr_log,
-            PathBuf::from("/home/u/.larkline/profiles/claude/logs/daemon/daemon-stderr.log")
+            root.join("profiles/claude/logs/daemon/daemon-stderr.log")
         );
         assert!(spec.working_dir.is_none());
     }
 
     #[test]
     fn supervisor_spec_shape() {
+        let root = std::path::absolute("/home/u/.larkline").unwrap();
         let spec = ServiceSpec::for_supervisor(
             "/opt/larkline",
             vec!["run".to_string(), "--web-ui".to_string()],
-            "/home/u/.larkline",
+            root.clone(),
         )
         .unwrap();
         assert_eq!(spec.id, SUPERVISOR_SERVICE_ID);
@@ -876,7 +881,7 @@ mod tests {
         assert_eq!(spec.description, "larkline supervisor");
         assert_eq!(
             spec.stdout_log,
-            PathBuf::from("/home/u/.larkline/profiles/supervisor/logs/daemon/daemon-stdout.log")
+            root.join("profiles/supervisor/logs/daemon/daemon-stdout.log")
         );
     }
 
@@ -893,14 +898,12 @@ mod tests {
 
     #[test]
     fn log_paths_use_the_sanitized_service_id() {
-        let spec =
-            ServiceSpec::for_profile("小助手", "/opt/larkline", "/home/u/.larkline").unwrap();
+        let root = std::path::absolute("/home/u/.larkline").unwrap();
+        let spec = ServiceSpec::for_profile("小助手", "/opt/larkline", root.clone()).unwrap();
         assert_eq!(spec.service_id, "profile-d78a12b1");
         assert_eq!(
             spec.stdout_log,
-            PathBuf::from(
-                "/home/u/.larkline/profiles/profile-d78a12b1/logs/daemon/daemon-stdout.log"
-            )
+            root.join("profiles/profile-d78a12b1/logs/daemon/daemon-stdout.log")
         );
     }
 

@@ -423,13 +423,20 @@ mod tests {
         let cmd = render_launcher_cmd(&spec);
 
         assert!(cmd.starts_with("@echo off\r\n"));
-        assert!(cmd.contains("set \"LARKLINE_HOME=/home/me/.larkline\"\r\n"));
+        assert!(cmd.contains(&format!(
+            "set \"LARKLINE_HOME={}\"\r\n",
+            spec.env_value("LARKLINE_HOME").unwrap()
+        )));
         assert!(cmd.contains("set \"PATH=/usr/local/bin:/usr/bin\"\r\n"));
         assert!(cmd.contains("set \"LARKLINE_PROFILE=claude\"\r\n"));
-        assert!(cmd.contains("cd /d \"/home/me/work\"\r\n"));
+        assert!(cmd.contains(&format!(
+            "cd /d \"{}\"\r\n",
+            spec.working_dir.as_ref().unwrap().display()
+        )));
 
         let expected_command = format!(
-            "\"/opt/larkline\" \"run\" \"--profile\" \"claude\" >> \"{}\" 2>> \"{}\"",
+            "\"{}\" \"run\" \"--profile\" \"claude\" >> \"{}\" 2>> \"{}\"",
+            spec.program.display(),
             spec.stdout_log.display(),
             spec.stderr_log.display()
         );
@@ -480,7 +487,10 @@ mod tests {
         assert_eq!(task_name(&spec), "Larkline.Bot.claude");
         assert_eq!(
             launcher_cmd_path(&spec),
-            PathBuf::from("/home/me/.larkline/daemon/claude/launcher.cmd")
+            spec.root_dir
+                .join("daemon")
+                .join("claude")
+                .join("launcher.cmd")
         );
     }
 
