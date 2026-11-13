@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -61,7 +61,7 @@ jobs:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Add musl target
         run: rustup target add "${{ matrix.target }}"
@@ -95,7 +95,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/larkline" dist/larkline
           tar -C dist -czf "${{ matrix.asset }}.tar.gz" larkline
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}.tar.gz
@@ -105,7 +105,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -168,7 +168,7 @@ jobs:
           # The zip itself cannot be stapled; the ticket is attached to the
           # signed binary inside it, so Gatekeeper validates on first run.
           xcrun stapler validate larkline || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: larkline-darwin-universal
           path: larkline-darwin-universal.zip
@@ -178,7 +178,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
@@ -186,7 +186,7 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path target/release/larkline.exe -DestinationPath larkline-windows-x86_64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: larkline-windows-x86_64
           path: larkline-windows-x86_64.zip
@@ -195,7 +195,7 @@ jobs:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -204,7 +204,7 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
