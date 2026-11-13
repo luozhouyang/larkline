@@ -260,6 +260,10 @@ pub struct RunView {
     pub tool_errors: usize,
     /// Running status phrase source; `None` once the run is terminal.
     pub footer_status: Option<FooterStatus>,
+    /// UI-only note rendered at the top of a progress card that continues a
+    /// previous card after the 8.5-minute rollover. Final cards clear it; the
+    /// text renderer ignores it.
+    pub continuation_note: Option<String>,
     /// Minutes reported by the idle-timeout notice (TS `state.idleTimeoutMinutes`).
     pub idle_timeout_minutes: Option<u64>,
     pub session_id: Option<String>,
@@ -283,6 +287,7 @@ impl Default for RunView {
             blocks: Vec::new(),
             tool_errors: 0,
             footer_status: Some(FooterStatus::Thinking),
+            continuation_note: None,
             idle_timeout_minutes: None,
             session_id: None,
             thread_id: None,
@@ -723,6 +728,18 @@ fn build_elements(view: &RunView, options: &CardRenderOptions, detail: CardDetai
     let terminal = view.terminal();
     let finalized = terminal != Terminal::Running;
     let mut elements = Vec::new();
+
+    // A rolled-over progress card starts with a pointer to the card it
+    // continues; it is never part of the terminal frame.
+    if terminal == Terminal::Running {
+        if let Some(note) = view
+            .continuation_note
+            .as_deref()
+            .filter(|note| !note.trim().is_empty())
+        {
+            elements.push(notation(note));
+        }
+    }
 
     if options.reasoning {
         if let Some(limit) = detail.reasoning_limit() {

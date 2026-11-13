@@ -383,6 +383,17 @@ fn test_bridge(
     downloader: Arc<dyn ResourceDownloader>,
     idle_unit: Option<Duration>,
 ) -> (Arc<Bridge>, FakeTransport) {
+    test_bridge_with_safe_age(root, profile, agent, downloader, idle_unit, None)
+}
+
+fn test_bridge_with_safe_age(
+    root: &Path,
+    profile: ProfileConfig,
+    agent: PathBuf,
+    downloader: Arc<dyn ResourceDownloader>,
+    idle_unit: Option<Duration>,
+    card_safe_age: Option<Duration>,
+) -> (Arc<Bridge>, FakeTransport) {
     let paths = AppPaths::resolve(root, "test").expect("app paths");
     let media = MediaCache::new(paths.media_dir.clone(), downloader);
     let fake = FakeTransport::default();
@@ -403,6 +414,9 @@ fn test_bridge(
     .with_reaction_transport(Arc::new(NoopReaction));
     if let Some(unit) = idle_unit {
         bridge = bridge.with_idle_timeout_unit(unit);
+    }
+    if let Some(safe_age) = card_safe_age {
+        bridge = bridge.with_card_safe_age(safe_age);
     }
     (Arc::new(bridge), fake)
 }
@@ -965,5 +979,125 @@ async fn attachment_download_failure_does_not_fail_the_run() {
     assert!(
         !has_button(&terminal),
         "the run finalized normally: {terminal}"
+    );
+}
+
+/// A run that outlives the progress card's safe age gets a second card; the
+/// old card is finalized with a pointer and the answer lands on the new one.
+#[tokio::test]
+async fn long_runs_roll_over_to_a_second_card_and_finish_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "#!/bin/sh\n\
+         cat > /dev/null\n\
+         printf '%s\\n' '{}'\n\
+         printf '%s\\n' '{}'\n\
+         sleep 0.5\n\
+         printf '%s\\n' '{}'\n\
+         printf '%s\\n' '{}'\n",
+        claude_init("sess-roll"),
+        assistant_text("m1", "before rollover"),
+        assistant_text("m2", "after rollover"),
+        json!({
+            "type": "result",
+            "session_id": "sess-roll",
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        })
+    );
+    let agent = fake_agent(dir.path(), &body);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (bridge, transport) = test_bridge_with_safe_age(
+        dir.path(),
+        card_profile(),
+        agent,
+        Arc::new(FailingDownloader {
+            calls: Arc::clone(&calls),
+        }),
+        None,
+        Some(Duration::from_millis(120)),
+    );
+
+    bridge
+        .handle_message(message("om_roll", "oc_flow", "go"))
+        .await;
+
+    wait_for(&transport, Duration::from_secs(4), |frames| {
+        let starts = frames
+            .iter()
+            .filter(|frame| matches!(frame, Frame::StreamStart { .. }))
+            .count();
+        starts >= 2
+            && frames.iter().any(|frame| {
+                matches!(
+                    frame,
+                    Frame::StreamCard { card, .. } if card_json(card).contains("已完成")
+                )
+            })
+    })
+    .await;
+
+    let frames = transport.frames();
+    let starts: Vec<String> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::StreamStart { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        starts.len() >= 2,
+        "expected a continuation card, got {starts:?}"
+    );
+    let head_id = &starts[0];
+    let tail_id = starts.last().expect("tail card");
+
+    let head_last = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::StreamCard { message_id, card } if message_id == head_id => Some(card),
+            _ => None,
+        })
+        .next_back()
+        .expect("head card got a final frame");
+    let head_json = card_json(head_last);
+    assert!(
+        head_json.contains("接续到下一张卡片"),
+        "head card points at the continuation: {head_json}"
+    );
+    assert!(
+        !has_button(head_last),
+        "the rolled-over head card has no live stop button: {head_json}"
+    );
+
+    let tail_text = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::StreamStart { message_id, card } | Frame::StreamCard { message_id, card }
+                if message_id == tail_id =>
+            {
+                Some(card_json(card))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        tail_text.contains("接续上一张卡片"),
+        "continuation card says what it is: {tail_text}"
+    );
+    assert!(
+        tail_text.contains("after rollover"),
+        "continuation card streams the tail: {tail_text}"
+    );
+    assert!(
+        tail_text.contains("before rollover") && tail_text.contains("after rollover"),
+        "the final card carries the complete answer: {tail_text}"
+    );
+
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Card { .. } | Frame::ReplyCard { .. })),
+        "a rolled-over run finishes on its last card instead of sending a separate one"
     );
 }

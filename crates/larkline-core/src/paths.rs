@@ -38,6 +38,10 @@ pub struct AppPaths {
     pub active_profile_file: PathBuf,
     pub sessions_file: PathBuf,
     pub workspaces_file: PathBuf,
+    /// Messages queued while a run was live, persisted so a process restart
+    /// does not silently lose them. Rust-only: the TypeScript bridge never
+    /// reads or writes this file.
+    pub pending_file: PathBuf,
     /// Used/revoked card-callback nonces. TS writes this next to
     /// `sessions.json` (`dirname(mediaDir)/callback-nonces.json`).
     pub callback_nonces_file: PathBuf,
@@ -76,6 +80,7 @@ impl AppPaths {
             active_profile_file: root_dir.join("active-profile"),
             sessions_file: profile_dir.join("sessions.json"),
             workspaces_file: profile_dir.join("workspaces.json"),
+            pending_file: profile_dir.join("pending.json"),
             callback_nonces_file: profile_dir.join("callback-nonces.json"),
             secrets_file: profile_dir.join("secrets.enc"),
             keystore_salt_file: profile_dir.join(".keystore.salt"),

@@ -168,6 +168,11 @@ const STOP_WATCHDOG: Duration = Duration::from_millis(50);
 /// run is still live (port of TS `STREAM_CARD_PAUSE_NOTE`). The answer is then
 /// delivered as a separate message/card when the run finishes.
 const STREAM_PAUSED_NOTE: &str = "⏳ 任务仍在运行，过程消息已停止更新；完成后会单独发送最终答案。";
+/// Final note on a progress card whose safe age elapsed while the run is
+/// still live: the next card continues the same run.
+const STREAM_ROLLOVER_NOTE: &str = "⏭ 过程已接续到下一张卡片。";
+/// First line of a continuation card.
+const STREAM_CONTINUATION_NOTE: &str = "↪ 接续上一张卡片。";
 /// Upper bound on messages queued per scope.
 ///
 /// The TypeScript queue is unbounded; this is a Rust-only memory guard for a
@@ -296,6 +301,10 @@ pub struct Bridge {
     /// integration tests set a short unit so the watchdog can be exercised
     /// deterministically without waiting a real minute.
     idle_timeout_unit: Duration,
+    /// How long one progress card stays updatable before it is rolled over
+    /// (or paused). Production uses [`CARD_SAFE_AGE`]; run-flow tests shorten
+    /// it to exercise the rollover without waiting 8.5 minutes.
+    card_safe_age: Duration,
 }
 
 /// The running VC-bot manager and the handle that stops its poll task.
@@ -815,7 +824,19 @@ impl Bridge {
             meeting: StdMutex::new(None),
             cot_transport,
             idle_timeout_unit: Duration::from_secs(60),
+            card_safe_age: CARD_SAFE_AGE,
         })
+    }
+
+    /// Override the progress-card safe age.
+    ///
+    /// Production keeps the crate's 8.5-minute guard. This exists for the
+    /// run-flow integration tests, which force a rollover without waiting the
+    /// real interval; it is also the knob a tenant with a shorter CardKit
+    /// lifetime should use.
+    pub fn with_card_safe_age(mut self, safe_age: Duration) -> Self {
+        self.card_safe_age = safe_age;
+        self
     }
 
     /// Override the wall-clock length of one idle-timeout minute.
@@ -2208,6 +2229,10 @@ impl Bridge {
         });
 
         let mut view = RunView::default();
+        // After the first rollover the current card renders only the events
+        // that happened since the rollover; `view` keeps the full run for the
+        // final answer, session and terminal state.
+        let mut tail: Option<RunView> = None;
         let mut streaming: Option<Box<dyn BridgeStream>> = None;
         let mut message_id: Option<String> = None;
         if let Some(format) = card_format {
@@ -2301,11 +2326,11 @@ impl Bridge {
         let now = tokio::time::Instant::now();
         let deadline = wall_clock_deadline(idle_minutes, now);
         let mut watchdog = IdleWatchdog::new(idle_minutes, self.idle_timeout_unit, now);
-        // CardKit closes a streaming entity around ten minutes; pause the
-        // progress card at the crate's safe age and deliver the answer
-        // separately when the run finishes.
-        let pause_deadline =
-            card_format.map(|_| tokio::time::Instant::from_std(started + CARD_SAFE_AGE));
+        // CardKit closes a streaming entity around ten minutes. At the safe
+        // age the card is rolled over to a fresh entity; if that cannot be
+        // created the old behavior (pause + separate final answer) remains.
+        let mut pause_deadline =
+            card_format.map(|_| tokio::time::Instant::from_std(started + self.card_safe_age));
         let mut paused = false;
         let mut last_update = Instant::now();
         // Pinned read future, kept alive across pause ticks so an in-flight
@@ -2329,6 +2354,9 @@ impl Bridge {
                     drop(pending);
                     process.kill().await;
                     view.mark_interrupted();
+                    if let Some(tail) = tail.as_mut() {
+                        tail.mark_interrupted();
+                    }
                     break;
                 }
                 LoopTick::IdleTimeout => {
@@ -2339,41 +2367,81 @@ impl Bridge {
                     let minutes = watchdog.minutes().unwrap_or_default();
                     tracing::warn!(scope = %scope, minutes, "agent idle timeout; stopping the run");
                     view.mark_idle_timeout(minutes);
+                    if let Some(tail) = tail.as_mut() {
+                        tail.mark_idle_timeout(minutes);
+                    }
                     break;
                 }
                 LoopTick::TimedOut => {
                     drop(pending);
                     process.kill().await;
-                    view.apply(&AgentEvent::Error {
+                    let event = AgentEvent::Error {
                         message: "运行超时（30 分钟），已终止。".to_string(),
                         termination_reason: TerminationReason::Timeout,
-                    });
+                    };
+                    view.apply(&event);
+                    if let Some(tail) = tail.as_mut() {
+                        tail.apply(&event);
+                    }
                     // The rich-card terminal notice reports the deadline in
                     // minutes (TS `idleTimeoutMinutes`); text/markdown replies
                     // keep using the error message above.
                     view.idle_timeout_minutes = Some(RUN_TIMEOUT.as_secs() / 60);
+                    if let Some(tail) = tail.as_mut() {
+                        tail.idle_timeout_minutes = Some(RUN_TIMEOUT.as_secs() / 60);
+                    }
                     break;
                 }
                 LoopTick::PauseElapsed => {
-                    paused = true;
-                    if let Some(format) = card_format {
+                    let Some(format) = card_format else { continue };
+                    let render_view = tail.as_ref().unwrap_or(&view);
+                    if self
+                        .rollover_progress(
+                            &scope,
+                            &chat_id,
+                            &last_message_id,
+                            &mut streaming,
+                            &mut message_id,
+                            render_view,
+                            started,
+                            format,
+                        )
+                        .await
+                    {
+                        // The continuation card starts empty; only events
+                        // after this point are rendered into it.
+                        tail = Some(RunView {
+                            continuation_note: Some(STREAM_CONTINUATION_NOTE.to_string()),
+                            ..RunView::default()
+                        });
+                        paused = false;
+                        pause_deadline = Some(tokio::time::Instant::from_std(
+                            Instant::now() + self.card_safe_age,
+                        ));
+                        last_update = Instant::now();
+                        tracing::info!(scope = %scope, "progress card rolled over");
+                    } else {
+                        paused = true;
                         self.pause_progress(
                             &scope,
                             &mut streaming,
                             message_id.as_deref(),
-                            &view,
+                            render_view,
                             started,
                             format,
                         )
                         .await;
+                        last_update = Instant::now();
                     }
-                    last_update = Instant::now();
                     // `pending` is untouched and is awaited again next tick.
                 }
                 LoopTick::Eof => {
                     drop(pending);
                     for event in process.finish().await {
                         view.apply(&event);
+                        if let Some(tail) = tail.as_mut() {
+                            tail.apply(&event);
+                        }
                         // The publisher sees the same flushed tail as the view,
                         // so a final text/tool event still reaches the bubble.
                         if let Some(run) = cot.as_mut() {
@@ -2389,6 +2457,9 @@ impl Bridge {
                         // folding the event (the TS `armOrPauseIdle` order).
                         watchdog.observe(event, tokio::time::Instant::now());
                         view.apply(event);
+                        if let Some(tail) = tail.as_mut() {
+                            tail.apply(event);
+                        }
                         // A reasoning-only bubble is created on first use; the
                         // create is bounded by `COT_REQUEST_TIMEOUT` inside the
                         // publisher, so it cannot pin the event loop for long.
@@ -2401,11 +2472,12 @@ impl Bridge {
                     }
                     if let Some(format) = card_format {
                         if !paused && last_update.elapsed() >= CARD_UPDATE_INTERVAL {
+                            let render_view = tail.as_ref().unwrap_or(&view);
                             self.refresh_card(
                                 &scope,
                                 &mut streaming,
                                 message_id.as_deref(),
-                                &view,
+                                render_view,
                                 started,
                                 format,
                             )
@@ -2462,9 +2534,12 @@ impl Bridge {
         }
         // With a COT bubble the process was already published there, so the
         // final reply carries only the answer text (TS
-        // `finalAnswerOnlyState`): no reasoning/tool duplication.
-        let cot_final = cot_path.then(|| final_answer_only_view(&view));
-        let final_view = cot_final.as_ref().unwrap_or(&view);
+        // `finalAnswerOnlyState`): no reasoning/tool duplication. A rolled-over
+        // run does the same: the earlier cards already show the progress, and
+        // the last card receives the complete answer without replaying every
+        // tool panel.
+        let answer_only = (cot_path || tail.is_some()).then(|| final_answer_only_view(&view));
+        let final_view = answer_only.as_ref().unwrap_or(&view);
 
         self.finalize(
             &scope,
@@ -2541,7 +2616,7 @@ impl Bridge {
                     CardFormat::Rich => {
                         // Whole-card PUT with streaming mode off and no stop
                         // button (build_card omits the button when `stop` is
-                        // None). set_card applies the CARD_SAFE_AGE guard.
+                        // None). set_card applies the card safe-age guard.
                         let card = self.final_card(view, started);
                         match handle.set_card(&card).await {
                             Ok(true) => return,
@@ -2565,13 +2640,12 @@ impl Bridge {
                         }
                     }
                 }
-            } else if started.elapsed() < CARD_SAFE_AGE {
-                if self
+            } else if started.elapsed() < self.card_safe_age
+                && self
                     .update_card(scope, message_id, view, started, format)
                     .await
-                {
-                    return;
-                }
+            {
+                return;
             }
         }
 
@@ -2684,13 +2758,13 @@ impl Bridge {
                 }
             }
         }
-        if started.elapsed() < CARD_SAFE_AGE {
+        if started.elapsed() < self.card_safe_age {
             self.update_card(scope, message_id, view, started, format)
                 .await;
         }
     }
 
-    /// Write the one-time paused frame at [`CARD_SAFE_AGE`].
+    /// Write the one-time paused frame at the configured card safe age.
     ///
     /// The run continues; after this frame the progress message is never
     /// touched again, and the full answer is sent separately by `finalize`.
@@ -2733,6 +2807,90 @@ impl Bridge {
             format = ?format,
             "progress card paused at the card safe age"
         );
+    }
+
+    /// Hand the progress over to a fresh card when the current one reaches
+    /// its safe age.
+    ///
+    /// The new CardKit entity starts its own 8.5-minute window. The old card
+    /// is finalized with a pointer to the new one and no live stop button.
+    /// The new card is created first: if that fails the caller keeps the old
+    /// behavior (pause the card and send the answer separately), so the old
+    /// card must not claim a successor exists.
+    ///
+    /// Returns `true` when the continuation card is live.
+    #[allow(clippy::too_many_arguments)]
+    async fn rollover_progress(
+        &self,
+        scope: &str,
+        chat_id: &str,
+        source_message_id: &str,
+        streaming: &mut Option<Box<dyn BridgeStream>>,
+        message_id: &mut Option<String>,
+        view: &RunView,
+        started: Instant,
+        format: CardFormat,
+    ) -> bool {
+        let profile = self.live_profile();
+        let next_view = RunView {
+            continuation_note: Some(STREAM_CONTINUATION_NOTE.to_string()),
+            ..RunView::default()
+        };
+        let next_card = self.live_card_for(scope, &next_view, started, format);
+        let next = match reply::start_streaming_card(
+            &*self.transport,
+            scope,
+            chat_id,
+            Some(source_message_id),
+            next_card,
+            STREAMING_ELEMENT_ID,
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    scope,
+                    "cannot start the continuation card; pausing instead"
+                );
+                return false;
+            }
+        };
+
+        let head = match format {
+            CardFormat::Rich => rollover_rich_card(&profile, view, started),
+            CardFormat::Markdown => rollover_markdown_card(&profile, view),
+        };
+        let mut written = false;
+        if let Some(handle) = streaming.as_mut() {
+            match handle.set_card(&head).await {
+                Ok(true) => written = true,
+                Ok(false) => tracing::debug!(
+                    "streaming card window closed before the rollover frame was written"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "rollover frame failed; trying the message-level update"
+                ),
+            }
+        }
+        if !written {
+            if let Some(old_id) = message_id.as_deref() {
+                if let Err(err) = self.transport.update_card_message(old_id, &head).await {
+                    tracing::warn!(error = %err, "rollover message-card update failed");
+                }
+            }
+        }
+
+        *message_id = Some(next.message_id().to_string());
+        *streaming = Some(next);
+        tracing::info!(
+            scope,
+            format = ?format,
+            "progress card rolled over to a fresh card"
+        );
+        true
     }
 
     /// Card for a running frame.
@@ -3344,18 +3502,46 @@ fn build_markdown_card(
     } else {
         render_text(view, options)
     };
+    if let Some(note) = view
+        .continuation_note
+        .as_deref()
+        .filter(|note| !note.trim().is_empty())
+    {
+        body = if body.trim().is_empty() {
+            note.to_string()
+        } else {
+            format!("{note}\n\n{body}")
+        };
+    }
     if paused {
         body = append_pause_note(body);
     }
     if body.trim().is_empty() {
         body = "（没有输出）".to_string();
     }
-    let body = truncate_chars(&body, MAX_CARD_TEXT_CHARS);
     let summary = if paused {
         "仍在运行".to_string()
     } else {
         card_summary(view).to_string()
     };
+    markdown_card_from_body(body, &summary)
+}
+
+/// Final frame of a markdown progress card that is handing over to the next
+/// card: the running footer is dropped and a short pointer is appended.
+fn rollover_markdown_card(profile: &ProfileConfig, view: &RunView) -> lark_channel::Card {
+    let options = markdown_render_options(profile);
+    let body = render_text_without_footer(view, options);
+    let body = if body.trim().is_empty() {
+        STREAM_ROLLOVER_NOTE.to_string()
+    } else {
+        format!("{body}\n\n{STREAM_ROLLOVER_NOTE}")
+    };
+    markdown_card_from_body(body, "仍在运行")
+}
+
+fn markdown_card_from_body(body: String, summary: &str) -> lark_channel::Card {
+    let body = truncate_chars(&body, MAX_CARD_TEXT_CHARS);
     let value = json!({
         "schema": "2.0",
         "config": {
@@ -3380,11 +3566,32 @@ fn paused_rich_card(
     view: &RunView,
     started: Instant,
 ) -> lark_channel::Card {
+    closed_rich_card(profile, view, started, STREAM_PAUSED_NOTE)
+}
+
+/// A final progress frame written just before a new card takes over: footer
+/// removed, streaming off, no live button, and a short pointer to the card
+/// that continues the run.
+fn rollover_rich_card(
+    profile: &ProfileConfig,
+    view: &RunView,
+    started: Instant,
+) -> lark_channel::Card {
+    closed_rich_card(profile, view, started, STREAM_ROLLOVER_NOTE)
+}
+
+fn closed_rich_card(
+    profile: &ProfileConfig,
+    view: &RunView,
+    started: Instant,
+    note: &str,
+) -> lark_channel::Card {
     // The TS pause frame renders with `footer: null` so a paused card never
     // claims the process is still updating: clone the view without the status
     // phrase instead of teaching `build_card` about paused frames.
     let mut paused_view = view.clone();
     paused_view.footer_status = None;
+    paused_view.continuation_note = None;
     let mut value =
         build_card(profile, &paused_view, card_status(view), started, None).into_value();
     if let Some(config) = value["config"].as_object_mut() {
@@ -3397,7 +3604,7 @@ fn paused_rich_card(
         elements.retain(|element| element["tag"] != "button");
         elements.push(json!({
             "tag": "markdown",
-            "content": STREAM_PAUSED_NOTE,
+            "content": note,
             "text_size": "notation"
         }));
     }
@@ -3490,6 +3697,7 @@ fn final_answer_only_view(view: &RunView) -> RunView {
     final_view.reasoning.clear();
     final_view.reasoning_active = false;
     final_view.footer_status = None;
+    final_view.continuation_note = None;
     final_view.tools.clear();
     final_view.tool_calls.clear();
     final_view.tool_errors = 0;
